@@ -4,7 +4,7 @@
 ;; Maintainer: tychoish
 ;; Keywords: tools, agent-shell
 ;; Version: 0.1.0
-;; URL: https://github.com/tychoish/agent-shell-queue
+;; URL: https://github.com/tychoish/agent-shell-prompt
 ;; Package-Requires: ((emacs "29.1"))
 
 ;; This file is not part of GNU Emacs
