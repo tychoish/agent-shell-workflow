@@ -230,26 +230,41 @@ recent runs."
   (with-temp-file file-path
     (insert (or content ""))))
 
-(defun agent-shell-workflow-library--sanitize-name (str)
-  "Sanitize STR for use in directory/file names.
+(defvar agent-shell-workflow-library-max-branch-length 30
+  "Maximum character length for branch names in artifact directories.")
+
+(defun agent-shell-workflow-library--sanitize-name (str &optional max-length)
+  "Sanitize and optionally truncate STR for use in directory/file names.
+Strips leading `refs/heads/' or `origin/' git prefixes if present.
 Replaces non-alphanumeric characters (except `.' and `_') with `-',
-collapses consecutive hyphens, and trims leading/trailing hyphens."
+collapses consecutive hyphens, and trims leading/trailing delimiter
+characters (`-', `.', `_').  When MAX-LENGTH is a positive integer,
+truncates STR to at most MAX-LENGTH characters, trimming any resulting
+trailing delimiter characters."
   (if (or (null str) (string-empty-p (format "%s" str)))
       ""
     (let* ((s (format "%s" str))
-           (cleaned (replace-regexp-in-string "[^a-zA-Z0-9._]+" "-" s)))
-      (string-trim cleaned "-+" "-+"))))
+           (s-no-ref (replace-regexp-in-string "\\`\\(?:refs/heads/\\|origin/\\)" "" s))
+           (cleaned (replace-regexp-in-string "[^a-zA-Z0-9._]+" "-" s-no-ref))
+           (collapsed (replace-regexp-in-string "-+" "-" cleaned))
+           (trimmed (string-trim collapsed "[-._]+" "[-._]+")))
+      (if (and (integerp max-length) (> max-length 0) (> (length trimmed) max-length))
+          (string-trim-right (substring trimmed 0 max-length) "[-._]+")
+        trimmed))))
 
-(defun agent-shell-workflow-library--unique-artifact-dir (base-dir &optional ident branch date)
+(defun agent-shell-workflow-library--unique-artifact-dir (base-dir &optional ident branch date max-branch-len)
   "Return a unique artifact directory path under BASE-DIR.
 Constructs a directory name using DATE (defaults to today as YYYYMMDD),
-IDENT (e.g. \"run-123\" or \"pr-55\"), BRANCH, and an incrementing sequence number
-starting at 1 (e.g. `<date>-<ident>-<branch>-1').  If candidate exists, the
-sequence number increments until an unused directory name is found.
+IDENT (e.g. \"run-123\" or \"pr-55\"), BRANCH, and an incrementing sequence
+number starting at 1 (e.g. `<date>-<ident>-<branch>-1').  If candidate
+exists, the sequence number increments until an unused directory name is
+found.  BRANCH is sanitized and truncated to MAX-BRANCH-LEN (defaults to
+`agent-shell-workflow-library-max-branch-length' or 30).
 Creates and returns the unused directory path."
   (let* ((d-str (or date (format-time-string "%Y%m%d")))
+         (branch-limit (or max-branch-len agent-shell-workflow-library-max-branch-length 30))
          (clean-ident (when ident (agent-shell-workflow-library--sanitize-name ident)))
-         (clean-branch (when branch (agent-shell-workflow-library--sanitize-name branch)))
+         (clean-branch (when branch (agent-shell-workflow-library--sanitize-name branch branch-limit)))
          (parts (delq nil (list (and (not (string-empty-p d-str)) d-str)
                                 (and clean-ident (not (string-empty-p clean-ident)) clean-ident)
                                 (and clean-branch (not (string-empty-p clean-branch)) clean-branch))))

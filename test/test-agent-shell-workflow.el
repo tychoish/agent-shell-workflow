@@ -419,12 +419,37 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
     (should (equal (agent-shell-workflow-library--diff-summary '("HEAD") 5) "(no changes)"))))
 
 (ert-deftest agent-shell-workflow/library-sanitize-name ()
-  "agent-shell-workflow-library--sanitize-name strips invalid characters and trims hyphens."
+  "agent-shell-workflow-library--sanitize-name strips invalid characters, prefixes, and truncates."
   (should (equal (agent-shell-workflow-library--sanitize-name "feature/cool-branch#42") "feature-cool-branch-42"))
   (should (equal (agent-shell-workflow-library--sanitize-name "---lead-and-trail---") "lead-and-trail"))
+  (should (equal (agent-shell-workflow-library--sanitize-name "...lead.and.trail...") "lead.and.trail"))
   (should (equal (agent-shell-workflow-library--sanitize-name "safe.branch_1") "safe.branch_1"))
+  (should (equal (agent-shell-workflow-library--sanitize-name "refs/heads/feature/login") "feature-login"))
+  (should (equal (agent-shell-workflow-library--sanitize-name "origin/feature/login") "feature-login"))
+  (should (equal (agent-shell-workflow-library--sanitize-name "feature//multiple---dashes") "feature-multiple-dashes"))
+  ;; Truncation tests
+  (should (equal (agent-shell-workflow-library--sanitize-name "a-very-long-branch-name-with-many-words" 15) "a-very-long-bra"))
+  ;; 12 characters would end in trailing hyphen "a-very-long-", which must be trimmed to "a-very-long"
+  (should (equal (agent-shell-workflow-library--sanitize-name "a-very-long-branch-name-with-many-words" 12) "a-very-long"))
   (should (equal (agent-shell-workflow-library--sanitize-name nil) ""))
   (should (equal (agent-shell-workflow-library--sanitize-name "") "")))
+
+(ert-deftest agent-shell-workflow/library-unique-artifact-dir-truncates-long-branch ()
+  "agent-shell-workflow-library--unique-artifact-dir truncates branch names in dir path."
+  (let ((tmp-dir (make-temp-file "asq-uniq-trunc-test-" t)))
+    (unwind-protect
+        (let* ((long-branch "feature/JIRA-12345-extremely-long-branch-name-describing-a-huge-refactor")
+               (d (agent-shell-workflow-library--unique-artifact-dir tmp-dir "run-100" long-branch "20260927")))
+          ;; Branch portion should be truncated to 30 characters
+          (should (equal (file-name-nondirectory d)
+                         "20260927-run-100-feature-JIRA-12345-extremely-l-1"))
+          (should (file-directory-p d))
+          ;; Custom max length (13 chars would be "feature-JIRA-", trimmed to "feature-JIRA")
+          (let ((d-custom (agent-shell-workflow-library--unique-artifact-dir tmp-dir "run-101" long-branch "20260927" 13)))
+            (should (equal (file-name-nondirectory d-custom)
+                           "20260927-run-101-feature-JIRA-1"))
+            (should (file-directory-p d-custom))))
+      (delete-directory tmp-dir t))))
 
 (ert-deftest agent-shell-workflow/library-unique-artifact-dir-increments ()
   "agent-shell-workflow-library--unique-artifact-dir increments counter when directory exists."
