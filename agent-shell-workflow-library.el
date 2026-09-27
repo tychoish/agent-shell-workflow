@@ -67,7 +67,8 @@ Uses `magit-git-output` when available, falling back to
 (defun agent-shell-workflow-library--diff-summary (args &optional max-lines)
   "Return git diff for ARGS, truncating to `--stat` if lines exceed MAX-LINES.
 MAX-LINES defaults to 5.  When diff has <= MAX-LINES lines, returns full diff.
-When diff exceeds MAX-LINES lines, returns `git diff --stat` output with a note."
+When diff exceeds MAX-LINES lines, returns `git diff --stat` output with
+a note."
   (let* ((limit (or max-lines 5))
          (full-diff (apply #'agent-shell-workflow-library--git-output (append '("diff") args)))
          (trimmed (string-trim full-diff)))
@@ -164,8 +165,9 @@ Optional LIMIT sets maximum runs to fetch (defaults to 20)."
 
 (defun agent-shell-workflow-library--resolve-ci-run (repo &optional target-branch)
   "Return a run-id for REPO and TARGET-BRANCH.
-If the latest run on TARGET-BRANCH is failing, return its run-id automatically.
-Otherwise, prompt the user with an ACR picker showing recent runs."
+If the latest run on TARGET-BRANCH is failing, return its run-id
+automatically.  Otherwise, prompt the user with an ACR picker showing
+recent runs."
   (let* ((branch (or target-branch (agent-shell-workflow-library--current-branch)))
          (runs (agent-shell-workflow-library--fetch-runs repo 20))
          (branch-runs (seq-filter (lambda (r) (equal (map-elt r 'headBranch) branch)) runs))

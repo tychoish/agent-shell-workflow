@@ -74,7 +74,9 @@ has been handled.")
    :documentation "List of (NAME :prompt STRING :type TYPE :optional BOOL) specs.")
   (pre-op
    nil
-   :documentation "Function called as (PRE-OP ctx) or (PRE-OP ctx callback) — see `agent-shell-workflow-exec-pre'.")
+   :documentation
+   "Function called as (PRE-OP ctx) or (PRE-OP ctx callback).
+See `agent-shell-workflow-exec-pre'.")
   (template
    nil
    :documentation "String with {{key}} placeholders resolved against ctx.")
@@ -86,7 +88,9 @@ has been handled.")
    :documentation "One of `:session-reuse', `:session-new', `:queue', `:ask'.")
   (post-op
    nil
-   :documentation "Function called as (POST-OP shell-buffer ctx response-text) on turn completion; see `agent-shell-workflow-exec-post'."))
+   :documentation
+   "Function called as (POST-OP shell-buffer ctx response-text).
+Called on turn completion; see `agent-shell-workflow-exec-post'."))
 
 (defvar agent-shell-workflow-registry (make-hash-table :test #'eq)
   "Hash table of symbol id to `agent-shell-workflow-spec'.
@@ -279,7 +283,7 @@ agent-shell-menu in turn would be circular."
     (agent-shell-new-shell)))
 
 (defun agent-shell-workflow--session-buffer (target)
-  "Return a live `agent-shell' buffer for TARGET, creating or prompting if needed.
+  "Return a live `agent-shell' buffer for TARGET, creating or prompting.
 When TARGET is `:session-new', always create a new shell buffer.
 When matching open buffers exist for `default-directory', prompt the user
 whether to reuse an existing shell buffer or create a new one.
