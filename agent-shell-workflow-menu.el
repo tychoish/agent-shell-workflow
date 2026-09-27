@@ -69,7 +69,7 @@ CATEGORY non-nil, only workflows in that category are offered."
                     :history 'agent-shell-workflow-select)))
     (agent-shell-workflow-dispatch (agent-shell-workflow-spec-id selected))))
 
-;;;###autoload
+;;;###autoload (autoload 'agent-shell-workflow-dispatch-menu "agent-shell-workflow-menu" nil t)
 (transient-define-prefix agent-shell-workflow-dispatch-menu ()
   "Single entry point into the `agent-shell-workflow' ACR picker."
   ["Workflows"
