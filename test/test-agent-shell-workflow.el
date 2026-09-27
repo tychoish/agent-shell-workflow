@@ -11,12 +11,11 @@
 (require 'ert)
 (require 'cl-lib)
 (add-to-list 'load-path (file-name-directory (or load-file-name buffer-file-name)))
-(require 'agent-shell-queue)
-(require 'agent-shell-menu)
+(require 'test-helper)
+(require 'agent-shell nil t)
 (require 'agent-shell-workflow)
 (require 'agent-shell-workflow-menu)
 (require 'agent-shell-workflow-library)
-(require 'test-helper)
 
 ;;; Isolation macro (mirrors asq-types-test/isolate)
 

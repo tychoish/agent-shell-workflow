@@ -33,12 +33,12 @@ jobs:
       - name: Run ERT Tests
         uses: tychoish/elisp-ci@main
         with:
-          dependencies: "agent-shell transient annotated-completing-read agent-shell-queue"
+          dependencies: "agent-shell transient annotated-completing-read"
 
       - name: Measure Code Coverage
         uses: tychoish/elisp-ci/coverage@main
         with:
-          dependencies: "agent-shell transient annotated-completing-read agent-shell-queue"
+          dependencies: "agent-shell transient annotated-completing-read"
           target-files: "agent-shell-workflow.el agent-shell-workflow-menu.el agent-shell-workflow-library.el"
           report-format: "lcov"
           output-file: "coverage/lcov.info"

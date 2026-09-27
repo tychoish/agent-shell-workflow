@@ -15,6 +15,50 @@
 (when (boundp 'alert-default-style)
   (setq alert-default-style 'ignore))
 
+(require 'cl-lib)
+
+;;; Mock agent-shell-queue if not installed
+
+(unless (featurep 'agent-shell-queue)
+  (defvar agent-shell-queue--item-types (make-hash-table :test #'eq))
+  (cl-defun agent-shell-queue-register-item-type (&key kind label buffer-pred dispatch-fn input-spec)
+    (puthash kind (list :kind kind :label label :buffer-pred buffer-pred :dispatch-fn dispatch-fn :input-spec input-spec)
+             agent-shell-queue--item-types))
+  (defun agent-shell-queue--type-for-kind (kind)
+    (gethash kind agent-shell-queue--item-types))
+  (defun agent-shell-queue--agent-shell-buffer-p (buf)
+    (with-current-buffer buf
+      (derived-mode-p 'agent-shell-mode)))
+  (cl-defstruct (agent-shell-queue-item
+                 (:constructor agent-shell-queue-item--make)
+                 (:copier nil))
+    id args status kind background created dispatched completed response outcome directory)
+  (defun agent-shell-queue--make-item (prompt &optional background kind _delay-before _delay-after)
+    (agent-shell-queue-item--make
+     :id "test-item-1"
+     :args prompt
+     :background background
+     :kind (or kind 'workflow)
+     :status 'queued))
+  (cl-defstruct (agent-shell-queue-store
+                 (:constructor agent-shell-queue--make-store)
+                 (:copier nil))
+    items format file)
+  (cl-defstruct (agent-shell-queue-queue
+                 (:constructor agent-shell-queue-queue--make)
+                 (:copier nil))
+    store active-buffer-name name head session-paused editing-ids interjection-pending halted-sessions)
+  (defvar agent-shell-queue--store nil)
+  (defvar agent-shell-queue--queue nil)
+  (defvar agent-shell-queue--loaded nil)
+  (defun agent-shell-queue-enqueue-item (&rest _) t)
+  (defun agent-shell-queue-enqueue-clear (&rest _) t)
+  (defun agent-shell-queue--enqueue-args (&rest _) t)
+  (defun agent-shell-queue--collect-visible-response-text (&rest _) nil)
+  (defun agent-shell-queue--ensure-subscription (&rest _) t)
+  (defun agent-shell-queue--save (&rest _) t)
+  (defun agent-shell-queue--refresh-buffer (&rest _) t)
+  (provide 'agent-shell-queue))
 
 (defun agent-shell-test/suffix-plist (suffix)
   "Extract the plist from a parsed transient suffix spec SUFFIX.
@@ -70,4 +114,3 @@ Handles both the (CLASS :key ...) cons format and the
     dups))
 
 (provide 'test-helper)
-;;; test-helper.el ends here
