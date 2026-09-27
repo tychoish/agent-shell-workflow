@@ -60,29 +60,33 @@ has been handled.")
                (:constructor agent-shell-workflow-spec--make)
                (:copier nil))
   "A registered reusable prompt workflow."
-  (id nil :documentation "Symbol — unique registry key.")
-  (doc nil :documentation "String — one-line description shown in menus.")
-  (category nil :documentation "Grouping label shown in menus.")
-  (args nil
-        :documentation
-        "List of (NAME :prompt STRING :type TYPE :optional BOOL) specs.")
-  (pre-op nil
-          :documentation
-          "Function called as (PRE-OP ctx) or (PRE-OP ctx callback) — see
-`agent-shell-workflow-exec-pre'.")
-  (template nil
-            :documentation
-            "String with {{key}} placeholders resolved against ctx.")
-  (submit nil
-          :documentation
-          "Non-nil to submit the rendered prompt immediately on insertion.")
-  (target nil
-          :documentation
-          "One of `:session-reuse', `:session-new', `:queue', `:ask'.")
-  (post-op nil
-           :documentation
-           "Function called as (POST-OP shell-buffer ctx response-text)
-on turn completion; see `agent-shell-workflow-exec-post'."))
+  (id
+   nil
+   :documentation "Symbol — unique registry key.")
+  (doc
+   nil
+   :documentation "String — one-line description shown in menus.")
+  (category
+   nil
+   :documentation "Grouping label shown in menus.")
+  (args
+   nil
+   :documentation "List of (NAME :prompt STRING :type TYPE :optional BOOL) specs.")
+  (pre-op
+   nil
+   :documentation "Function called as (PRE-OP ctx) or (PRE-OP ctx callback) — see `agent-shell-workflow-exec-pre'.")
+  (template
+   nil
+   :documentation "String with {{key}} placeholders resolved against ctx.")
+  (submit
+   nil
+   :documentation "Non-nil to submit the rendered prompt immediately on insertion.")
+  (target
+   nil
+   :documentation "One of `:session-reuse', `:session-new', `:queue', `:ask'.")
+  (post-op
+   nil
+   :documentation "Function called as (POST-OP shell-buffer ctx response-text) on turn completion; see `agent-shell-workflow-exec-post'."))
 
 (defvar agent-shell-workflow-registry (make-hash-table :test #'eq)
   "Hash table of symbol id to `agent-shell-workflow-spec'.
