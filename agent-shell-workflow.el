@@ -414,4 +414,7 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
 
 (provide 'agent-shell-workflow)
 
+(require 'agent-shell-workflow-library)
+(require 'agent-shell-workflow-menu)
+
 ;;; agent-shell-workflow.el ends here
