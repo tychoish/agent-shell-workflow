@@ -1,10 +1,10 @@
-;;; agent-shell-prompt-library.el --- Built-in agent-shell-prompt workflows -*- lexical-binding: t -*-
+;;; agent-shell-workflow-library.el --- Built-in agent-shell-workflow workflows -*- lexical-binding: t -*-
 
 ;; Author: tycho garen
 ;; Maintainer: tychoish
 ;; Keywords: tools, agent-shell
 ;; Version: 0.1.0
-;; URL: https://github.com/tychoish/agent-shell-prompt
+;; URL: https://github.com/tychoish/agent-shell-workflow
 ;; Package-Requires: ((emacs "29.1"))
 
 ;; This file is not part of GNU Emacs
@@ -24,7 +24,7 @@
 
 ;;; Commentary:
 
-;; Standard `register-agent-shell-prompt` registrations: CI failure
+;; Standard `register-agent-shell-workflow` registrations: CI failure
 ;; remediation, PR review patching, coverage expansion, refactor
 ;; cleanup, and git commit authoring.  Each pre-op is deterministic Elisp
 ;; gathering exact context via `gh` or `git` (using Magit when available)
@@ -35,7 +35,8 @@
 ;;; Code:
 
 (require 'seq)
-(require 'agent-shell-prompt)
+(require 'agent-shell-workflow)
+(eval-when-compile (require 'agent-shell-workflow))
 
 (declare-function magit-git-output "magit-git" (&rest args))
 (declare-function magit-get-current-branch "magit-git" ())
@@ -45,7 +46,7 @@
 (declare-function annotated-completing-read "annotated-completing-read")
 (declare-function vc-git-branches "vc-git" ())
 
-(defun agent-shell-prompt-library--shell (&rest args)
+(defun agent-shell-workflow-library--shell (&rest args)
   "Run ARGS as a shell command in `default-directory` and return its output.
 Trailing newline is trimmed.  Errors are captured inline in the result
 rather than signaled, so a pre-op can surface tool failures to the agent
@@ -55,27 +56,27 @@ instead of aborting the workflow."
      (with-current-buffer standard-output
        (apply #'call-process (car args) nil t nil (cdr args))))))
 
-(defun agent-shell-prompt-library--git-output (&rest args)
+(defun agent-shell-workflow-library--git-output (&rest args)
   "Run git with ARGS in `default-directory` and return trimmed output.
 Uses `magit-git-output` when available, falling back to
-`agent-shell-prompt-library--shell`."
+`agent-shell-workflow-library--shell`."
   (if (fboundp 'magit-git-output)
       (string-trim (or (apply #'magit-git-output args) ""))
-    (apply #'agent-shell-prompt-library--shell "git" args)))
+    (apply #'agent-shell-workflow-library--shell "git" args)))
 
-(defun agent-shell-prompt-library--diff-summary (args &optional max-lines)
+(defun agent-shell-workflow-library--diff-summary (args &optional max-lines)
   "Return git diff for ARGS, truncating to `--stat` if lines exceed MAX-LINES.
 MAX-LINES defaults to 5.  When diff has <= MAX-LINES lines, returns full diff.
 When diff exceeds MAX-LINES lines, returns `git diff --stat` output with a note."
   (let* ((limit (or max-lines 5))
-         (full-diff (apply #'agent-shell-prompt-library--git-output (append '("diff") args)))
+         (full-diff (apply #'agent-shell-workflow-library--git-output (append '("diff") args)))
          (trimmed (string-trim full-diff)))
     (if (string-empty-p trimmed)
         "(no changes)"
       (let ((lines (split-string trimmed "\n" t)))
         (if (<= (length lines) limit)
             trimmed
-          (let* ((stat (apply #'agent-shell-prompt-library--git-output (append '("diff" "--stat") args)))
+          (let* ((stat (apply #'agent-shell-workflow-library--git-output (append '("diff" "--stat") args)))
                  (trimmed-stat (string-trim (or stat ""))))
             (if (not (string-empty-p trimmed-stat))
                 (format "%s\n(Diff exceeds %d lines — run `git diff%s` to view full diff)"
@@ -84,23 +85,23 @@ When diff exceeds MAX-LINES lines, returns `git diff --stat` output with a note.
               (format "%s\n...\n(Truncated — run `git diff` to view full diff)"
                       (mapconcat #'identity (seq-take lines limit) "\n")))))))))
 
-(defun agent-shell-prompt-library--gather (ctx pairs)
+(defun agent-shell-workflow-library--gather (ctx pairs)
   "Populate CTX with the output of each shell command in PAIRS.
 PAIRS is a list of (CTX-KEY COMMAND ARG...) entries; each COMMAND is run
-via `agent-shell-prompt-library--shell` and stored under CTX-KEY."
+via `agent-shell-workflow-library--shell` and stored under CTX-KEY."
   (dolist (pair pairs ctx)
-    (plist-put ctx (car pair) (apply #'agent-shell-prompt-library--shell (cdr pair)))))
+    (plist-put ctx (car pair) (apply #'agent-shell-workflow-library--shell (cdr pair)))))
 
-(defun agent-shell-prompt-library--iso-to-seconds (iso-str)
+(defun agent-shell-workflow-library--iso-to-seconds (iso-str)
   "Convert ISO-STR timestamp string to float seconds."
   (when (and (stringp iso-str) (not (string-empty-p iso-str)))
     (ignore-errors
       (float-time (encode-time (parse-time-string iso-str))))))
 
-(defun agent-shell-prompt-library--format-duration (start-iso end-iso)
+(defun agent-shell-workflow-library--format-duration (start-iso end-iso)
   "Format duration between START-ISO and END-ISO string."
-  (let ((s (agent-shell-prompt-library--iso-to-seconds start-iso))
-        (e (agent-shell-prompt-library--iso-to-seconds end-iso)))
+  (let ((s (agent-shell-workflow-library--iso-to-seconds start-iso))
+        (e (agent-shell-workflow-library--iso-to-seconds end-iso)))
     (if (and s e)
         (let ((diff (max 0 (floor (- e s)))))
           (cond ((< diff 60) (format "%ds" diff))
@@ -108,9 +109,9 @@ via `agent-shell-prompt-library--shell` and stored under CTX-KEY."
                 (t (format "%dh %dm" (/ diff 3600) (% (% diff 3600) 60)))))
       "n/a")))
 
-(defun agent-shell-prompt-library--format-time-ago (iso-time)
+(defun agent-shell-workflow-library--format-time-ago (iso-time)
   "Format ISO-TIME string as relative time ago."
-  (let ((t-sec (agent-shell-prompt-library--iso-to-seconds iso-time)))
+  (let ((t-sec (agent-shell-workflow-library--iso-to-seconds iso-time)))
     (if t-sec
         (let ((diff (max 0 (floor (- (float-time) t-sec)))))
           (cond ((< diff 60) "just now")
@@ -119,7 +120,7 @@ via `agent-shell-prompt-library--shell` and stored under CTX-KEY."
                 (t (format "%dd ago" (/ diff 86400)))))
       "n/a")))
 
-(defun agent-shell-prompt-library--resolve-repo-slug (repo)
+(defun agent-shell-workflow-library--resolve-repo-slug (repo)
   "Resolve REPO name or path to an OWNER/NAME GitHub repository slug string."
   (if (and (stringp repo) (string-match-p "/" repo))
       repo
@@ -135,10 +136,10 @@ via `agent-shell-prompt-library--shell` and stored under CTX-KEY."
                  (format "%s/%s" o r))))
         repo)))
 
-(defun agent-shell-prompt-library--fetch-runs (repo &optional limit)
+(defun agent-shell-workflow-library--fetch-runs (repo &optional limit)
   "Fetch recent GitHub Actions run records for REPO as a list of alists.
 Optional LIMIT sets maximum runs to fetch (defaults to 20)."
-  (when-let* ((slug (agent-shell-prompt-library--resolve-repo-slug repo))
+  (when-let* ((slug (agent-shell-workflow-library--resolve-repo-slug repo))
               ((executable-find "gh" t)))
     (let* ((lim (number-to-string (or limit 20)))
            (json-str (with-output-to-string
@@ -150,7 +151,7 @@ Optional LIMIT sets maximum runs to fetch (defaults to 20)."
            (parsed (ignore-errors (json-parse-string json-str :object-type 'alist :array-type 'list))))
       (when (listp parsed) parsed))))
 
-(defun agent-shell-prompt-library--current-branch ()
+(defun agent-shell-workflow-library--current-branch ()
   "Return current git branch name or `main`."
   (or (ignore-errors
         (and (fboundp 'magit-get-current-branch)
@@ -161,12 +162,12 @@ Optional LIMIT sets maximum runs to fetch (defaults to 20)."
         (unless (or (null b) (string-empty-p b)) b))
       "main"))
 
-(defun agent-shell-prompt-library--resolve-ci-run (repo &optional target-branch)
+(defun agent-shell-workflow-library--resolve-ci-run (repo &optional target-branch)
   "Return a run-id for REPO and TARGET-BRANCH.
 If the latest run on TARGET-BRANCH is failing, return its run-id automatically.
 Otherwise, prompt the user with an ACR picker showing recent runs."
-  (let* ((branch (or target-branch (agent-shell-prompt-library--current-branch)))
-         (runs (agent-shell-prompt-library--fetch-runs repo 20))
+  (let* ((branch (or target-branch (agent-shell-workflow-library--current-branch)))
+         (runs (agent-shell-workflow-library--fetch-runs repo 20))
          (branch-runs (seq-filter (lambda (r) (equal (map-elt r 'headBranch) branch)) runs))
          (target-runs (or branch-runs runs))
          (latest (car target-runs))
@@ -188,9 +189,9 @@ Otherwise, prompt the user with an ACR picker showing recent runs."
                                 (b (map-elt r 'headBranch))
                                 (status (map-elt r 'status))
                                 (conclusion (or (map-elt r 'conclusion) status))
-                                (dur (agent-shell-prompt-library--format-duration
+                                (dur (agent-shell-workflow-library--format-duration
                                       (map-elt r 'startedAt) (map-elt r 'updatedAt)))
-                                (ago (agent-shell-prompt-library--format-time-ago
+                                (ago (agent-shell-workflow-library--format-time-ago
                                       (or (map-elt r 'updatedAt) (map-elt r 'createdAt))))
                                 (cand (format "#%s %s (%s) [%s]" id title short-sha b))
                                 (ann (format "%s | %s | %s" conclusion dur ago)))
@@ -201,7 +202,7 @@ Otherwise, prompt the user with an ACR picker showing recent runs."
                              (annotated-completing-read table
                                                         :prompt "Select CI Run: "
                                                         :require-match t
-                                                        :history 'agent-shell-prompt-ci-run-history)
+                                                        :history 'agent-shell-workflow-ci-run-history)
                            (completing-read "Select CI Run: " table nil t)))
                (match (assoc selected items)))
           (if match
@@ -210,7 +211,7 @@ Otherwise, prompt the user with an ACR picker showing recent runs."
 
 ;; Local filesystem helpers for prompt artifacts
 
-(defun agent-shell-prompt-library--project-root ()
+(defun agent-shell-workflow-library--project-root ()
   "Return the root directory of the current project or repository."
   (file-name-as-directory
    (expand-file-name
@@ -218,7 +219,7 @@ Otherwise, prompt the user with an ACR picker showing recent runs."
         (ignore-errors (locate-dominating-file default-directory ".git"))
         default-directory))))
 
-(defun agent-shell-prompt-library--write-file (file-path content)
+(defun agent-shell-workflow-library--write-file (file-path content)
   "Write CONTENT string to FILE-PATH, creating parent directories as needed."
   (let ((dir (file-name-directory file-path)))
     (when (and dir (not (file-directory-p dir)))
@@ -226,7 +227,7 @@ Otherwise, prompt the user with an ACR picker showing recent runs."
   (with-temp-file file-path
     (insert (or content ""))))
 
-(defun agent-shell-prompt-library--format-pr-comments-markdown (repo pr-num view-obj inline-comments raw-comments)
+(defun agent-shell-workflow-library--format-pr-comments-markdown (repo pr-num view-obj inline-comments raw-comments)
   "Format PR review comments into Markdown.
 REPO is the repository slug string.  PR-NUM is the PR number string.
 VIEW-OBJ is the parsed hash-table from `gh pr view --json ...`.
@@ -336,7 +337,7 @@ RAW-COMMENTS is fallback plain text from `gh pr view --comments`."
 
 ;; CI build failure remediation
 
-(defun agent-shell-prompt-library--fix-ci-pre-op (ctx)
+(defun agent-shell-workflow-library--fix-ci-pre-op (ctx)
   "Fetch failing CI artifacts for :repo/:run-id in CTX and save them locally.
 Artifacts (failed-step log, jobs metadata JSON, and triage index) are written
 under <project-root>/.agent/fix-ci/ so the agent can inspect them as files."
@@ -351,14 +352,14 @@ under <project-root>/.agent/fix-ci/ so the agent can inspect them as files."
                            (unless (or (string-empty-p slug) (string-match-p "^error" slug))
                              slug)))
                        (user-error "No repository specified for fix-ci")))
-         (repo-slug (agent-shell-prompt-library--resolve-repo-slug raw-repo))
+         (repo-slug (agent-shell-workflow-library--resolve-repo-slug raw-repo))
          (run-id (or (plist-get args :run-id)
-                     (agent-shell-prompt-library--resolve-ci-run repo-slug (plist-get args :branch))))
+                     (agent-shell-workflow-library--resolve-ci-run repo-slug (plist-get args :branch))))
          (run-id-str (when run-id (format "%s" run-id)))
          (updated-args (plist-put (plist-put (copy-sequence args) :repo repo-slug) :run-id run-id))
          (updated-ctx (plist-put (copy-sequence ctx) :args updated-args)))
     (if (and repo-slug run-id-str)
-        (let* ((root (agent-shell-prompt-library--project-root))
+        (let* ((root (agent-shell-workflow-library--project-root))
                (ci-dir (expand-file-name ".agent/fix-ci" root))
                (log-file (expand-file-name (format "run-%s-logs.txt" run-id-str) ci-dir))
                (jobs-file (expand-file-name (format "run-%s-jobs.json" run-id-str) ci-dir))
@@ -370,12 +371,12 @@ under <project-root>/.agent/fix-ci/ so the agent can inspect them as files."
                (rel-jobs-file (file-relative-name jobs-file root))
                (rel-index-file (file-relative-name index-file root))
                ;; Fetch run summary, failed logs, and job metadata
-               (ci-summary (agent-shell-prompt-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug))
-               (ci-log (agent-shell-prompt-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug "--log-failed"))
-               (ci-jobs (agent-shell-prompt-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug "--json" "jobs,conclusion,workflowName,url,displayTitle,headBranch"))
+               (ci-summary (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug))
+               (ci-log (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug "--log-failed"))
+               (ci-jobs (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug "--json" "jobs,conclusion,workflowName,url,displayTitle,headBranch"))
                (log-content (if (and (stringp ci-log) (not (string-empty-p ci-log)))
                                 ci-log
-                              (let ((full-log (agent-shell-prompt-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug "--log")))
+                              (let ((full-log (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug "--log")))
                                 (if (and (stringp full-log) (not (string-empty-p full-log)))
                                     full-log
                                   (format "No failed-step logs returned for run #%s.\n\nSummary:\n%s" run-id-str ci-summary)))))
@@ -386,11 +387,11 @@ under <project-root>/.agent/fix-ci/ so the agent can inspect them as files."
                 (format "# CI Triage Index\n\n- **Repository**: %s\n- **Run ID**: %s\n- **Generated**: %s\n- **Log File**: `%s`\n- **Jobs Metadata**: `%s`\n\n## Summary\n\n```\n%s\n```\n"
                         repo-slug run-id-str (format-time-string "%Y-%m-%dT%T%z") rel-log-file rel-jobs-file ci-summary)))
           ;; Write artifacts to local filesystem
-          (agent-shell-prompt-library--write-file log-file log-content)
-          (agent-shell-prompt-library--write-file jobs-file jobs-content)
-          (agent-shell-prompt-library--write-file index-file index-content)
-          (agent-shell-prompt-library--write-file alias-log-file log-content)
-          (agent-shell-prompt-library--write-file alias-jobs-file jobs-content)
+          (agent-shell-workflow-library--write-file log-file log-content)
+          (agent-shell-workflow-library--write-file jobs-file jobs-content)
+          (agent-shell-workflow-library--write-file index-file index-content)
+          (agent-shell-workflow-library--write-file alias-log-file log-content)
+          (agent-shell-workflow-library--write-file alias-jobs-file jobs-content)
           ;; Populate context
           (setq updated-ctx (plist-put updated-ctx :ci-summary ci-summary))
           (setq updated-ctx (plist-put updated-ctx :ci-dir rel-ci-dir))
@@ -401,12 +402,12 @@ under <project-root>/.agent/fix-ci/ so the agent can inspect them as files."
           updated-ctx)
       updated-ctx)))
 
-(register-agent-shell-prompt fix-ci
+(register-agent-shell-workflow fix-ci
   :doc "Download CI artifacts to local filesystem and prompt agent to fix build failure"
   :category "CI/CD"
   :args ((repo :prompt "Repository: " :optional t)
          (run-id :prompt "Run ID: " :type integer :optional t))
-  :pre-op #'agent-shell-prompt-library--fix-ci-pre-op
+  :pre-op #'agent-shell-workflow-library--fix-ci-pre-op
   :template "Investigate and fix the CI failure in {{args.repo}} (run #{{args.run-id}}).
 
 ## CI Artifacts:
@@ -426,7 +427,7 @@ Do NOT read the entire log file into context. Inspect the logs as files using se
 
 ;; PR review comment remediation
 
-(defun agent-shell-prompt-library--pr-review-pre-op (ctx)
+(defun agent-shell-workflow-library--pr-review-pre-op (ctx)
   "Fetch PR review comments for :pr-number in CTX and save them locally.
 Markdown summary and JSON export are saved under
 <project-root>/.agent/pr-comments/."
@@ -440,7 +441,7 @@ Markdown summary and JSON export are saved under
                          (let ((slug (string-trim (shell-command-to-string "gh repo view --json nameWithOwner --jq .nameWithOwner"))))
                            (unless (or (string-empty-p slug) (string-match-p "^error" slug))
                              slug)))))
-         (repo-slug (when raw-repo (agent-shell-prompt-library--resolve-repo-slug raw-repo)))
+         (repo-slug (when raw-repo (agent-shell-workflow-library--resolve-repo-slug raw-repo)))
          (pr-arg (plist-get args :pr-number))
          (pr-number (or (and pr-arg (if (numberp pr-arg) pr-arg (string-to-number (format "%s" pr-arg))))
                         (ignore-errors
@@ -449,7 +450,7 @@ Markdown summary and JSON export are saved under
                               (string-to-number val))))))
          (pr-str (if pr-number (format "%s" pr-number)
                    (user-error "No PR number specified or detected for pr-review-patch")))
-         (root (agent-shell-prompt-library--project-root))
+         (root (agent-shell-workflow-library--project-root))
          (pr-dir (expand-file-name ".agent/pr-comments" root))
          (md-file (expand-file-name (format "pr-%s-comments.md" pr-str) pr-dir))
          (json-file (expand-file-name (format "pr-%s-comments.json" pr-str) pr-dir))
@@ -461,19 +462,19 @@ Markdown summary and JSON export are saved under
          (repo-args (if repo-slug (list "--repo" repo-slug) nil))
          ;; Fetch structured review info
          (view-json-raw
-          (apply #'agent-shell-prompt-library--shell
+          (apply #'agent-shell-workflow-library--shell
                  "gh" "pr" "view" pr-str "--json"
                  "number,title,author,url,reviews,comments"
                  repo-args))
          ;; Fetch inline review comments
          (api-json-raw
           (when repo-slug
-            (agent-shell-prompt-library--shell
+            (agent-shell-workflow-library--shell
              "gh" "api" (format "repos/%s/pulls/%s/comments" repo-slug pr-str)
              "--paginate")))
          ;; Fetch raw formatted comments fallback
          (raw-comments
-          (apply #'agent-shell-prompt-library--shell
+          (apply #'agent-shell-workflow-library--shell
                  "gh" "pr" "view" pr-str "--comments"
                  repo-args))
          ;; Parse JSON responses
@@ -483,7 +484,7 @@ Markdown summary and JSON export are saved under
                     (when (and api-json-raw (not (string-empty-p api-json-raw)))
                       (json-parse-string api-json-raw :object-type 'hash-table :array-type 'array))))
          ;; Render Markdown
-         (md-content (agent-shell-prompt-library--format-pr-comments-markdown
+         (md-content (agent-shell-workflow-library--format-pr-comments-markdown
                       repo-slug pr-str view-obj api-arr raw-comments))
          ;; Build structured JSON
          (json-content
@@ -516,10 +517,10 @@ Markdown summary and JSON export are saved under
                         (if (vectorp inline) (length inline) 0)))
             (format "PR #%s in %s" pr-str (or repo-slug "repository")))))
     ;; Write artifacts to disk
-    (agent-shell-prompt-library--write-file md-file md-content)
-    (agent-shell-prompt-library--write-file json-file (or json-content "{}"))
-    (agent-shell-prompt-library--write-file alias-md-file md-content)
-    (agent-shell-prompt-library--write-file alias-json-file (or json-content "{}"))
+    (agent-shell-workflow-library--write-file md-file md-content)
+    (agent-shell-workflow-library--write-file json-file (or json-content "{}"))
+    (agent-shell-workflow-library--write-file alias-md-file md-content)
+    (agent-shell-workflow-library--write-file alias-json-file (or json-content "{}"))
     ;; Populate context
     (let* ((updated-args (plist-put (copy-sequence args) :pr-number (or pr-number (string-to-number pr-str))))
            (updated-ctx (plist-put (copy-sequence ctx) :args updated-args)))
@@ -533,12 +534,12 @@ Markdown summary and JSON export are saved under
       (setq updated-ctx (plist-put updated-ctx :pr-comments raw-comments))
       updated-ctx)))
 
-(register-agent-shell-prompt pr-review-patch
+(register-agent-shell-workflow pr-review-patch
   :doc "Fetch PR review comments to local filesystem and draft remediation patch"
   :category "Code Review"
   :args ((pr-number :prompt "PR number: " :type integer :optional t)
          (repo :prompt "Repository: " :optional t))
-  :pre-op #'agent-shell-prompt-library--pr-review-pre-op
+  :pre-op #'agent-shell-workflow-library--pr-review-pre-op
   :template "Address the review comments on PR #{{args.pr-number}} in {{args.repo}}.
 
 ## PR Summary:
@@ -560,18 +561,18 @@ Do NOT read all raw comment data into context at once. Review comments in `{{pr-
 
 ;; Test coverage expansion
 
-(defun agent-shell-prompt-library--coverage-pre-op (ctx)
+(defun agent-shell-workflow-library--coverage-pre-op (ctx)
   "Diff :file in CTX against HEAD to scope untested edits."
   (let* ((args (plist-get ctx :args))
          (file (plist-get args :file))
-         (diff (agent-shell-prompt-library--diff-summary (list "HEAD" "--" file) 5)))
+         (diff (agent-shell-workflow-library--diff-summary (list "HEAD" "--" file) 5)))
     (plist-put (copy-sequence ctx) :file-diff diff)))
 
-(register-agent-shell-prompt expand-coverage
+(register-agent-shell-workflow expand-coverage
   :doc "Analyze uncovered lines and author missing unit tests"
   :category "Testing"
   :args ((file :prompt "File: "))
-  :pre-op #'agent-shell-prompt-library--coverage-pre-op
+  :pre-op #'agent-shell-workflow-library--coverage-pre-op
   :template "Review {{args.file}} for untested logic and author missing unit tests.
 
 Diff:
@@ -581,18 +582,18 @@ Diff:
 
 ;; Refactor / dead-code cleanup
 
-(defun agent-shell-prompt-library--refactor-pre-op (ctx)
+(defun agent-shell-workflow-library--refactor-pre-op (ctx)
   "Gather git log summary for :file in CTX to scope stale/legacy code."
   (let* ((args (plist-get ctx :args))
          (file (plist-get args :file))
-         (log (agent-shell-prompt-library--git-output "log" "--oneline" "-n" "5" "--" file)))
+         (log (agent-shell-workflow-library--git-output "log" "--oneline" "-n" "5" "--" file)))
     (plist-put (copy-sequence ctx) :recent-history (if (string-empty-p log) "(no history)" log))))
 
-(register-agent-shell-prompt refactor-module
+(register-agent-shell-workflow refactor-module
   :doc "Clean up dead code and migrate legacy macro forms"
   :category "Refactoring"
   :args ((file :prompt "File: "))
-  :pre-op #'agent-shell-prompt-library--refactor-pre-op
+  :pre-op #'agent-shell-workflow-library--refactor-pre-op
   :template "Refactor {{args.file}}: remove dead code and migrate legacy forms to current conventions.
 
 Recent history:
@@ -602,30 +603,30 @@ Recent history:
 
 ;; Git commit authoring
 
-(defun agent-shell-prompt-library--create-commit-pre-op (ctx)
+(defun agent-shell-workflow-library--create-commit-pre-op (ctx)
   "Gather git status, diff against HEAD, and recent log history for CTX.
 Uses Magit or Git directly to gather state."
   (let* ((args (plist-get ctx :args))
          (files (plist-get args :files))
          (has-files (and (stringp files) (not (string-empty-p files))))
          (file-args (when has-files (list "--" files)))
-         (status (apply #'agent-shell-prompt-library--git-output
+         (status (apply #'agent-shell-workflow-library--git-output
                         (append '("status" "--short") file-args)))
-         (diff (agent-shell-prompt-library--diff-summary
+         (diff (agent-shell-workflow-library--diff-summary
                 (append '("HEAD") file-args) 5))
-         (log (agent-shell-prompt-library--git-output "log" "--oneline" "-n" "5"))
+         (log (agent-shell-workflow-library--git-output "log" "--oneline" "-n" "5"))
          (updated-ctx (copy-sequence ctx)))
     (setq updated-ctx (plist-put updated-ctx :git-status (if (string-empty-p status) "(clean)" status)))
     (setq updated-ctx (plist-put updated-ctx :git-diff diff))
     (setq updated-ctx (plist-put updated-ctx :recent-log (if (string-empty-p log) "(no history)" log)))
     updated-ctx))
 
-(register-agent-shell-prompt create-commit
+(register-agent-shell-workflow create-commit
   :doc "Draft and create a git commit with concise message and attribution"
   :category "Git"
   :args ((files :prompt "Files to commit (optional): " :optional t)
          (instructions :prompt "Additional instructions (optional): " :optional t))
-  :pre-op #'agent-shell-prompt-library--create-commit-pre-op
+  :pre-op #'agent-shell-workflow-library--create-commit-pre-op
   :template "Create a git commit for the current changes:
 
 ## Working Tree Status:
@@ -647,6 +648,6 @@ Uses Magit or Git directly to gather state."
   :submit t
   :target :session-reuse)
 
-(provide 'agent-shell-prompt-library)
+(provide 'agent-shell-workflow-library)
 
-;;; agent-shell-prompt-library.el ends here
+;;; agent-shell-workflow-library.el ends here
