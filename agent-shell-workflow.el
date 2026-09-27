@@ -90,10 +90,14 @@ Populate via `register-agent-shell-workflow'.")
 
 (defun agent-shell-workflow-get (id)
   "Return the `agent-shell-workflow-spec' registered under ID, or nil."
-  (gethash id agent-shell-workflow-registry))
+  (or (gethash id agent-shell-workflow-registry)
+      (progn
+        (require 'agent-shell-workflow-library nil t)
+        (gethash id agent-shell-workflow-registry))))
 
 (defun agent-shell-workflow-list ()
   "Return all registered `agent-shell-workflow-spec' values."
+  (require 'agent-shell-workflow-library nil t)
   (map-values agent-shell-workflow-registry))
 
 (cl-defun agent-shell-workflow-register (&key id doc category args pre-op template submit target post-op)
