@@ -418,6 +418,32 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
              (lambda (&rest _) "")))
     (should (equal (agent-shell-workflow-library--diff-summary '("HEAD") 5) "(no changes)"))))
 
+(ert-deftest agent-shell-workflow/library-sanitize-name ()
+  "agent-shell-workflow-library--sanitize-name strips invalid characters and trims hyphens."
+  (should (equal (agent-shell-workflow-library--sanitize-name "feature/cool-branch#42") "feature-cool-branch-42"))
+  (should (equal (agent-shell-workflow-library--sanitize-name "---lead-and-trail---") "lead-and-trail"))
+  (should (equal (agent-shell-workflow-library--sanitize-name "safe.branch_1") "safe.branch_1"))
+  (should (equal (agent-shell-workflow-library--sanitize-name nil) ""))
+  (should (equal (agent-shell-workflow-library--sanitize-name "") "")))
+
+(ert-deftest agent-shell-workflow/library-unique-artifact-dir-increments ()
+  "agent-shell-workflow-library--unique-artifact-dir increments counter when directory exists."
+  (let ((tmp-dir (make-temp-file "asq-uniq-dir-test-" t)))
+    (unwind-protect
+        (let* ((d1 (agent-shell-workflow-library--unique-artifact-dir tmp-dir "run-99" "main" "20260927"))
+               (d2 (agent-shell-workflow-library--unique-artifact-dir tmp-dir "run-99" "main" "20260927"))
+               (d3 (agent-shell-workflow-library--unique-artifact-dir tmp-dir "run-99" "main" "20260927"))
+               (d-other (agent-shell-workflow-library--unique-artifact-dir tmp-dir "run-99" "feat/x" "20260927")))
+          (should (equal (file-name-nondirectory d1) "20260927-run-99-main-1"))
+          (should (equal (file-name-nondirectory d2) "20260927-run-99-main-2"))
+          (should (equal (file-name-nondirectory d3) "20260927-run-99-main-3"))
+          (should (equal (file-name-nondirectory d-other) "20260927-run-99-feat-x-1"))
+          (should (file-directory-p d1))
+          (should (file-directory-p d2))
+          (should (file-directory-p d3))
+          (should (file-directory-p d-other)))
+      (delete-directory tmp-dir t))))
+
 (ert-deftest agent-shell-workflow/library-fix-ci-pre-op-populates-ctx ()
   "fix-ci's pre-op fetches summary and log text via gh into ctx."
   (let ((tmp-dir (make-temp-file "asq-fix-ci-pre-" t)))
@@ -466,15 +492,53 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
               (insert-file-contents index-path)
               (should (string-match-p "CI Triage Index" (buffer-string))))
             ;; Rendered template refers to files and gives triage guidance
-            (should (string-match-p "\\.agent/fix-ci/run-123-logs\\.txt" rendered))
-            (should (string-match-p "\\.agent/fix-ci/run-123-jobs\\.json" rendered))
-            (should (string-match-p "\\.agent/fix-ci/ci-triage-index\\.md" rendered))
+            (should (string-match-p "\\.agent/fix-ci/[^/]+/run-123-logs\\.txt" rendered))
+            (should (string-match-p "\\.agent/fix-ci/[^/]+/run-123-jobs\\.json" rendered))
+            (should (string-match-p "\\.agent/fix-ci/[^/]+/ci-triage-index\\.md" rendered))
+            (should (string-match-p "\\.agent/fix-ci/[^/]+/fix-plan\\.md" rendered))
             (should (string-match-p "Do NOT read the entire log file into context" rendered))
             (should (string-match-p "150-200 lines" rendered))
             ;; Rendered template does NOT inline the entire log body or full page
             (should-not (string-match-p "widget_test\\.go:42" rendered))))
       (delete-directory tmp-dir t))))
 
+
+
+(ert-deftest agent-shell-workflow/library-fix-ci-unique-directories-prevent-collision ()
+  "fix-ci pre-op creates distinct directories across multiple attempts without overwriting."
+  (let ((tmp-dir (make-temp-file "asq-fix-ci-col-test-" t)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-workflow-library--project-root)
+                   (lambda () (file-name-as-directory tmp-dir)))
+                  ((symbol-function 'agent-shell-workflow-library--shell)
+                   (lambda (&rest args)
+                     (cond
+                      ((member "--log-failed" args) "attempt log")
+                      ((member "--json" args) "{\"jobs\":[]}")
+                      (t "Run summary")))))
+          (let* ((ctx1 (agent-shell-workflow-library--fix-ci-pre-op
+                        (list :args (list :repo "org/app" :run-id 123 :date "20260927"))))
+                 (log1 (expand-file-name (plist-get ctx1 :ci-log-file) tmp-dir))
+                 (plan1 (expand-file-name (plist-get ctx1 :ci-plan-file) tmp-dir)))
+            ;; Simulate agent writing plan in attempt 1
+            (with-temp-file plan1 (insert "plan for attempt 1"))
+            ;; Now run fix-ci again for the same run
+            (let* ((ctx2 (agent-shell-workflow-library--fix-ci-pre-op
+                          (list :args (list :repo "org/app" :run-id 123 :date "20260927"))))
+                   (log2 (expand-file-name (plist-get ctx2 :ci-log-file) tmp-dir))
+                   (plan2 (expand-file-name (plist-get ctx2 :ci-plan-file) tmp-dir)))
+              (should-not (equal (plist-get ctx1 :ci-dir) (plist-get ctx2 :ci-dir)))
+              (should (string-match-p "-1$" (plist-get ctx1 :ci-dir)))
+              (should (string-match-p "-2$" (plist-get ctx2 :ci-dir)))
+              ;; Attempt 1 plan is not overwritten
+              (with-temp-buffer
+                (insert-file-contents plan1)
+                (should (equal (buffer-string) "plan for attempt 1")))
+              ;; Attempt 2 plan file is distinct and does not yet exist
+              (should-not (file-exists-p plan2))
+              (should (file-exists-p log1))
+              (should (file-exists-p log2)))))
+      (delete-directory tmp-dir t))))
 
 (ert-deftest agent-shell-workflow/library-resolve-ci-run-auto-selects-failing ()
   "Auto-selects the latest run when its conclusion indicates failure."
@@ -544,7 +608,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
                        (list :args (list :repo "org/app" :pr-number 55))))
                  (md-path (expand-file-name (plist-get ctx :pr-comments-file) tmp-dir))
                  (json-path (expand-file-name (plist-get ctx :pr-comments-json-file) tmp-dir))
-                 (alias-md (expand-file-name ".agent/pr-comments/pr-comments.md" tmp-dir))
+                 (alias-md (expand-file-name "pr-comments.md" (expand-file-name (plist-get ctx :pr-dir) tmp-dir)))
                  (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx)))
             ;; Files exist on disk
             (should (file-exists-p md-path))
@@ -558,15 +622,43 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
                 (should (string-match-p "Review by @bob" text))
                 (should (string-match-p "Inline Comment by @carol on `widget\\.go`" text))))
             ;; Rendered template directs agent to read files
-            (should (string-match-p "\\.agent/pr-comments/pr-55-comments\\.md" rendered))
-            (should (string-match-p "\\.agent/pr-comments/pr-55-comments\\.json" rendered))
+            (should (string-match-p "\\.agent/pr-comments/[^/]+/pr-55-comments\\.md" rendered))
+            (should (string-match-p "\\.agent/pr-comments/[^/]+/pr-55-comments\\.json" rendered))
+            (should (string-match-p "\\.agent/pr-comments/[^/]+/review-plan\\.md" rendered))
             (should (string-match-p "Do NOT read all raw comment data into context" rendered))
             (should (string-match-p "change-required" rendered))
-            (should (string-match-p "review-plan\\.md" rendered))
             ;; Rendered template does NOT inline the entire comments dump
             (should-not (string-match-p "Please simplify this function" rendered))))
       (delete-directory tmp-dir t))))
 
+
+
+(ert-deftest agent-shell-workflow/library-pr-review-unique-directories-prevent-collision ()
+  "pr-review-patch pre-op creates distinct directories across multiple attempts without overwriting."
+  (let ((tmp-dir (make-temp-file "asq-pr-col-test-" t)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-workflow-library--project-root)
+                   (lambda () (file-name-as-directory tmp-dir)))
+                  ((symbol-function 'agent-shell-workflow-library--shell)
+                   (lambda (&rest args)
+                     (cond
+                      ((member "--json" args) "{\"title\":\"Col PR\",\"author\":{\"login\":\"u\"},\"reviews\":[],\"comments\":[]}")
+                      (t "")))))
+          (let* ((ctx1 (agent-shell-workflow-library--pr-review-pre-op
+                        (list :args (list :repo "org/app" :pr-number 42 :date "20260927"))))
+                 (plan1 (expand-file-name (plist-get ctx1 :pr-plan-file) tmp-dir)))
+            (with-temp-file plan1 (insert "review plan 1"))
+            (let* ((ctx2 (agent-shell-workflow-library--pr-review-pre-op
+                          (list :args (list :repo "org/app" :pr-number 42 :date "20260927"))))
+                   (plan2 (expand-file-name (plist-get ctx2 :pr-plan-file) tmp-dir)))
+              (should-not (equal (plist-get ctx1 :pr-dir) (plist-get ctx2 :pr-dir)))
+              (should (string-match-p "-1$" (plist-get ctx1 :pr-dir)))
+              (should (string-match-p "-2$" (plist-get ctx2 :pr-dir)))
+              (with-temp-buffer
+                (insert-file-contents plan1)
+                (should (equal (buffer-string) "review plan 1")))
+              (should-not (file-exists-p plan2)))))
+      (delete-directory tmp-dir t))))
 
 (ert-deftest agent-shell-workflow/library-coverage-pre-op-populates-ctx ()
   "expand-coverage's pre-op diffs :file against HEAD into ctx."
