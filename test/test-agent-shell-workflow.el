@@ -390,7 +390,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 
 (ert-deftest agent-shell-workflow/library-registers-built-ins ()
   "The example prompt library registers all four built-in workflows."
-  (dolist (id '(create-commit fix-ci pr-review-patch expand-coverage refactor-module))
+  (dolist (id '(create-commit fix-ci pr-review-patch expand-coverage refactor-module executor-pipeline-run executor-pipeline-verify))
     (should (agent-shell-workflow-get id))))
 
 (ert-deftest agent-shell-workflow/library-diff-summary-short-diff ()
@@ -856,6 +856,164 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
      (should-error
       (agent-shell-workflow-dispatch 'queue-unreg)
       :type 'user-error))))
+
+(ert-deftest agent-shell-workflow/library-pipeline-run-pre-op ()
+  "pipeline-run-pre-op populates worktree, context-dir, and op-id."
+  (let ((ctx (list :args (list :file "test.el" :instruction "Fix bug" :op-id "op-101"))))
+    (cl-letf (((symbol-function 'agent-shell-workflow-library--project-root)
+               (lambda () "/tmp/mock-repo"))
+              ((symbol-function 'sprite-mcp-spawn)
+               (lambda (&rest args)
+                 (let ((id (plist-get args :name)))
+                   (list :id id :worktree (format "/tmp/mock-repo/.wt/%s" id)))))
+              ((symbol-function 'sprite-mcp-worktree) (lambda (e) (plist-get e :worktree)))
+              ((symbol-function 'sprite-mcp-sprite-id) (lambda (e) (plist-get e :id)))
+              ((symbol-function 'sprite-mcp-branch) (lambda (e) (format "branch-%s" (plist-get e :id)))))
+      (let ((res (agent-shell-workflow-library--pipeline-run-pre-op ctx)))
+        (should (equal (plist-get res :op-id) "op-101"))
+        (should (equal (plist-get res :repo-root) "/tmp/mock-repo"))
+        (should (equal (plist-get res :worktree-dir) "/tmp/mock-repo/.wt/op-101"))
+        (should (equal (plist-get res :context-dir) "/tmp/mock-repo/.wt/op-101"))
+        (should (equal (plist-get res :sprite-id) "op-101"))
+        (should (equal (plist-get res :branch) "branch-op-101"))))))
+
+(ert-deftest agent-shell-workflow/library-pipeline-run-pre-op-validates-args ()
+  "pipeline-run-pre-op signals error when required arguments are missing."
+  (should-error (agent-shell-workflow-library--pipeline-run-pre-op (list :args (list :file "foo.el")))
+                :type 'user-error)
+  (should-error (agent-shell-workflow-library--pipeline-run-pre-op (list :args (list :instruction "do it")))
+                :type 'user-error))
+
+(ert-deftest agent-shell-workflow/library-pipeline-run-post-op-chains ()
+  "pipeline-run-post-op captures git diff and chains to executor-pipeline-verify."
+  (let ((ctx (list :op-id "op-101"
+                   :repo-root "/tmp/mock-repo"
+                   :worktree-dir "/tmp/mock-wt"
+                   :sprite-id "sp-101"
+                   :branch "branch-op-101"
+                   :args (list :file "test.el" :instruction "Fix bug"))))
+    (cl-letf (((symbol-function 'file-directory-p) (lambda (_) t))
+              ((symbol-function 'agent-shell-workflow-library--shell)
+               (lambda (&rest args)
+                 (if (member "HEAD" args)
+                     "+ (fixed bug)"
+                   ""))))
+      (let ((res (agent-shell-workflow-library--pipeline-run-post-op nil ctx nil)))
+        (should (consp res))
+        (should (eq (car res) :chain))
+        (should (eq (cadr res) 'executor-pipeline-verify))
+        (let ((chain-args (caddr res)))
+          (should (equal (plist-get chain-args :op-id) "op-101"))
+          (should (equal (plist-get chain-args :file) "test.el"))
+          (should (equal (plist-get chain-args :instruction) "Fix bug"))
+          (should (equal (plist-get chain-args :diff) "+ (fixed bug)"))
+          (should (equal (plist-get chain-args :worktree-dir) "/tmp/mock-wt"))
+          (should (equal (plist-get chain-args :sprite-id) "sp-101"))
+          (should (equal (plist-get chain-args :branch) "branch-op-101")))))))
+
+(ert-deftest agent-shell-workflow/library-pipeline-verify-pre-op-empty-diff ()
+  "pipeline-verify-pre-op rejects immediately when diff is empty."
+  (let* ((ctx (list :args (list :file "test.el" :instruction "Fix" :diff "   ")))
+         called-ctx)
+    (agent-shell-workflow-library--pipeline-verify-pre-op
+     ctx
+     (lambda (updated) (setq called-ctx updated)))
+    (should called-ctx)
+    (let ((res (plist-get called-ctx :verify-result)))
+      (should (null (plist-get res :accepted)))
+      (should (= (plist-get res :confidence) 1.0))
+      (should (equal (plist-get res :issues) '("Empty diff: instruction was not applied"))))))
+
+(ert-deftest agent-shell-workflow/library-pipeline-verify-pre-op-gptel ()
+  "pipeline-verify-pre-op calls gptel-request with schema and parses JSON response."
+  (let* ((ctx (list :args (list :file "test.el" :instruction "Fix" :diff "+ fix")))
+         gptel-called-prompt
+         gptel-called-schema
+         called-ctx)
+    (cl-letf (((symbol-function 'gptel-request)
+               (lambda (prompt &rest plist)
+                 (setq gptel-called-prompt prompt)
+                 (setq gptel-called-schema (plist-get plist :schema))
+                 (let ((cb (plist-get plist :callback)))
+                   (funcall cb "{\"accepted\": true, \"confidence\": 0.95, \"summary\": \"Correct fix\", \"issues\": []}" nil)))))
+      (agent-shell-workflow-library--pipeline-verify-pre-op
+       ctx
+       (lambda (updated) (setq called-ctx updated)))
+      (should called-ctx)
+      (should (string-match-p "test.el" gptel-called-prompt))
+      (should gptel-called-schema)
+      (let ((res (plist-get called-ctx :verify-result)))
+        (should (eq (plist-get res :accepted) t))
+        (should (= (plist-get res :confidence) 0.95))
+        (should (equal (plist-get res :summary) "Correct fix"))
+        (should (null (plist-get res :issues)))))))
+
+(ert-deftest agent-shell-workflow/library-pipeline-verify-post-op-accepted ()
+  "pipeline-verify-post-op cleans up worktree when verified with high confidence."
+  (let* ((ctx (list :verify-result (list :accepted t :confidence 0.95 :summary "Great")
+                    :args (list :op-id "op-101" :sprite-id "sp-101")))
+         killed-id
+         killed-cleanup)
+    (cl-letf (((symbol-function 'sprite-mcp-kill)
+               (lambda (id &rest plist)
+                 (setq killed-id id)
+                 (setq killed-cleanup (plist-get plist :cleanup-worktree)))))
+      (let ((res (agent-shell-workflow-library--pipeline-verify-post-op nil ctx nil)))
+        (should (eq res :done))
+        (should (equal killed-id "sp-101"))
+        (should (eq killed-cleanup t))))))
+
+(ert-deftest agent-shell-workflow/library-pipeline-verify-post-op-escalates-to-hitl ()
+  "pipeline-verify-post-op creates hitl question when rejected or low confidence."
+  (let* ((ctx (list :verify-result (list :accepted nil :confidence 0.9 :summary "Broke tests" :issues '("Syntax err"))
+                    :args (list :op-id "op-101" :file "test.el" :diff "+ broken"
+                                :worktree-dir "/tmp/wt" :sprite-id "sp-101")))
+         hitl-called-args)
+    (cl-letf (((symbol-function 'hitl-ask)
+               (lambda (&rest plist)
+                 (setq hitl-called-args plist)
+                 t)))
+      (let ((res (agent-shell-workflow-library--pipeline-verify-post-op nil ctx nil)))
+        (should (eq res :done))
+        (should hitl-called-args)
+        (should (equal (plist-get hitl-called-args :id) "verify-op-101"))
+        (should (string-match-p "Broke tests" (plist-get hitl-called-args :prompt)))
+        (should (equal (plist-get hitl-called-args :options)
+                       '("Accept and Merge" "Reject and Discard" "Keep Worktree")))))))
+
+(ert-deftest agent-shell-workflow/benchmark-cascade-scenarios ()
+  "Benchmark 5 representative edit scenarios through the executor/verifier cascade."
+  (let* ((cases
+          (list
+           (list :id "case-1-clean" :diff "+ (defun foo () t)" :accepted t :conf 0.98 :exp-hitl nil :exp-clean t)
+           (list :id "case-2-syntax-err" :diff "+ (defun foo (x (unclosed)" :accepted nil :conf 0.95 :exp-hitl t :exp-clean nil)
+           (list :id "case-3-ambiguous" :diff "+ (setq timeout (if flag 10 20))" :accepted t :conf 0.70 :exp-hitl t :exp-clean nil)
+           (list :id "case-4-empty" :diff "" :accepted nil :conf 1.0 :exp-hitl t :exp-clean nil)
+           (list :id "case-5-breaking" :diff "- (f a b)\n+ (f a b c)" :accepted nil :conf 0.92 :exp-hitl t :exp-clean nil))))
+    (dolist (c cases)
+      (let ((hitl-called nil)
+            (cleaned nil))
+        (cl-letf (((symbol-function 'gptel-request)
+                   (lambda (_prompt &rest plist)
+                     (let ((cb (plist-get plist :callback)))
+                       (funcall cb (format "{\"accepted\": %s, \"confidence\": %s, \"summary\": \"eval\", \"issues\": []}"
+                                           (if (plist-get c :accepted) "true" "false")
+                                           (plist-get c :conf))
+                                nil))))
+                  ((symbol-function 'hitl-ask)
+                   (lambda (&rest _) (setq hitl-called t) t))
+                  ((symbol-function 'sprite-mcp-kill)
+                   (lambda (_id &rest plist)
+                     (when (plist-get plist :cleanup-worktree)
+                       (setq cleaned t)))))
+          (let ((ctx (list :args (list :op-id (plist-get c :id) :file "test.el"
+                                       :diff (plist-get c :diff) :sprite-id "sp-1")))
+                verify-ctx)
+            (agent-shell-workflow-library--pipeline-verify-pre-op
+             ctx (lambda (up) (setq verify-ctx up)))
+            (agent-shell-workflow-library--pipeline-verify-post-op nil verify-ctx nil)
+            (should (eq hitl-called (plist-get c :exp-hitl)))
+            (should (eq cleaned (plist-get c :exp-clean)))))))))
 
 (provide 'test-agent-shell-workflow)
 
