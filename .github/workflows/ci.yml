@@ -28,7 +28,7 @@ jobs:
         uses: tychoish/elisp-ci/lint@main
         with:
           dependencies: "agent-shell transient annotated-completing-read"
-          target-files: "agent-shell-workflow.el agent-shell-workflow-menu.el agent-shell-workflow-library.el"
+          target-files: "agent-shell-workflow.el agent-shell-workflow-menu.el agent-shell-workflow-library.el agent-shell-workflow-github.el agent-shell-workflow-pipeline.el"
 
       - name: Run ERT Tests
         uses: tychoish/elisp-ci@main
@@ -39,7 +39,7 @@ jobs:
         uses: tychoish/elisp-ci/coverage@main
         with:
           dependencies: "agent-shell transient annotated-completing-read"
-          target-files: "agent-shell-workflow.el agent-shell-workflow-menu.el agent-shell-workflow-library.el"
+          target-files: "agent-shell-workflow.el agent-shell-workflow-menu.el agent-shell-workflow-library.el agent-shell-workflow-github.el agent-shell-workflow-pipeline.el"
           report-format: "lcov"
           output-file: "coverage/lcov.info"
 
