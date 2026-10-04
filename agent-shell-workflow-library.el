@@ -115,7 +115,7 @@ via `agent-shell-workflow-library--shell` and stored under CTX-KEY."
         (let ((diff (max 0 (floor (- e s)))))
           (cond ((< diff 60) (format "%ds" diff))
                 ((< diff 3600) (format "%dm %ds" (/ diff 60) (% diff 60)))
-                (t (format "%dh %dm" (/ diff 3600) (% (% diff 3600) 60)))))
+                (t (format "%dh %dm" (/ diff 3600) (/ (% diff 3600) 60)))))
       "n/a")))
 
 (defun agent-shell-workflow-library--format-time-ago (iso-time)

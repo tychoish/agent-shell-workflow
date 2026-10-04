@@ -1015,6 +1015,351 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
             (should (eq hitl-called (plist-get c :exp-hitl)))
             (should (eq cleaned (plist-get c :exp-clean)))))))))
 
+
+;;; ─────────────────────────────────────────────────────────────
+;;; Additional Coverage: Core Stringification, Directory, and Post Results
+
+(ert-deftest agent-shell-workflow/stringify-handles-various-types ()
+  "agent-shell-workflow--stringify formats strings, symbols, nil, numbers, and lists."
+  (should (equal (agent-shell-workflow--stringify "plain string") "plain string"))
+  (should (equal (agent-shell-workflow--stringify nil) ""))
+  (should (equal (agent-shell-workflow--stringify 'foo-symbol) "foo-symbol"))
+  (should (equal (agent-shell-workflow--stringify 42) "42"))
+  (should (equal (agent-shell-workflow--stringify 3.14) "3.14"))
+  (should (equal (agent-shell-workflow--stringify '(a b c)) "(a b c)")))
+
+(ert-deftest agent-shell-workflow/canonicalize-dir-handles-inputs ()
+  "agent-shell-workflow--canonicalize-dir normalizes nil, relative, and absolute paths."
+  (let ((default-directory "/tmp/default-dir/"))
+    (should (equal (agent-shell-workflow--canonicalize-dir nil) "/tmp/default-dir/"))
+    (should (equal (agent-shell-workflow--canonicalize-dir "/tmp/some-path") "/tmp/some-path/"))
+    (should (equal (agent-shell-workflow--canonicalize-dir "/tmp/some-path/") "/tmp/some-path/"))))
+
+(ert-deftest agent-shell-workflow/insert-renders-template ()
+  "agent-shell-workflow--insert renders the template and passes arguments to agent-shell-insert."
+  (asw-test/isolate
+   (let* ((spec (agent-shell-workflow-register :id 'test-ins :template "Hello {{name}}!"))
+          (ctx (list :name "World"))
+          inserted-args)
+     (cl-letf (((symbol-function 'agent-shell-insert)
+                (lambda (&rest keys)
+                  (setq inserted-args keys)
+                  '((:end . 100)))))
+       (let ((res (agent-shell-workflow--insert spec ctx 'mock-buf t)))
+         (should (equal (plist-get inserted-args :text) "Hello World!"))
+         (should (eq (plist-get inserted-args :shell-buffer) 'mock-buf))
+         (should (eq (plist-get inserted-args :submit) t))
+         (should (equal res '((:end . 100)))))))))
+
+(ert-deftest agent-shell-workflow/apply-post-result-restart-and-unrecognized ()
+  "agent-shell-workflow--apply-post-result handles :restart and unrecognized flags."
+  (let (interrupt-called
+        (buf (generate-new-buffer "asw-restart-test")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-interrupt)
+                   (lambda () (setq interrupt-called t))))
+          (agent-shell-workflow--apply-post-result :restart buf)
+          (should interrupt-called)
+          ;; Unrecognized flag should be a safe no-op
+          (should-not (agent-shell-workflow--apply-post-result :unknown-flag buf)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/apply-post-result-drop-context-fallback ()
+  "agent-shell-workflow--apply-post-result falls back to agent-shell-clear when queue clear is not fboundp."
+  (let (clear-called
+        (buf (generate-new-buffer "asw-clear-test")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-clear)
+                   (lambda (b) (setq clear-called b)))
+                  ((symbol-function 'fboundp)
+                   (lambda (sym)
+                     (if (eq sym 'agent-shell-queue-enqueue-clear)
+                         nil
+                       (eq sym 'agent-shell-clear)))))
+          (agent-shell-workflow--apply-post-result :drop-context buf)
+          (should (eq clear-called buf)))
+      (kill-buffer buf))))
+
+;;; ─────────────────────────────────────────────────────────────
+;;; Additional Coverage: Queue Target Handler and Setup
+
+(ert-deftest agent-shell-workflow/queue-target-handler-returns-nil-for-other-targets ()
+  "agent-shell-workflow--queue-target-handler ignores non-:queue targets."
+  (asw-test/isolate
+   (let ((spec (agent-shell-workflow-register :id 'q-test :template "hi")))
+     (should-not (agent-shell-workflow--queue-target-handler spec nil :session-reuse nil))
+     (should-not (agent-shell-workflow--queue-target-handler spec nil :session-new nil)))))
+
+(ert-deftest agent-shell-workflow/queue-target-handler-errors-when-queue-unavailable ()
+  "agent-shell-workflow--queue-target-handler raises user-error when queue is not loaded."
+  (asw-test/isolate
+   (let ((spec (agent-shell-workflow-register :id 'q-test :template "hi")))
+     (cl-letf (((symbol-function 'fboundp)
+                (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) nil (cl-typep sym 'symbol)))))
+       (should-error (agent-shell-workflow--queue-target-handler spec nil :queue nil)
+                     :type 'user-error)))))
+
+(ert-deftest agent-shell-workflow/setup-queue-integration-adds-hook ()
+  "agent-shell-workflow--setup-queue-integration registers target hook and queue item type."
+  (let ((agent-shell-workflow-dispatch-target-functions nil)
+        type-registered-args)
+    (cl-letf (((symbol-function 'agent-shell-queue-register-item-type)
+               (lambda (&rest args) (setq type-registered-args args))))
+      (agent-shell-workflow--setup-queue-integration)
+      (should (memq #'agent-shell-workflow--queue-target-handler
+                    agent-shell-workflow-dispatch-target-functions))
+      (should type-registered-args)
+      (should (eq (plist-get type-registered-args :kind) 'workflow)))))
+
+;;; ─────────────────────────────────────────────────────────────
+;;; Additional Coverage: Library ISO Timestamps and Formatting
+
+(ert-deftest agent-shell-workflow/library-iso-to-seconds-test ()
+  "agent-shell-workflow-library--iso-to-seconds parses ISO timestamps and handles nil/empty."
+  (should (null (agent-shell-workflow-library--iso-to-seconds nil)))
+  (should (null (agent-shell-workflow-library--iso-to-seconds "")))
+  (should (null (agent-shell-workflow-library--iso-to-seconds "not-a-date")))
+  (let ((sec (agent-shell-workflow-library--iso-to-seconds "2026-10-04T12:00:00Z")))
+    (should (numberp sec))
+    (should (> sec 0))))
+
+(ert-deftest agent-shell-workflow/library-format-duration-test ()
+  "agent-shell-workflow-library--format-duration formats seconds, minutes, and hours."
+  (should (equal (agent-shell-workflow-library--format-duration nil nil) "n/a"))
+  (should (equal (agent-shell-workflow-library--format-duration "invalid" "invalid") "n/a"))
+  (let ((start "2026-10-04T12:00:00Z")
+        (end-sec "2026-10-04T12:00:45Z")
+        (end-min "2026-10-04T12:05:30Z")
+        (end-hr "2026-10-04T14:15:00Z"))
+    (should (equal (agent-shell-workflow-library--format-duration start end-sec) "45s"))
+    (should (equal (agent-shell-workflow-library--format-duration start end-min) "5m 30s"))
+    (should (equal (agent-shell-workflow-library--format-duration start end-hr) "2h 15m"))))
+
+(ert-deftest agent-shell-workflow/library-format-time-ago-test ()
+  "agent-shell-workflow-library--format-time-ago formats elapsed relative time."
+  (should (equal (agent-shell-workflow-library--format-time-ago nil) "n/a"))
+  (should (equal (agent-shell-workflow-library--format-time-ago "invalid") "n/a"))
+  (let* ((real-float-time (symbol-function 'float-time))
+         (now (funcall real-float-time))
+         (fmt (lambda (ts) (format-time-string "%Y-%m-%dT%T%z" ts))))
+    (cl-letf (((symbol-function 'float-time)
+               (lambda (&optional specified-time)
+                 (if specified-time
+                     (funcall real-float-time specified-time)
+                   now))))
+      ;; 30 seconds ago
+      (should (equal (agent-shell-workflow-library--format-time-ago (funcall fmt (- now 30))) "just now"))
+      ;; 10 minutes ago
+      (should (equal (agent-shell-workflow-library--format-time-ago (funcall fmt (- now 600))) "10m ago"))
+      ;; 3 hours ago
+      (should (equal (agent-shell-workflow-library--format-time-ago (funcall fmt (- now 10800))) "3h ago"))
+      ;; 2 days ago
+      (should (equal (agent-shell-workflow-library--format-time-ago (funcall fmt (- now 172800))) "2d ago")))))
+
+;;; ─────────────────────────────────────────────────────────────
+;;; Additional Coverage: Library Repo Slug Resolution and File Writing
+
+(ert-deftest agent-shell-workflow/library-resolve-repo-slug-test ()
+  "agent-shell-workflow-library--resolve-repo-slug handles slashed names, gh cli, and magit-dash."
+  ;; Slashed name passes through directly
+  (should (equal (agent-shell-workflow-library--resolve-repo-slug "owner/repo") "owner/repo"))
+  ;; Resolves via gh repo view
+  (cl-letf (((symbol-function 'shell-command-to-string)
+             (lambda (_) "upstream/cool-project
+")))
+    (should (equal (agent-shell-workflow-library--resolve-repo-slug "cool-project")
+                   "upstream/cool-project")))
+  ;; Resolves via magit-dash-gh--repo-info
+  (cl-letf (((symbol-function 'shell-command-to-string) (lambda (_) "error: not a repo
+"))
+            ((symbol-function 'magit-dash-gh--repo-info)
+             (lambda () '(:owner "dash-owner" :repo "dash-repo"))))
+    (should (equal (agent-shell-workflow-library--resolve-repo-slug "unslashed")
+                   "dash-owner/dash-repo")))
+  ;; Fallback when all fail
+  (cl-letf (((symbol-function 'shell-command-to-string) (lambda (_) ""))
+            ((symbol-function 'magit-dash-gh--repo-info) (lambda () nil)))
+    (should (equal (agent-shell-workflow-library--resolve-repo-slug "fallback-name")
+                   "fallback-name"))))
+
+(ert-deftest agent-shell-workflow/library-write-file-creates-parents ()
+  "agent-shell-workflow-library--write-file creates directories and writes content."
+  (let* ((temp-dir (make-temp-file "asw-write-test" t))
+         (target-file (expand-file-name "nested/sub/artifact.txt" temp-dir)))
+    (unwind-protect
+        (progn
+          (agent-shell-workflow-library--write-file target-file "test file content")
+          (should (file-exists-p target-file))
+          (with-temp-buffer
+            (insert-file-contents target-file)
+            (should (equal (buffer-string) "test file content")))
+          ;; Also handles nil content
+          (agent-shell-workflow-library--write-file target-file nil)
+          (with-temp-buffer
+            (insert-file-contents target-file)
+            (should (equal (buffer-string) ""))))
+      (delete-directory temp-dir t))))
+
+;;; ─────────────────────────────────────────────────────────────
+;;; Additional Coverage: PR Comments Formatting
+
+(ert-deftest agent-shell-workflow/library-format-pr-comments-markdown-test ()
+  "agent-shell-workflow-library--format-pr-comments-markdown formats structured PR data."
+  (let* ((view-obj (let ((h (make-hash-table :test #'equal)))
+                     (puthash "title" "Fix edge case in auth" h)
+                     (puthash "url" "https://github.com/foo/bar/pull/42" h)
+                     (puthash "author" (let ((a (make-hash-table :test #'equal)))
+                                         (puthash "login" "octocat" a)
+                                         a)
+                              h)
+                     (puthash "reviews"
+                              (vector
+                               (let ((r (make-hash-table :test #'equal)))
+                                 (puthash "author" (let ((u (make-hash-table :test #'equal)))
+                                                     (puthash "login" "reviewer1" u)
+                                                     u)
+                                          r)
+                                 (puthash "state" "APPROVED" r)
+                                 (puthash "body" "Looks good to me!" r)
+                                 r)
+                               (let ((r (make-hash-table :test #'equal)))
+                                 (puthash "author" (let ((u (make-hash-table :test #'equal)))
+                                                     (puthash "login" "github-actions" u)
+                                                     u)
+                                          r)
+                                 (puthash "state" "COMMENTED" r)
+                                 (puthash "body" "Bot comment" r)
+                                 r))
+                              h)
+                     (puthash "comments"
+                              (vector
+                               (let ((c (make-hash-table :test #'equal)))
+                                 (puthash "author" (let ((u (make-hash-table :test #'equal)))
+                                                     (puthash "login" "commenter1" u)
+                                                     u)
+                                          c)
+                                 (puthash "body" "Great catch." c)
+                                 c))
+                              h)
+                     h))
+         (inline-comments
+          (vector
+           (let ((c (make-hash-table :test #'equal)))
+             (puthash "path" "auth.el" c)
+             (puthash "line" 15 c)
+             (puthash "user" (let ((u (make-hash-table :test #'equal)))
+                               (puthash "login" "inline-reviewer" u)
+                               u)
+                      c)
+             (puthash "body" "Consider checking nil here." c)
+             c)))
+         (output (agent-shell-workflow-library--format-pr-comments-markdown
+                  "foo/bar" "42" view-obj inline-comments nil)))
+    (should (string-match-p "# PR #42 Comments: Fix edge case in auth" output))
+    (should (string-match-p "foo/bar" output))
+    (should (string-match-p "@octocat" output))
+    (should (string-match-p "Review by @reviewer1" output))
+    (should (string-match-p "Looks good to me!" output))
+    ;; Bot comment should be filtered out
+    (should-not (string-match-p "Review by @github-actions" output))
+    (should (string-match-p "Comment by @commenter1" output))
+    (should (string-match-p "Great catch." output))
+    (should (string-match-p "auth.el:15" output))
+    (should (string-match-p "inline-reviewer" output))))
+
+;;; ─────────────────────────────────────────────────────────────
+;;; Additional Coverage: Pipeline HITL Callbacks and Fallbacks
+
+(ert-deftest agent-shell-workflow/library-pipeline-run-post-op-diff-head-1-fallback ()
+  "pipeline-run-post-op falls back to git diff HEAD~1 when diff HEAD is empty."
+  (let ((ctx (list :op-id "op-fallback"
+                   :repo-root "/tmp/mock-repo"
+                   :worktree-dir "/tmp/mock-wt"
+                   :sprite-id "sp-fallback"
+                   :branch "branch-fallback"
+                   :args (list :file "test.el" :instruction "Fix commit"))))
+    (cl-letf (((symbol-function 'file-directory-p) (lambda (_) t))
+              ((symbol-function 'agent-shell-workflow-library--shell)
+               (lambda (&rest args)
+                 (cond
+                  ((member "HEAD" args) "   ")
+                  ((member "HEAD~1" args) "+ (committed fix)")
+                  (t "")))))
+      (let ((res (agent-shell-workflow-library--pipeline-run-post-op nil ctx nil)))
+        (should (eq (car res) :chain))
+        (let ((chain-args (caddr res)))
+          (should (equal (plist-get chain-args :diff) "+ (committed fix)")))))))
+
+(ert-deftest agent-shell-workflow/library-pipeline-verify-post-op-hitl-callbacks ()
+  "pipeline-verify-post-op HITL interactive choices execute expected cleanup."
+  (let* ((ctx (list :verify-result (list :accepted nil :confidence 0.5 :summary "Ambiguous" :issues '("Warn"))
+                    :args (list :op-id "op-hitl" :file "test.el" :diff "+ edit"
+                                :worktree-dir "/tmp/wt" :sprite-id "sp-hitl")))
+         captured-callback
+         killed-id
+         killed-cleanup)
+    (cl-letf (((symbol-function 'hitl-ask)
+               (lambda (&rest plist)
+                 (setq captured-callback (plist-get plist :callback))
+                 t))
+              ((symbol-function 'sprite-mcp-kill)
+               (lambda (id &rest plist)
+                 (setq killed-id id)
+                 (setq killed-cleanup (plist-get plist :cleanup-worktree)))))
+      (agent-shell-workflow-library--pipeline-verify-post-op nil ctx nil)
+      (should captured-callback)
+
+      ;; Choice 1: "Accept and Merge" -> cleanup-worktree nil
+      (setq killed-id nil killed-cleanup nil)
+      (funcall captured-callback "Accept and Merge" nil)
+      (should (equal killed-id "sp-hitl"))
+      (should (null killed-cleanup))
+
+      ;; Choice 2: "Reject and Discard" -> cleanup-worktree t
+      (setq killed-id nil killed-cleanup nil)
+      (funcall captured-callback "Reject and Discard" nil)
+      (should (equal killed-id "sp-hitl"))
+      (should (eq killed-cleanup t))
+
+      ;; Choice 3: "Keep Worktree" -> sprite-mcp-kill not called
+      (setq killed-id nil killed-cleanup nil)
+      (funcall captured-callback "Keep Worktree" nil)
+      (should-not killed-id))))
+
+(ert-deftest agent-shell-workflow/library-pipeline-verify-pre-op-gptel-unavailable-fallback ()
+  "pipeline-verify-pre-op falls back gracefully when gptel-request is not fboundp."
+  (let* ((ctx (list :args (list :file "test.el" :instruction "Fix" :diff "+ fix")))
+         called-ctx)
+    (cl-letf (((symbol-function 'fboundp)
+               (lambda (sym) (if (eq sym 'gptel-request) nil (cl-typep sym 'symbol)))))
+      (agent-shell-workflow-library--pipeline-verify-pre-op
+       ctx
+       (lambda (updated) (setq called-ctx updated)))
+      (should called-ctx)
+      (let ((res (plist-get called-ctx :verify-result)))
+        (should (eq (plist-get res :accepted) t))
+        (should (= (plist-get res :confidence) 0.5))
+        (should (string-match-p "gptel is not loaded" (plist-get res :summary)))))))
+
+;;; ─────────────────────────────────────────────────────────────
+;;; Additional Coverage: Menu Candidates and Selection
+
+(ert-deftest agent-shell-workflow/candidates-filters-by-category ()
+  "agent-shell-workflow--candidates filters specs by category or returns all."
+  (asw-test/isolate
+   (register-agent-shell-workflow c-cat1 :template "a" :category "Alpha")
+   (register-agent-shell-workflow c-cat2 :template "b" :category "Beta")
+   (register-agent-shell-workflow c-cat3 :template "c" :category "Alpha")
+   ;; Without filter
+   (let ((all (agent-shell-workflow--candidates)))
+     (should (seq-find (lambda (s) (eq (agent-shell-workflow-spec-id s) 'c-cat1)) all))
+     (should (seq-find (lambda (s) (eq (agent-shell-workflow-spec-id s) 'c-cat2)) all))
+     (should (seq-find (lambda (s) (eq (agent-shell-workflow-spec-id s) 'c-cat3)) all)))
+   ;; With filter
+   (let ((alpha (agent-shell-workflow--candidates "Alpha")))
+     (should (= (length alpha) 2))
+     (should (seq-every-p (lambda (s) (equal (agent-shell-workflow-spec-category s) "Alpha")) alpha)))))
+
 (provide 'test-agent-shell-workflow)
 
 ;;; test-agent-shell-workflow.el ends here
