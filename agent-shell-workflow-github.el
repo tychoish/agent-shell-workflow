@@ -53,9 +53,11 @@
 (defun agent-shell-workflow-library--format-duration (start-iso end-iso)
   "Format duration between START-ISO and END-ISO string."
   (let ((s (agent-shell-workflow-library--iso-to-seconds start-iso))
-        (e (agent-shell-workflow-library--iso-to-seconds end-iso)))
+        (e (agent-shell-workflow-library--iso-to-seconds end-iso))
+        (diff nil))
     (if (and s e)
-        (let ((diff (max 0 (floor (- e s)))))
+        (progn
+          (setq diff (max 0 (floor (- e s))))
           (cond ((< diff 60) (format "%ds" diff))
                 ((< diff 3600) (format "%dm %ds" (/ diff 60) (% diff 60)))
                 (t (format "%dh %dm" (/ diff 3600) (/ (% diff 3600) 60)))))
@@ -319,12 +321,12 @@ RAW-COMMENTS is fallback plain text from `gh pr view --comments`."
 
 ;; CI build failure remediation
 
-(defun agent-shell-workflow-library--fix-ci-pre-op (ctx)
+(defun agent-shell-workflow-library--fix-ci-pre-op (ctx &optional callback)
   "Fetch failing CI artifacts for :repo/:run-id in CTX and save them locally.
 Artifacts (failed-step log, jobs metadata JSON, triage index, and fix
 plan) are written under a unique directory in <project-root>/.agent/fix-ci/
 so the agent can inspect them as files without collisions across runs
-or attempts."
+or attempts.  When CALLBACK is given, executes asynchronously."
   (let* ((args (plist-get ctx :args))
          (raw-repo (or (plist-get args :repo)
                        (ignore-errors
@@ -345,60 +347,72 @@ or attempts."
          (updated-args (plist-put (plist-put (copy-sequence args) :repo repo-slug) :run-id run-id))
          (updated-ctx (plist-put (copy-sequence ctx) :args updated-args)))
     (if (and repo-slug run-id-str)
-        (let* ((root (agent-shell-workflow-library--project-root))
-               ;; Fetch run summary, failed logs, and job metadata
-               (ci-summary (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug))
-               (ci-log (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug "--log-failed"))
-               (ci-jobs (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug "--json" "jobs,conclusion,workflowName,url,displayTitle,headBranch"))
-               (parsed-jobs (ignore-errors (json-parse-string ci-jobs :object-type 'alist :array-type 'list)))
-               (run-branch (or (plist-get args :branch)
-                               (and (listp parsed-jobs) (alist-get 'headBranch parsed-jobs))
-                               target-branch))
-               (base-ci-dir (expand-file-name ".agent/fix-ci" root))
-               (ci-dir (agent-shell-workflow-library--unique-artifact-dir
-                        base-ci-dir
-                        (format "run-%s" run-id-str)
-                        run-branch
-                        (plist-get args :date)))
-               (log-file (expand-file-name (format "run-%s-logs.txt" run-id-str) ci-dir))
-               (jobs-file (expand-file-name (format "run-%s-jobs.json" run-id-str) ci-dir))
-               (index-file (expand-file-name "ci-triage-index.md" ci-dir))
-               (alias-log-file (expand-file-name "ci-logs.txt" ci-dir))
-               (alias-jobs-file (expand-file-name "ci-jobs.json" ci-dir))
-               (plan-file (expand-file-name "fix-plan.md" ci-dir))
-               (rel-ci-dir (file-relative-name ci-dir root))
-               (rel-log-file (file-relative-name log-file root))
-               (rel-jobs-file (file-relative-name jobs-file root))
-               (rel-index-file (file-relative-name index-file root))
-               (rel-plan-file (file-relative-name plan-file root))
-               (log-content (if (and (stringp ci-log) (not (string-empty-p ci-log)))
-                                ci-log
-                              (let ((full-log (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug "--log")))
-                                (if (and (stringp full-log) (not (string-empty-p full-log)))
-                                    full-log
-                                  (format "No failed-step logs returned for run #%s.\n\nSummary:\n%s" run-id-str ci-summary)))))
-               (jobs-content (if (and (stringp ci-jobs) (not (string-empty-p ci-jobs)))
-                                 ci-jobs
-                               "{}"))
-               (index-content
-                (format "# CI Triage Index\n\n- **Repository**: %s\n- **Run ID**: %s\n- **Branch**: %s\n- **Generated**: %s\n- **Log File**: `%s`\n- **Jobs Metadata**: `%s`\n- **Fix Plan**: `%s`\n\n## Summary\n\n```\n%s\n```\n"
-                        repo-slug run-id-str (or run-branch "unknown") (format-time-string "%Y-%m-%dT%T%z") rel-log-file rel-jobs-file rel-plan-file ci-summary)))
-          ;; Write artifacts to local filesystem
-          (agent-shell-workflow-library--write-file log-file log-content)
-          (agent-shell-workflow-library--write-file jobs-file jobs-content)
-          (agent-shell-workflow-library--write-file index-file index-content)
-          (agent-shell-workflow-library--write-file alias-log-file log-content)
-          (agent-shell-workflow-library--write-file alias-jobs-file jobs-content)
-          ;; Populate context
-          (setq updated-ctx (plist-put updated-ctx :ci-summary ci-summary))
-          (setq updated-ctx (plist-put updated-ctx :ci-dir rel-ci-dir))
-          (setq updated-ctx (plist-put updated-ctx :ci-log-file rel-log-file))
-          (setq updated-ctx (plist-put updated-ctx :ci-jobs-file rel-jobs-file))
-          (setq updated-ctx (plist-put updated-ctx :ci-index-file rel-index-file))
-          (setq updated-ctx (plist-put updated-ctx :ci-plan-file rel-plan-file))
-          (setq updated-ctx (plist-put updated-ctx :ci-log ci-log))
-          updated-ctx)
-      updated-ctx)))
+        (let ((finish
+               (lambda (ci-summary ci-log ci-jobs)
+                 (let* ((root (agent-shell-workflow-library--project-root))
+                        (parsed-jobs (ignore-errors (json-parse-string ci-jobs :object-type 'alist :array-type 'list)))
+                        (run-branch (or (plist-get args :branch)
+                                        (and (listp parsed-jobs) (alist-get 'headBranch parsed-jobs))
+                                        target-branch))
+                        (base-ci-dir (expand-file-name ".agent/fix-ci" root))
+                        (ci-dir (agent-shell-workflow-library--unique-artifact-dir
+                                 base-ci-dir
+                                 (format "run-%s" run-id-str)
+                                 run-branch
+                                 (plist-get args :date)))
+                        (log-file (expand-file-name (format "run-%s-logs.txt" run-id-str) ci-dir))
+                        (jobs-file (expand-file-name (format "run-%s-jobs.json" run-id-str) ci-dir))
+                        (index-file (expand-file-name "ci-triage-index.md" ci-dir))
+                        (alias-log-file (expand-file-name "ci-logs.txt" ci-dir))
+                        (alias-jobs-file (expand-file-name "ci-jobs.json" ci-dir))
+                        (plan-file (expand-file-name "fix-plan.md" ci-dir))
+                        (rel-ci-dir (file-relative-name ci-dir root))
+                        (rel-log-file (file-relative-name log-file root))
+                        (rel-jobs-file (file-relative-name jobs-file root))
+                        (rel-index-file (file-relative-name index-file root))
+                        (rel-plan-file (file-relative-name plan-file root))
+                        (log-content (if (and (stringp ci-log) (not (string-empty-p ci-log)))
+                                         ci-log
+                                       (format "No failed-step logs returned for run #%s.\n\nSummary:\n%s" run-id-str ci-summary)))
+                        (jobs-content (if (and (stringp ci-jobs) (not (string-empty-p ci-jobs)))
+                                          ci-jobs
+                                        "{}"))
+                        (index-content
+                         (format "# CI Triage Index\n\n- **Repository**: %s\n- **Run ID**: %s\n- **Branch**: %s\n- **Generated**: %s\n- **Log File**: `%s`\n- **Jobs Metadata**: `%s`\n- **Fix Plan**: `%s`\n\n## Summary\n\n```\n%s\n```\n"
+                                 repo-slug run-id-str (or run-branch "unknown") (format-time-string "%Y-%m-%dT%T%z") rel-log-file rel-jobs-file rel-plan-file ci-summary)))
+                   ;; Write artifacts to local filesystem
+                   (agent-shell-workflow-library--write-file log-file log-content)
+                   (agent-shell-workflow-library--write-file jobs-file jobs-content)
+                   (agent-shell-workflow-library--write-file index-file index-content)
+                   (agent-shell-workflow-library--write-file alias-log-file log-content)
+                   (agent-shell-workflow-library--write-file alias-jobs-file jobs-content)
+                   ;; Populate context
+                   (setq updated-ctx (plist-put updated-ctx :ci-summary ci-summary))
+                   (setq updated-ctx (plist-put updated-ctx :ci-dir rel-ci-dir))
+                   (setq updated-ctx (plist-put updated-ctx :ci-log-file rel-log-file))
+                   (setq updated-ctx (plist-put updated-ctx :ci-jobs-file rel-jobs-file))
+                   (setq updated-ctx (plist-put updated-ctx :ci-index-file rel-index-file))
+                   (setq updated-ctx (plist-put updated-ctx :ci-plan-file rel-plan-file))
+                   (setq updated-ctx (plist-put updated-ctx :ci-log ci-log))
+                   updated-ctx))))
+          (if callback
+              (agent-shell-workflow--gather-async
+               (list (list :ci-summary "gh" "run" "view" run-id-str "--repo" repo-slug)
+                     (list :ci-log "gh" "run" "view" run-id-str "--repo" repo-slug "--log-failed")
+                     (list :ci-jobs "gh" "run" "view" run-id-str "--repo" repo-slug "--json" "jobs,conclusion,workflowName,url,displayTitle,headBranch"))
+               (lambda (results)
+                 (let* ((summary (or (cdr (assq :ci-summary results)) ""))
+                        (log (or (cdr (assq :ci-log results)) ""))
+                        (jobs (or (cdr (assq :ci-jobs results)) "")))
+                   (funcall callback (funcall finish summary log jobs)))))
+            ;; Synchronous path
+            (let* ((ci-summary (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug))
+                   (ci-log (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug "--log-failed"))
+                   (ci-jobs (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug "--json" "jobs,conclusion,workflowName,url,displayTitle,headBranch")))
+              (funcall finish ci-summary ci-log ci-jobs))))
+      (if callback
+          (funcall callback updated-ctx)
+        updated-ctx))))
 
 (register-agent-shell-workflow fix-ci
   :doc "Download CI artifacts to local filesystem and prompt agent to fix build failure"
@@ -425,11 +439,12 @@ Do NOT read the entire log file into context. Inspect the logs as files using se
 
 ;; PR review comment remediation
 
-(defun agent-shell-workflow-library--pr-review-pre-op (ctx)
+(defun agent-shell-workflow-library--pr-review-pre-op (ctx &optional callback)
   "Fetch PR review comments for :pr-number in CTX and save them locally.
 Markdown summary and JSON export are saved under a unique directory
 under <project-root>/.agent/pr-comments/ so the agent can inspect them
-as files without colliding across PRs or review attempts."
+as files without colliding across PRs or review attempts.
+When CALLBACK is given, executes asynchronously."
   (let* ((args (plist-get ctx :args))
          (raw-repo (or (plist-get args :repo)
                        (ignore-errors
@@ -450,100 +465,117 @@ as files without colliding across PRs or review attempts."
          (pr-str (if pr-number (format "%s" pr-number)
                    (user-error "No PR number specified or detected for pr-review-patch")))
          (repo-args (if repo-slug (list "--repo" repo-slug) nil))
-         ;; Fetch structured review info
-         (view-json-raw
-          (apply #'agent-shell-workflow-library--shell
-                 "gh" "pr" "view" pr-str "--json"
-                 "number,title,author,url,reviews,comments,headRefName"
-                 repo-args))
-         ;; Fetch inline review comments
-         (api-json-raw
-          (when repo-slug
-            (agent-shell-workflow-library--shell
-             "gh" "api" (format "repos/%s/pulls/%s/comments" repo-slug pr-str)
-             "--paginate")))
-         ;; Fetch raw formatted comments fallback
-         (raw-comments
-          (apply #'agent-shell-workflow-library--shell
-                 "gh" "pr" "view" pr-str "--comments"
-                 repo-args))
-         ;; Parse JSON responses
-         (view-obj (ignore-errors
-                     (json-parse-string view-json-raw :object-type 'hash-table :array-type 'array)))
-         (api-arr (ignore-errors
-                    (when (and api-json-raw (not (string-empty-p api-json-raw)))
-                      (json-parse-string api-json-raw :object-type 'hash-table :array-type 'array))))
-         (head-ref (when (hash-table-p view-obj) (gethash "headRefName" view-obj)))
-         (branch (or (plist-get args :branch)
-                     (and (stringp head-ref) (not (string-empty-p head-ref)) head-ref)
-                     (agent-shell-workflow-library--current-branch)))
-         (root (agent-shell-workflow-library--project-root))
-         (base-pr-dir (expand-file-name ".agent/pr-comments" root))
-         (pr-dir (agent-shell-workflow-library--unique-artifact-dir
-                  base-pr-dir
-                  (format "pr-%s" pr-str)
-                  branch
-                  (plist-get args :date)))
-         (md-file (expand-file-name (format "pr-%s-comments.md" pr-str) pr-dir))
-         (json-file (expand-file-name (format "pr-%s-comments.json" pr-str) pr-dir))
-         (alias-md-file (expand-file-name "pr-comments.md" pr-dir))
-         (alias-json-file (expand-file-name "pr-comments.json" pr-dir))
-         (plan-file (expand-file-name "review-plan.md" pr-dir))
-         (rel-pr-dir (file-relative-name pr-dir root))
-         (rel-md-file (file-relative-name md-file root))
-         (rel-json-file (file-relative-name json-file root))
-         (rel-plan-file (file-relative-name plan-file root))
-         ;; Render Markdown
-         (md-content (agent-shell-workflow-library--format-pr-comments-markdown
-                      repo-slug pr-str view-obj api-arr raw-comments))
-         ;; Build structured JSON
-         (json-content
-          (if (hash-table-p view-obj)
-              (let ((table (make-hash-table :test #'equal)))
-                (puthash "pr" (or pr-number (string-to-number pr-str)) table)
-                (when repo-slug (puthash "repo" repo-slug table))
-                (when-let* ((t-val (gethash "title" view-obj))) (puthash "title" t-val table))
-                (when-let* ((u-val (gethash "url" view-obj))) (puthash "url" u-val table))
-                (puthash "reviews" (or (gethash "reviews" view-obj) []) table)
-                (puthash "comments" (or (gethash "comments" view-obj) []) table)
-                (puthash "inline_comments" (or api-arr []) table)
-                (or (ignore-errors (json-serialize table)) "{}"))
-            (if (and view-json-raw (not (string-empty-p view-json-raw)))
-                view-json-raw
-              "{}")))
-         ;; Summary string
-         (pr-summary
-          (if (hash-table-p view-obj)
-              (let* ((title (or (gethash "title" view-obj) ""))
-                     (author-obj (gethash "author" view-obj))
-                     (author (if (hash-table-p author-obj) (gethash "login" author-obj) (format "%s" (or author-obj ""))))
-                     (reviews (gethash "reviews" view-obj))
-                     (comments (gethash "comments" view-obj))
-                     (inline api-arr))
-                (format "PR #%s: %s (by @%s) — %d review(s), %d comment(s), %d inline comment(s)"
-                        pr-str title author
-                        (if (vectorp reviews) (length reviews) 0)
-                        (if (vectorp comments) (length comments) 0)
-                        (if (vectorp inline) (length inline) 0)))
-            (format "PR #%s in %s" pr-str (or repo-slug "repository")))))
-    ;; Write artifacts to disk
-    (agent-shell-workflow-library--write-file md-file md-content)
-    (agent-shell-workflow-library--write-file json-file (or json-content "{}"))
-    (agent-shell-workflow-library--write-file alias-md-file md-content)
-    (agent-shell-workflow-library--write-file alias-json-file (or json-content "{}"))
-    ;; Populate context
-    (let* ((updated-args (plist-put (copy-sequence args) :pr-number (or pr-number (string-to-number pr-str))))
-           (updated-ctx (plist-put (copy-sequence ctx) :args updated-args)))
-      (when repo-slug
-        (setq updated-args (plist-put updated-args :repo repo-slug))
-        (setq updated-ctx (plist-put updated-ctx :args updated-args)))
-      (setq updated-ctx (plist-put updated-ctx :pr-summary pr-summary))
-      (setq updated-ctx (plist-put updated-ctx :pr-dir rel-pr-dir))
-      (setq updated-ctx (plist-put updated-ctx :pr-comments-file rel-md-file))
-      (setq updated-ctx (plist-put updated-ctx :pr-comments-json-file rel-json-file))
-      (setq updated-ctx (plist-put updated-ctx :pr-plan-file rel-plan-file))
-      (setq updated-ctx (plist-put updated-ctx :pr-comments raw-comments))
-      updated-ctx)))
+         (finish
+          (lambda (view-json-raw api-json-raw raw-comments)
+            (let* ((view-obj (ignore-errors
+                               (json-parse-string view-json-raw :object-type 'hash-table :array-type 'array)))
+                   (api-arr (ignore-errors
+                              (when (and api-json-raw (not (string-empty-p api-json-raw)))
+                                (json-parse-string api-json-raw :object-type 'hash-table :array-type 'array))))
+                   (head-ref (when (hash-table-p view-obj) (gethash "headRefName" view-obj)))
+                   (branch (or (plist-get args :branch)
+                               (and (stringp head-ref) (not (string-empty-p head-ref)) head-ref)
+                               (agent-shell-workflow-library--current-branch)))
+                   (root (agent-shell-workflow-library--project-root))
+                   (base-pr-dir (expand-file-name ".agent/pr-comments" root))
+                   (pr-dir (agent-shell-workflow-library--unique-artifact-dir
+                            base-pr-dir
+                            (format "pr-%s" pr-str)
+                            branch
+                            (plist-get args :date)))
+                   (md-file (expand-file-name (format "pr-%s-comments.md" pr-str) pr-dir))
+                   (json-file (expand-file-name (format "pr-%s-comments.json" pr-str) pr-dir))
+                   (alias-md-file (expand-file-name "pr-comments.md" pr-dir))
+                   (alias-json-file (expand-file-name "pr-comments.json" pr-dir))
+                   (plan-file (expand-file-name "review-plan.md" pr-dir))
+                   (rel-pr-dir (file-relative-name pr-dir root))
+                   (rel-md-file (file-relative-name md-file root))
+                   (rel-json-file (file-relative-name json-file root))
+                   (rel-plan-file (file-relative-name plan-file root))
+                   ;; Render Markdown
+                   (md-content (agent-shell-workflow-library--format-pr-comments-markdown
+                                repo-slug pr-str view-obj api-arr raw-comments))
+                   ;; Build structured JSON
+                   (json-content
+                    (if (hash-table-p view-obj)
+                        (let ((table (make-hash-table :test #'equal)))
+                          (puthash "pr" (or pr-number (string-to-number pr-str)) table)
+                          (when repo-slug (puthash "repo" repo-slug table))
+                          (when-let* ((t-val (gethash "title" view-obj))) (puthash "title" t-val table))
+                          (when-let* ((u-val (gethash "url" view-obj))) (puthash "url" u-val table))
+                          (puthash "reviews" (or (gethash "reviews" view-obj) []) table)
+                          (puthash "comments" (or (gethash "comments" view-obj) []) table)
+                          (puthash "inline_comments" (or api-arr []) table)
+                          (or (ignore-errors (json-serialize table)) "{}"))
+                      (if (and view-json-raw (not (string-empty-p view-json-raw)))
+                          view-json-raw
+                        "{}")))
+                   ;; Summary string
+                   (pr-summary
+                    (if (hash-table-p view-obj)
+                        (let* ((title (or (gethash "title" view-obj) ""))
+                               (author-obj (gethash "author" view-obj))
+                               (author (if (hash-table-p author-obj) (gethash "login" author-obj) (format "%s" (or author-obj ""))))
+                               (reviews (gethash "reviews" view-obj))
+                               (comments (gethash "comments" view-obj))
+                               (inline api-arr))
+                          (format "PR #%s: %s (by @%s) — %d review(s), %d comment(s), %d inline comment(s)"
+                                  pr-str title author
+                                  (if (vectorp reviews) (length reviews) 0)
+                                  (if (vectorp comments) (length comments) 0)
+                                  (if (vectorp inline) (length inline) 0)))
+                      (format "PR #%s in %s" pr-str (or repo-slug "repository")))))
+              ;; Write artifacts to disk
+              (agent-shell-workflow-library--write-file md-file md-content)
+              (agent-shell-workflow-library--write-file json-file (or json-content "{}"))
+              (agent-shell-workflow-library--write-file alias-md-file md-content)
+              (agent-shell-workflow-library--write-file alias-json-file (or json-content "{}"))
+              ;; Populate context
+              (let* ((updated-args (plist-put (copy-sequence args) :pr-number (or pr-number (string-to-number pr-str))))
+                     (updated-ctx (plist-put (copy-sequence ctx) :args updated-args)))
+                (when repo-slug
+                  (setq updated-args (plist-put updated-args :repo repo-slug))
+                  (setq updated-ctx (plist-put updated-ctx :args updated-args)))
+                (setq updated-ctx (plist-put updated-ctx :pr-summary pr-summary))
+                (setq updated-ctx (plist-put updated-ctx :pr-dir rel-pr-dir))
+                (setq updated-ctx (plist-put updated-ctx :pr-comments-file rel-md-file))
+                (setq updated-ctx (plist-put updated-ctx :pr-comments-json-file rel-json-file))
+                (setq updated-ctx (plist-put updated-ctx :pr-plan-file rel-plan-file))
+                (setq updated-ctx (plist-put updated-ctx :pr-comments raw-comments))
+                updated-ctx)))))
+    (if callback
+        (agent-shell-workflow--gather-async
+         (delq nil
+               (list (append (list :view "gh" "pr" "view" pr-str "--json"
+                                   "number,title,author,url,reviews,comments,headRefName")
+                             repo-args)
+                     (when repo-slug
+                       (list :api "gh" "api"
+                             (format "repos/%s/pulls/%s/comments" repo-slug pr-str)
+                             "--paginate"))
+                     (append (list :raw "gh" "pr" "view" pr-str "--comments")
+                             repo-args)))
+         (lambda (results)
+           (let ((view-json-raw (or (cdr (assq :view results)) ""))
+                 (api-json-raw (or (cdr (assq :api results)) ""))
+                 (raw-comments (or (cdr (assq :raw results)) "")))
+             (funcall callback (funcall finish view-json-raw api-json-raw raw-comments)))))
+      ;; Synchronous path
+      (let* ((view-json-raw
+              (apply #'agent-shell-workflow-library--shell
+                     "gh" "pr" "view" pr-str "--json"
+                     "number,title,author,url,reviews,comments,headRefName"
+                     repo-args))
+             (api-json-raw
+              (when repo-slug
+                (agent-shell-workflow-library--shell
+                 "gh" "api" (format "repos/%s/pulls/%s/comments" repo-slug pr-str)
+                 "--paginate")))
+             (raw-comments
+              (apply #'agent-shell-workflow-library--shell
+                     "gh" "pr" "view" pr-str "--comments"
+                     repo-args)))
+        (funcall finish view-json-raw api-json-raw raw-comments)))))
 
 (register-agent-shell-workflow pr-review-patch
   :doc "Fetch PR review comments to local filesystem and draft remediation patch"

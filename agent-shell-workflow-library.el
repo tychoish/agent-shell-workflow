@@ -85,6 +85,8 @@ via `agent-shell-workflow-library--shell` and stored under CTX-KEY."
   (dolist (pair pairs ctx)
     (plist-put ctx (car pair) (apply #'agent-shell-workflow-library--shell (cdr pair)))))
 
+(defalias 'agent-shell-workflow-library--gather-async #'agent-shell-workflow--gather-async)
+
 ;; Local filesystem helpers for prompt artifacts
 (defun agent-shell-workflow-library--project-root ()
   "Return the root directory of the current project or repository."
@@ -96,20 +98,29 @@ via `agent-shell-workflow-library--shell` and stored under CTX-KEY."
 
 (defun agent-shell-workflow-library--write-file (file-path content)
   "Write CONTENT string to FILE-PATH, creating parent directories as needed."
-  (let ((dir (file-name-directory file-path)))
+  (let ((dir (file-name-directory file-path))
+        (text (or content "")))
     (when (and dir (not (file-directory-p dir)))
-      (make-directory dir t)))
-  (with-temp-file file-path
-    (insert (or content ""))))
+      (make-directory dir t))
+    (with-temp-file file-path
+      (insert text))))
 
 ;; Test coverage expansion
 
-(defun agent-shell-workflow-library--coverage-pre-op (ctx)
+(defun agent-shell-workflow-library--coverage-pre-op (ctx &optional callback)
   "Diff :file in CTX against HEAD to scope untested edits."
   (let* ((args (plist-get ctx :args))
-         (file (plist-get args :file))
-         (diff (agent-shell-workflow-library--diff-summary (list "HEAD" "--" file) 5)))
-    (plist-put (copy-sequence ctx) :file-diff diff)))
+         (file (plist-get args :file)))
+    (if callback
+        (agent-shell-workflow--run-process-async
+         "git" (list "diff" "HEAD" "--" file) nil
+         (lambda (out)
+           (let ((diff (if (string-empty-p out)
+                           "(no diff against HEAD)"
+                         out)))
+             (funcall callback (plist-put (copy-sequence ctx) :file-diff diff)))))
+      (let ((diff (agent-shell-workflow-library--diff-summary (list "HEAD" "--" file) 5)))
+        (plist-put (copy-sequence ctx) :file-diff diff)))))
 
 (register-agent-shell-workflow expand-coverage
   :doc "Analyze uncovered lines and author missing unit tests"
@@ -125,12 +136,18 @@ Diff:
 
 ;; Refactor / dead-code cleanup
 
-(defun agent-shell-workflow-library--refactor-pre-op (ctx)
+(defun agent-shell-workflow-library--refactor-pre-op (ctx &optional callback)
   "Gather git log summary for :file in CTX to scope stale/legacy code."
   (let* ((args (plist-get ctx :args))
-         (file (plist-get args :file))
-         (log (agent-shell-workflow-library--git-output "log" "--oneline" "-n" "5" "--" file)))
-    (plist-put (copy-sequence ctx) :recent-history (if (string-empty-p log) "(no history)" log))))
+         (file (plist-get args :file)))
+    (if callback
+        (agent-shell-workflow--run-process-async
+         "git" (list "log" "--oneline" "-n" "5" "--" file) nil
+         (lambda (out)
+           (let ((log (if (string-empty-p out) "(no history)" out)))
+             (funcall callback (plist-put (copy-sequence ctx) :recent-history log)))))
+      (let ((log (agent-shell-workflow-library--git-output "log" "--oneline" "-n" "5" "--" file)))
+        (plist-put (copy-sequence ctx) :recent-history (if (string-empty-p log) "(no history)" log))))))
 
 (register-agent-shell-workflow refactor-module
   :doc "Clean up dead code and migrate legacy macro forms"
@@ -146,23 +163,36 @@ Recent history:
 
 ;; Git commit authoring
 
-(defun agent-shell-workflow-library--create-commit-pre-op (ctx)
+(defun agent-shell-workflow-library--create-commit-pre-op (ctx &optional callback)
   "Gather git status, diff against HEAD, and recent log history for CTX.
 Uses Magit or Git directly to gather state."
   (let* ((args (plist-get ctx :args))
          (files (plist-get args :files))
          (has-files (and (stringp files) (not (string-empty-p files))))
          (file-args (when has-files (list "--" files)))
-         (status (apply #'agent-shell-workflow-library--git-output
-                        (append '("status" "--short") file-args)))
-         (diff (agent-shell-workflow-library--diff-summary
-                (append '("HEAD") file-args) 5))
-         (log (agent-shell-workflow-library--git-output "log" "--oneline" "-n" "5"))
-         (updated-ctx (copy-sequence ctx)))
-    (setq updated-ctx (plist-put updated-ctx :git-status (if (string-empty-p status) "(clean)" status)))
-    (setq updated-ctx (plist-put updated-ctx :git-diff diff))
-    (setq updated-ctx (plist-put updated-ctx :recent-log (if (string-empty-p log) "(no history)" log)))
-    updated-ctx))
+         (finish
+          (lambda (status diff log)
+            (let ((updated-ctx (copy-sequence ctx)))
+              (setq updated-ctx (plist-put updated-ctx :git-status (if (string-empty-p status) "(clean)" status)))
+              (setq updated-ctx (plist-put updated-ctx :git-diff (if (string-empty-p diff) "(no diff)" diff)))
+              (setq updated-ctx (plist-put updated-ctx :recent-log (if (string-empty-p log) "(no history)" log)))
+              updated-ctx))))
+    (if callback
+        (agent-shell-workflow--gather-async
+         (list (append '(:status "git" "status" "--short") file-args)
+               (append '(:diff "git" "diff" "HEAD") file-args)
+               '(:log "git" "log" "--oneline" "-n" "5"))
+         (lambda (results)
+           (let ((status (or (cdr (assq :status results)) ""))
+                 (diff (or (cdr (assq :diff results)) ""))
+                 (log (or (cdr (assq :log results)) "")))
+             (funcall callback (funcall finish status diff log)))))
+      (let ((status (apply #'agent-shell-workflow-library--git-output
+                           (append '("status" "--short") file-args)))
+            (diff (agent-shell-workflow-library--diff-summary
+                   (append '("HEAD") file-args) 5))
+            (log (agent-shell-workflow-library--git-output "log" "--oneline" "-n" "5")))
+        (funcall finish status diff log)))))
 
 (register-agent-shell-workflow create-commit
   :doc "Draft and create a git commit with concise message and attribution"

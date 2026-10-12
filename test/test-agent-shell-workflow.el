@@ -1363,3 +1363,224 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (provide 'test-agent-shell-workflow)
 
 ;;; test-agent-shell-workflow.el ends here
+
+;;; ─────────────────────────────────────────────────────────
+;;; Context clearing, Async execution, and Eager Session Resolution
+
+(ert-deftest agent-shell-workflow/clear-command-resolution-omp ()
+  "_clear-command-for-buffer resolves /shake for omp buffers."
+  (let ((buf (generate-new-buffer "*omp*")))
+    (unwind-protect
+        (should (equal (agent-shell-workflow--clear-command-for-buffer buf) "/shake"))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/clear-command-resolution-default ()
+  "_clear-command-for-buffer resolves /clear by default."
+  (let ((buf (generate-new-buffer "*agent-shell*")))
+    (unwind-protect
+        (should (equal (agent-shell-workflow--clear-command-for-buffer buf) "/clear"))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/clear-command-resolution-custom ()
+  "_clear-command-for-buffer respects agent-shell-workflow-clear-commands."
+  (let ((agent-shell-workflow-clear-commands (quote ((omp . "/shake") (t . "/wipe"))))
+        (buf (generate-new-buffer "*generic-agent*")))
+    (unwind-protect
+        (should (equal (agent-shell-workflow--clear-command-for-buffer buf) "/wipe"))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/maybe-clear-reused-buffer-confirmed ()
+  "_maybe-clear-reused-buffer inserts clear command when user confirms."
+  (let ((buf (generate-new-buffer "*test-clear*"))
+        inserted-text
+        inserted-submit)
+    (unwind-protect
+        (cl-letf (((symbol-function (quote y-or-n-p)) (lambda (&rest _) t))
+                  ((symbol-function (quote agent-shell-insert))
+                   (lambda (&rest args)
+                     (setq inserted-text (plist-get args :text))
+                     (setq inserted-submit (plist-get args :submit)))))
+          (let ((res (agent-shell-workflow--maybe-clear-reused-buffer buf)))
+            (should (eq res t))
+            (should (equal inserted-text "/clear"))
+            (should (eq inserted-submit t))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/maybe-clear-reused-buffer-declined ()
+  "_maybe-clear-reused-buffer does nothing when user declines."
+  (let ((buf (generate-new-buffer "*test-clear-declined*"))
+        insert-called)
+    (unwind-protect
+        (cl-letf (((symbol-function (quote y-or-n-p)) (lambda (&rest _) nil))
+                  ((symbol-function (quote agent-shell-insert))
+                   (lambda (&rest _) (setq insert-called t))))
+          (let ((res (agent-shell-workflow--maybe-clear-reused-buffer buf)))
+            (should-not res)
+            (should-not insert-called)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/run-process-async-echo ()
+  "_run-process-async completes and invokes callback with stdout."
+  (let ((done nil)
+        (result nil))
+    (agent-shell-workflow--run-process-async
+     "sh" (list "-c" "echo async-test-output") nil
+     (lambda (out)
+       (setq result out)
+       (setq done t)))
+    (while (not done)
+      (accept-process-output nil 0.05))
+    (should (equal result "async-test-output"))))
+
+(ert-deftest agent-shell-workflow/gather-async-multi ()
+  "_gather-async runs specs and collects alist in key order."
+  (let ((done nil)
+        (results nil))
+    (agent-shell-workflow--gather-async
+     (quote ((:first "sh" "-c" "echo 1")
+             (:second "sh" "-c" "echo 2")))
+     (lambda (res)
+       (setq results res)
+       (setq done t)))
+    (while (not done)
+      (accept-process-output nil 0.05))
+    (should (equal results (quote ((:first . "1") (:second . "2")))))))
+
+(ert-deftest agent-shell-workflow/eager-session-resolution-order ()
+  "Dispatch resolves session-buffer eagerly before pre-op runs."
+  (asw-test/isolate
+   (let ((order nil)
+         (test-buf (generate-new-buffer "*asw-order-shell*")))
+     (unwind-protect
+         (progn
+           (register-agent-shell-workflow eager-order-test
+             :template "Order: {{step}}"
+             :target :session-reuse
+             :pre-op (lambda (ctx callback)
+                       (push (cons :pre-op (plist-get ctx :shell-buffer)) order)
+                       (funcall callback (plist-put ctx :step "done"))))
+           (cl-letf (((symbol-function (quote agent-shell-workflow--project-buffers))
+                      (lambda (_dir) (list test-buf)))
+                     ((symbol-function (quote y-or-n-p))
+                      (lambda (_prompt) (push :prompted order) t))
+                     ((symbol-function (quote agent-shell-insert))
+                      (lambda (&rest args)
+                        (push (cons :insert (plist-get args :text)) order))))
+             (agent-shell-workflow-dispatch (quote eager-order-test))
+             ;; Verification: reuse prompt occurred, then pre-op ran with shell-buffer in ctx
+             (should (member :prompted order))
+             (should (equal (alist-get :pre-op order) test-buf))))
+       (kill-buffer test-buf)))))
+
+(ert-deftest agent-shell-workflow/dispatch-to-buffer-waits-for-pending-clear ()
+  "_dispatch-to-buffer defers insert when pending clear is active."
+  (let ((buf (generate-new-buffer "*asw-pending-clear*"))
+        (inserted nil)
+        (sub-callback nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (agent-shell-mode)
+            (setq-local agent-shell-workflow--pending-clear t))
+          (cl-letf (((symbol-function (quote agent-shell-subscribe-to))
+                     (lambda (&rest args)
+                       (setq sub-callback (plist-get args :on-event))
+                       (quote test-sub)))
+                    ((symbol-function (quote agent-shell-unsubscribe))
+                     (lambda (&rest _) t))
+                    ((symbol-function (quote agent-shell-workflow--insert))
+                     (lambda (&rest _) (setq inserted t) (quote ((:end . 10))))))
+            (agent-shell-workflow--dispatch-to-buffer
+             (agent-shell-workflow-spec--make :template "hi")
+             nil buf nil)
+            ;; Insertion should be deferred because pending clear is t
+            (should-not inserted)
+            (should sub-callback)
+            ;; Trigger turn-complete callback
+            (funcall sub-callback nil)
+            ;; Now insertion should have executed and pending flag cleared
+            (should inserted)
+            (should-not (buffer-local-value (quote agent-shell-workflow--pending-clear) buf))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/library-fix-ci-pre-op-async ()
+  "library--fix-ci-pre-op invokes callback with populated ctx when given callback."
+  (let ((called nil)
+        (ctx (list :args (quote (:repo "foo/bar" :run-id 123)))))
+    (cl-letf (((symbol-function (quote agent-shell-workflow--gather-async))
+               (lambda (_pairs callback &rest _)
+                 (funcall callback
+                          (quote ((:ci-summary . "All passed")
+                                  (:ci-log . "Log output")
+                                  (:ci-jobs . "[]")))))))
+      (agent-shell-workflow-library--fix-ci-pre-op
+       ctx
+       (lambda (updated-ctx)
+         (setq called t)
+         (should (equal (plist-get updated-ctx :ci-summary) "All passed"))
+         (should (equal (plist-get updated-ctx :ci-log) "Log output")))))
+    (should called)))
+
+(ert-deftest agent-shell-workflow/library-pr-review-pre-op-async ()
+  "library--pr-review-pre-op invokes callback with populated ctx when given callback."
+  (let ((called nil)
+        (ctx (list :args (quote (:repo "foo/bar" :pr-number 42)))))
+    (cl-letf (((symbol-function (quote agent-shell-workflow--gather-async))
+               (lambda (_pairs callback &rest _)
+                 (funcall callback
+                          (quote ((:view . "{\"title\":\"Test PR\"}")
+                                  (:api . "[]")
+                                  (:raw . "raw comments")))))))
+      (agent-shell-workflow-library--pr-review-pre-op
+       ctx
+       (lambda (updated-ctx)
+         (setq called t)
+         (should (string-match-p "PR #42" (plist-get updated-ctx :pr-summary))))))
+    (should called)))
+
+(ert-deftest agent-shell-workflow/library-coverage-pre-op-async ()
+  "library--coverage-pre-op invokes callback with populated ctx when given callback."
+  (let ((called nil)
+        (ctx (list :args (quote (:file "test.el")))))
+    (cl-letf (((symbol-function (quote agent-shell-workflow--run-process-async))
+               (lambda (_prog _args _dir callback)
+                 (funcall callback "+added line"))))
+      (agent-shell-workflow-library--coverage-pre-op
+       ctx
+       (lambda (updated-ctx)
+         (setq called t)
+         (should (equal (plist-get updated-ctx :file-diff) "+added line")))))
+    (should called)))
+
+(ert-deftest agent-shell-workflow/library-refactor-pre-op-async ()
+  "library--refactor-pre-op invokes callback with populated ctx when given callback."
+  (let ((called nil)
+        (ctx (list :args (quote (:file "test.el")))))
+    (cl-letf (((symbol-function (quote agent-shell-workflow--run-process-async))
+               (lambda (_prog _args _dir callback)
+                 (funcall callback "1234567 commit msg"))))
+      (agent-shell-workflow-library--refactor-pre-op
+       ctx
+       (lambda (updated-ctx)
+         (setq called t)
+         (should (equal (plist-get updated-ctx :recent-history) "1234567 commit msg")))))
+    (should called)))
+
+(ert-deftest agent-shell-workflow/library-create-commit-pre-op-async ()
+  "library--create-commit-pre-op invokes callback with populated ctx when given callback."
+  (let ((called nil)
+        (ctx (list :args (quote (:files "foo.el")))))
+    (cl-letf (((symbol-function (quote agent-shell-workflow--gather-async))
+               (lambda (_pairs callback &rest _)
+                 (funcall callback
+                          (quote ((:status . "M foo.el")
+                                  (:diff . "+diff")
+                                  (:log . "recent log")))))))
+      (agent-shell-workflow-library--create-commit-pre-op
+       ctx
+       (lambda (updated-ctx)
+         (setq called t)
+         (should (equal (plist-get updated-ctx :git-status) "M foo.el"))
+         (should (equal (plist-get updated-ctx :git-diff) "+diff"))
+         (should (equal (plist-get updated-ctx :recent-log) "recent log")))))
+    (should called)))

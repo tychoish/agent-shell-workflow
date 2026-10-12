@@ -40,6 +40,7 @@
 (require 'cl-lib)
 (require 'map)
 (require 'seq)
+(require 'subr-x)
 (require 'agent-shell)
 
 (declare-function agent-shell-queue-enqueue-clear "agent-shell-queue")
@@ -49,10 +50,133 @@
 (declare-function agent-shell-queue--agent-shell-buffer-p "agent-shell-queue")
 (declare-function agent-shell-queue-item-args "agent-shell-queue")
 
+(defgroup agent-shell-workflow nil
+  "Reusable prompt and agent workflows for agent-shell."
+  :group 'tools
+  :prefix "agent-shell-workflow-")
+
+(defcustom agent-shell-workflow-clear-commands
+  '((omp . "/shake")
+    (t . "/clear"))
+  "Alist mapping agent identifiers to context-clearing slash commands.
+The key `t' provides the fallback command."
+  :type '(alist :key-type symbol :value-type string)
+  :group 'agent-shell-workflow)
+
+(defvar-local agent-shell-workflow--pending-clear nil
+  "Non-nil when a context clearing command is pending in this shell buffer.")
+
+(defun agent-shell-workflow--clear-command-for-buffer (buffer)
+  "Resolve the context-clearing command for BUFFER.
+Inspects the agent configuration via `agent-shell-get-config' or buffer name.
+Matches against `agent-shell-workflow-clear-commands'."
+  (let* ((buf (and buffer (get-buffer buffer)))
+         (config (and buf (fboundp 'agent-shell-get-config) (agent-shell-get-config buf)))
+         (ident (or (and config (map-elt config :identifier))
+                    (and buf (string-match-p "\\bomp\\b" (downcase (buffer-name buf))) 'omp)))
+         (val agent-shell-workflow-clear-commands))
+    (cond
+     ((functionp val) (funcall val ident))
+     ((listp val) (or (cdr (assq ident val)) (cdr (assq t val)) "/clear"))
+     ((stringp val) val)
+     (t "/clear"))))
+
+(defun agent-shell-workflow--maybe-clear-reused-buffer (buffer)
+  "Prompt user to run context-clearing command in reused BUFFER.
+When confirmed, executes the command immediately via `agent-shell-insert`."
+  (let ((cmd (agent-shell-workflow--clear-command-for-buffer buffer)))
+    (when (and cmd (y-or-n-p (format "Run %s in %s? " cmd (buffer-name buffer))))
+      (condition-case nil
+          (agent-shell-insert :text cmd :shell-buffer buffer :submit t)
+        (error nil))
+      (when (and (buffer-live-p buffer)
+                 (with-current-buffer buffer (derived-mode-p (quote agent-shell-mode)))
+                 (fboundp (quote agent-shell-subscribe-to)))
+        (with-current-buffer buffer
+          (setq-local agent-shell-workflow--pending-clear t))
+        (let ((sub nil))
+          (setq sub
+                (condition-case nil
+                    (agent-shell-subscribe-to
+                     :shell-buffer buffer
+                     :event (quote turn-complete)
+                     :on-event
+                     (lambda (_event)
+                       (when (buffer-live-p buffer)
+                         (with-current-buffer buffer
+                           (setq-local agent-shell-workflow--pending-clear nil)))
+                       (when sub
+                         (agent-shell-unsubscribe :subscription sub)
+                         (setq sub nil))))
+                  (error
+                   (when (buffer-live-p buffer)
+                     (with-current-buffer buffer
+                       (setq-local agent-shell-workflow--pending-clear nil)))
+                   nil)))))
+      t)))
+
 (defvar agent-shell-workflow-dispatch-target-functions nil
   "Hook run with (SPEC CTX TARGET SUBMIT) to handle custom workflow targets.
 Functions are called until one returns non-nil, indicating the dispatch
 has been handled.")
+
+;; Subprocess execution primitives
+
+(defun agent-shell-workflow--run-process-async (program args dir callback)
+  "Run PROGRAM with ARGS in DIR asynchronously.
+Calls CALLBACK with the trimmed stdout string on exit.
+If execution fails or process exits with non-zero status and empty output,
+CALLBACK receives a descriptive error string."
+  (let* ((output-buffer (generate-new-buffer " *agent-shell-workflow-proc*"))
+         (default-directory (or dir default-directory)))
+    (condition-case err
+        (make-process
+         :name (format "asw-%s" (file-name-nondirectory program))
+         :buffer output-buffer
+         :command (cons program args)
+         :noquery t
+         :sentinel
+         (lambda (proc _event)
+           (when (memq (process-status proc) '(exit signal))
+             (let ((out (with-current-buffer output-buffer
+                          (string-trim (buffer-string))))
+                   (status (process-exit-status proc)))
+               (when (buffer-live-p output-buffer)
+                 (kill-buffer output-buffer))
+               (if (and (not (zerop status)) (string-empty-p out))
+                   (funcall callback (format "[Command %s exited with status %s]" program status))
+                 (funcall callback out))))))
+      (error
+       (when (buffer-live-p output-buffer)
+         (kill-buffer output-buffer))
+       (funcall callback (format "[Error executing %s: %s]" program (error-message-string err)))))))
+
+(defun agent-shell-workflow--gather-async (pairs callback-or-dir &optional dir-or-callback)
+  "Run shell command PAIRS asynchronously and collect their outputs.
+PAIRS is a list of (KEY PROGRAM ARG...).
+Calls CALLBACK with an alist of (KEY . OUTPUT) when all commands complete.
+CALLBACK-OR-DIR and DIR-OR-CALLBACK may be passed in either order:
+(PAIRS CALLBACK &optional DIR) or (PAIRS DIR CALLBACK)."
+  (let* ((callback (if (functionp callback-or-dir) callback-or-dir dir-or-callback))
+         (dir (if (functionp callback-or-dir) dir-or-callback callback-or-dir))
+         (total (length pairs))
+         (remaining total)
+         (results (make-hash-table :test #'equal)))
+    (if (zerop total)
+        (when callback (funcall callback nil))
+      (dolist (pair pairs)
+        (let ((key (car pair))
+              (program (cadr pair))
+              (args (cddr pair)))
+          (agent-shell-workflow--run-process-async
+           program args dir
+           (lambda (out)
+             (puthash key out results)
+             (setq remaining (1- remaining))
+             (when (zerop remaining)
+               (let ((alist (mapcar (lambda (p) (cons (car p) (gethash (car p) results)))
+                                    pairs)))
+                 (when callback (funcall callback alist)))))))))))
 
 ;; Data model
 
@@ -215,9 +339,11 @@ its callback argument with the updated ctx."
   (let ((pre-op (agent-shell-workflow-spec-pre-op spec)))
     (if (null pre-op)
         (funcall callback ctx)
-      (pcase (car (func-arity pre-op))
-        (1 (funcall callback (funcall pre-op ctx)))
-        (_ (funcall pre-op ctx callback))))))
+      (let ((arity (func-arity pre-op)))
+        (if (or (> (car arity) 1)
+                (and (= (car arity) 1) (or (eq (cdr arity) 'many) (>= (cdr arity) 2))))
+            (funcall pre-op ctx callback)
+          (funcall callback (funcall pre-op ctx)))))))
 
 (defun agent-shell-workflow-exec-post (spec shell-buffer ctx response-text)
   "Run SPEC's post-op with SHELL-BUFFER, CTX, and RESPONSE-TEXT.
@@ -257,8 +383,8 @@ Handles `:drop-context', `:restart', `:close', and `(:chain ID ARGS)'.
   "Resolve TARGET keyword `:ask' via `completing-read' into a concrete target."
   (if (eq target :ask)
       (intern (completing-read "Dispatch to: "
-                                '(":session-reuse" ":session-new" ":queue")
-                                nil t))
+                               '(":session-reuse" ":session-new" ":queue")
+                               nil t))
     target))
 
 (defun agent-shell-workflow--canonicalize-dir (dir)
@@ -285,20 +411,19 @@ agent-shell-menu in turn would be circular."
 (defun agent-shell-workflow--create-shell (&optional dir)
   "Create and return a new `agent-shell' buffer in DIR."
   (let* ((canon-dir (agent-shell-workflow--canonicalize-dir (or dir default-directory)))
-         (before-bufs (agent-shell-buffers))
-         (default-directory canon-dir)
-         (res (agent-shell-new-shell))
-         (buf (cond
-               ((and (bufferp res) (buffer-live-p res))
-                res)
-               ((seq-find (lambda (b) (not (memq b before-bufs)))
-                          (agent-shell-buffers)))
-               ((seq-first (agent-shell-workflow--project-buffers canon-dir)))
-               ((when (derived-mode-p 'agent-shell-mode)
-                  (current-buffer)))
-               ((and res (not (numberp res)))
-                res))))
-    buf))
+         (before-bufs (agent-shell-buffers)))
+    (let ((default-directory canon-dir))
+      (let ((res (agent-shell-new-shell)))
+        (cond
+         ((and (bufferp res) (buffer-live-p res))
+          res)
+         ((seq-find (lambda (b) (not (memq b before-bufs)))
+                    (agent-shell-buffers)))
+         ((seq-first (agent-shell-workflow--project-buffers canon-dir)))
+         ((when (derived-mode-p 'agent-shell-mode)
+            (current-buffer)))
+         ((and res (not (numberp res)))
+          res))))))
 
 (defun agent-shell-workflow--session-buffer (target &optional dir)
   "Return a live `agent-shell' buffer for TARGET in DIR, creating or prompting.
@@ -310,24 +435,31 @@ Otherwise, create a new shell buffer."
     (if (eq target :session-new)
         (agent-shell-workflow--create-shell effective-dir)
       (let* ((buffers (agent-shell-workflow--project-buffers effective-dir))
-             (dir-name (file-name-nondirectory (directory-file-name (expand-file-name effective-dir)))))
+             (dir-name (file-name-nondirectory (directory-file-name (expand-file-name effective-dir))))
+             (reused-buf nil)
+             (res-buf nil))
         (cond
          ((null buffers)
-          (agent-shell-workflow--create-shell effective-dir))
+          (setq res-buf (agent-shell-workflow--create-shell effective-dir)))
          ((= (length buffers) 1)
           (let ((buf (car buffers)))
             (if (y-or-n-p (format "Reuse open agent-shell %s for %s? "
                                   (buffer-name buf) dir-name))
-                buf
-              (agent-shell-workflow--create-shell effective-dir))))
+                (setq reused-buf buf
+                      res-buf buf)
+              (setq res-buf (agent-shell-workflow--create-shell effective-dir)))))
          (t
           (let* ((new-option "[New agent-shell]")
                  (choices (cons new-option (mapcar #'buffer-name buffers)))
                  (choice (completing-read (format "Select agent-shell for %s: " dir-name)
                                           choices nil t)))
             (if (string-equal choice new-option)
-                (agent-shell-workflow--create-shell effective-dir)
-              (get-buffer choice)))))))))
+                (setq res-buf (agent-shell-workflow--create-shell effective-dir))
+              (setq reused-buf (get-buffer choice)
+                    res-buf reused-buf)))))
+        (when (and reused-buf (buffer-live-p reused-buf))
+          (agent-shell-workflow--maybe-clear-reused-buffer reused-buf))
+        res-buf))))
 
 (defun agent-shell-workflow--dispatch-rendered (spec ctx target submit &optional dir)
   "Deliver the rendered prompt for SPEC and CTX to TARGET in DIR.
@@ -342,21 +474,52 @@ When SUBMIT is non-nil, submit the prompt immediately."
      ((eq target :queue)
       (user-error "Target `:queue' requested but no queue target handler is registered"))
      (t
-      (let* ((shell-buffer (agent-shell-workflow--session-buffer target effective-dir))
-             (insertion (agent-shell-workflow--insert spec ctx shell-buffer submit))
-             (resp-start (alist-get :end insertion)))
-        (when (agent-shell-workflow-spec-post-op spec)
-          (agent-shell-subscribe-to
-           :shell-buffer shell-buffer
-           :event 'turn-complete
-           :on-event (lambda (_event)
-                       (let* ((start (or resp-start
-                                         (with-current-buffer shell-buffer
-                                           (when (boundp 'comint-last-input-end)
-                                             comint-last-input-end))))
-                              (resp (agent-shell-workflow--last-response-text shell-buffer start))
-                              (result (agent-shell-workflow-exec-post spec shell-buffer ctx resp)))
-                         (agent-shell-workflow--apply-post-result result shell-buffer))))))))))
+      (let* ((shell-buffer (or (plist-get ctx :shell-buffer)
+                               (agent-shell-workflow--session-buffer target effective-dir))))
+        (agent-shell-workflow--dispatch-to-buffer spec ctx shell-buffer submit))))))
+
+(defun agent-shell-workflow--dispatch-to-buffer (spec ctx shell-buffer submit)
+  "Insert and optionally submit prompt in SHELL-BUFFER for SPEC and CTX.
+If a context clear is currently pending in SHELL-BUFFER, defers insertion
+until turn-complete."
+  (let ((do-insert
+         (lambda ()
+           (let* ((insertion (agent-shell-workflow--insert spec ctx shell-buffer submit))
+                  (resp-start (alist-get :end insertion)))
+             (when (agent-shell-workflow-spec-post-op spec)
+               (agent-shell-subscribe-to
+                :shell-buffer shell-buffer
+                :event (quote turn-complete)
+                :on-event (lambda (_event)
+                            (let* ((start (or resp-start
+                                              (with-current-buffer shell-buffer
+                                                (when (boundp (quote comint-last-input-end))
+                                                  comint-last-input-end))))
+                                   (resp (agent-shell-workflow--last-response-text shell-buffer start))
+                                   (result (agent-shell-workflow-exec-post spec shell-buffer ctx resp)))
+                              (agent-shell-workflow--apply-post-result result shell-buffer)))))))))
+    (if (and (buffer-live-p shell-buffer)
+             (buffer-local-value (quote agent-shell-workflow--pending-clear) shell-buffer)
+             (with-current-buffer shell-buffer (derived-mode-p (quote agent-shell-mode)))
+             (fboundp (quote agent-shell-subscribe-to)))
+        (let ((sub nil))
+          (setq sub
+                (condition-case nil
+                    (agent-shell-subscribe-to
+                     :shell-buffer shell-buffer
+                     :event (quote turn-complete)
+                     :on-event
+                     (lambda (_ev)
+                       (when sub
+                         (agent-shell-unsubscribe :subscription sub)
+                         (setq sub nil))
+                       (when (buffer-live-p shell-buffer)
+                         (with-current-buffer shell-buffer
+                           (setq-local agent-shell-workflow--pending-clear nil)))
+                       (funcall do-insert)))
+                  (error
+                   (funcall do-insert)))))
+      (funcall do-insert))))
 
 (defun agent-shell-workflow--insert (spec ctx shell-buffer submit)
   "Render SPEC with CTX and insert it into SHELL-BUFFER.
@@ -396,7 +559,15 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
                    (error "Agent-shell-workflow: no workflow registered with id `%s'" id)))
          (dir (or context-dir default-directory))
          (collected-args (agent-shell-workflow--collect-args spec args))
-         (initial-ctx (list :args collected-args :target target :submit submit :context-dir dir)))
+         (resolved-target (agent-shell-workflow--resolve-target
+                           (or target (agent-shell-workflow-spec-target spec))))
+         (shell-buffer (when (memq resolved-target '(:session-reuse :session-new))
+                         (agent-shell-workflow--session-buffer resolved-target dir)))
+         (initial-ctx (list :args collected-args
+                            :target resolved-target
+                            :shell-buffer shell-buffer
+                            :submit submit
+                            :context-dir dir)))
     (let ((default-directory dir))
       (agent-shell-workflow-exec-pre
        spec initial-ctx
@@ -405,7 +576,7 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
                 (default-directory effective-dir)
                 (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) updated-ctx))
                 (ctx-with-rendered (plist-put updated-ctx :rendered rendered)))
-           (agent-shell-workflow--dispatch-rendered spec ctx-with-rendered target submit effective-dir)))))))
+           (agent-shell-workflow--dispatch-rendered spec ctx-with-rendered resolved-target submit effective-dir)))))))
 
 ;; Integration with agent-shell-queue
 
