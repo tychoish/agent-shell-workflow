@@ -49,6 +49,9 @@
 (declare-function agent-shell-queue-register-item-type "agent-shell-queue")
 (declare-function agent-shell-queue--agent-shell-buffer-p "agent-shell-queue")
 (declare-function agent-shell-queue-item-args "agent-shell-queue")
+(declare-function agent-shell-queue--has-running-item-p "agent-shell-queue")
+(declare-function shell-maker-busy "shell-maker")
+(declare-function agent-shell--active-requests-p "agent-shell")
 
 (defgroup agent-shell-workflow nil
   "Reusable prompt and agent workflows for agent-shell."
@@ -61,6 +64,26 @@
   "Alist mapping agent identifiers to context-clearing slash commands.
 The key `t' provides the fallback command."
   :type '(alist :key-type symbol :value-type string)
+  :group 'agent-shell-workflow)
+
+(defcustom agent-shell-workflow-busy-shell-behavior 'queue
+  "Action to take when submitting a workflow prompt to a busy shell buffer.
+
+Allowed values:
+`queue'  - Add the prompt to `agent-shell-queue' for the target shell buffer.
+`ask'    - Prompt the user (y-or-n-p) whether to add the prompt to the queue.
+           To avoid hanging after preflight completes, this is asked upfront
+           (conditionally if the shell is not yet busy); if declined, fall
+           back to `wait'.
+`wait'   - Defer prompt insertion and submission until the running turn
+           completes.
+`insert' - Insert the rendered prompt into the buffer without submitting.
+`error'  - Signal a `user-error' that the shell is currently busy."
+  :type '(choice (const :tag "Add to queue for the shell" queue)
+                 (const :tag "Ask whether to add to queue" ask)
+                 (const :tag "Wait for turn to complete" wait)
+                 (const :tag "Insert without submitting" insert)
+                 (const :tag "Signal an error" error))
   :group 'agent-shell-workflow)
 
 (defvar-local agent-shell-workflow--pending-clear nil
@@ -478,48 +501,198 @@ When SUBMIT is non-nil, submit the prompt immediately."
                                (agent-shell-workflow--session-buffer target effective-dir))))
         (agent-shell-workflow--dispatch-to-buffer spec ctx shell-buffer submit))))))
 
+(defun agent-shell-workflow--buffer-busy-p (buffer)
+  "Return non-nil if BUFFER is currently busy executing a turn or command."
+  (let ((buf (cond
+              ((bufferp buffer) buffer)
+              ((stringp buffer) (get-buffer buffer))
+              (t nil))))
+    (when (and buf (buffer-live-p buf))
+      (with-current-buffer buf
+        (or (and (boundp 'agent-shell-workflow--pending-clear)
+                 agent-shell-workflow--pending-clear)
+            (and (boundp 'shell-maker--busy)
+                 shell-maker--busy)
+            (and (fboundp 'shell-maker-busy)
+                 (ignore-errors (shell-maker-busy)))
+            (and (boundp 'agent-shell--busy)
+                 agent-shell--busy)
+            (and (boundp 'agent-shell--state)
+                 (fboundp 'agent-shell--active-requests-p)
+                 (ignore-errors (agent-shell--active-requests-p agent-shell--state)))
+            (and (fboundp 'agent-shell-queue--has-running-item-p)
+                 (ignore-errors (agent-shell-queue--has-running-item-p (buffer-name buf)))))))))
+
+(defun agent-shell-workflow--resolve-busy-action-upfront (shell-buffer will-submit)
+  "Determine the action to take if SHELL-BUFFER is busy, asked upfront.
+Consults `agent-shell-workflow-busy-shell-behavior'.  When set to `ask',
+prompts the user with `y-or-n-p' synchronously before preflight starts.
+If SHELL-BUFFER is already busy, asks if prompt should be queued when
+preflight completes.  If SHELL-BUFFER is not currently busy, asks
+conditionally if prompt should be queued if the shell becomes busy.
+Returns one of `queue', `wait', `insert', or `error'."
+  (when (and will-submit shell-buffer)
+    (let* ((buf (cond
+                 ((bufferp shell-buffer) shell-buffer)
+                 ((stringp shell-buffer) (get-buffer shell-buffer))
+                 (t nil)))
+           (buf-name (cond
+                      ((bufferp buf) (buffer-name buf))
+                      ((stringp shell-buffer) shell-buffer)
+                      (t (format "%s" shell-buffer))))
+           (queue-avail (fboundp 'agent-shell-queue--enqueue-args)))
+      (pcase agent-shell-workflow-busy-shell-behavior
+        ('ask
+         (if queue-avail
+             (let* ((busy-now (agent-shell-workflow--buffer-busy-p shell-buffer))
+                    (prompt-text
+                     (if busy-now
+                         (format "Agent shell `%s' is currently busy. Add prompt to queue when preflight completes? "
+                                 buf-name)
+                       (format "If agent shell `%s' is busy when preflight completes, add prompt to queue? "
+                               buf-name))))
+               (if (y-or-n-p prompt-text)
+                   'queue
+                 'wait))
+           'wait))
+        ('queue
+         (if queue-avail
+             'queue
+           (message "agent-shell-queue not available; falling back to waiting for turn complete")
+           'wait))
+        (other other)))))
+
+(defun agent-shell-workflow--resolve-busy-action (shell-buffer)
+  "Determine the action to take when submitting to busy SHELL-BUFFER.
+Consults `agent-shell-workflow-busy-shell-behavior'.  If set to `ask',
+prompts the user with `y-or-n-p'.  Returns one of `queue', `wait',
+`insert', or `error'."
+  (let* ((buf (cond
+               ((bufferp shell-buffer) shell-buffer)
+               ((stringp shell-buffer) (get-buffer shell-buffer))
+               (t nil)))
+         (buf-name (cond
+                    ((bufferp buf) (buffer-name buf))
+                    ((stringp shell-buffer) shell-buffer)
+                    (t (format "%s" shell-buffer))))
+         (queue-avail (fboundp 'agent-shell-queue--enqueue-args)))
+    (pcase agent-shell-workflow-busy-shell-behavior
+      ('ask
+       (if (and queue-avail
+                (y-or-n-p (format "Agent shell `%s' is currently busy. Add prompt to queue? "
+                                  buf-name)))
+           'queue
+         'wait))
+      ('queue
+       (if queue-avail
+           'queue
+         (message "agent-shell-queue not available; falling back to waiting for turn complete")
+         'wait))
+      (other other))))
+
+(defun agent-shell-workflow--enqueue-for-buffer (spec ctx shell-buffer submit)
+  "Add prompt for SPEC, CTX, and SUBMIT to `agent-shell-queue' for SHELL-BUFFER.
+Signals a `user-error' if `agent-shell-queue' is not available."
+  (if (fboundp 'agent-shell-queue--enqueue-args)
+      (let* ((buf (cond
+                   ((bufferp shell-buffer) shell-buffer)
+                   ((stringp shell-buffer) (get-buffer shell-buffer))
+                   (t shell-buffer)))
+             (buf-name (cond
+                        ((bufferp buf) (buffer-name buf))
+                        ((stringp shell-buffer) shell-buffer)
+                        (t (format "%s" shell-buffer))))
+             (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx)))
+        (agent-shell-queue--enqueue-args
+         (prin1-to-string (list :workflow-id (agent-shell-workflow-spec-id spec)
+                                :rendered rendered
+                                :ctx ctx
+                                :submit submit))
+         'workflow
+         buf)
+        (message "Added workflow `%s' to queue for %s"
+                 (agent-shell-workflow-spec-id spec)
+                 buf-name)
+        t)
+    (user-error "Cannot enqueue prompt: `agent-shell-queue' is not available")))
+
+(defun agent-shell-workflow--defer-until-turn-complete (shell-buffer callback)
+  "Defer CALLBACK until turn-complete fires on SHELL-BUFFER.
+Clears `agent-shell-workflow--pending-clear' if set."
+  (if (and (buffer-live-p shell-buffer)
+           (with-current-buffer shell-buffer (derived-mode-p 'agent-shell-mode))
+           (fboundp 'agent-shell-subscribe-to))
+      (let ((sub nil))
+        (setq sub
+              (condition-case nil
+                  (agent-shell-subscribe-to
+                   :shell-buffer shell-buffer
+                   :event 'turn-complete
+                   :on-event
+                   (lambda (_ev)
+                     (when sub
+                       (agent-shell-unsubscribe :subscription sub)
+                       (setq sub nil))
+                     (when (buffer-live-p shell-buffer)
+                       (with-current-buffer shell-buffer
+                         (setq-local agent-shell-workflow--pending-clear nil)))
+                     (funcall callback)))
+                (error
+                 (funcall callback)))))
+    (funcall callback)))
+
+(defun agent-shell-workflow--insert-and-post (spec ctx shell-buffer submit)
+  "Insert rendered SPEC into SHELL-BUFFER and subscribe to post-op if present."
+  (let* ((insertion (agent-shell-workflow--insert spec ctx shell-buffer submit))
+         (resp-start (alist-get :end insertion)))
+    (when (agent-shell-workflow-spec-post-op spec)
+      (agent-shell-subscribe-to
+       :shell-buffer shell-buffer
+       :event 'turn-complete
+       :on-event (lambda (_event)
+                   (let* ((start (or resp-start
+                                     (with-current-buffer shell-buffer
+                                       (when (boundp 'comint-last-input-end)
+                                         comint-last-input-end))))
+                          (resp (agent-shell-workflow--last-response-text shell-buffer start))
+                          (result (agent-shell-workflow-exec-post spec shell-buffer ctx resp)))
+                     (agent-shell-workflow--apply-post-result result shell-buffer)))))))
+
 (defun agent-shell-workflow--dispatch-to-buffer (spec ctx shell-buffer submit)
   "Insert and optionally submit prompt in SHELL-BUFFER for SPEC and CTX.
+If SUBMIT is non-nil and SHELL-BUFFER is busy, handles the busy state
+according to `agent-shell-workflow-busy-shell-behavior' or pre-resolved
+`:busy-action' in CTX.
 If a context clear is currently pending in SHELL-BUFFER, defers insertion
 until turn-complete."
   (let ((do-insert
          (lambda ()
-           (let* ((insertion (agent-shell-workflow--insert spec ctx shell-buffer submit))
-                  (resp-start (alist-get :end insertion)))
-             (when (agent-shell-workflow-spec-post-op spec)
-               (agent-shell-subscribe-to
-                :shell-buffer shell-buffer
-                :event (quote turn-complete)
-                :on-event (lambda (_event)
-                            (let* ((start (or resp-start
-                                              (with-current-buffer shell-buffer
-                                                (when (boundp (quote comint-last-input-end))
-                                                  comint-last-input-end))))
-                                   (resp (agent-shell-workflow--last-response-text shell-buffer start))
-                                   (result (agent-shell-workflow-exec-post spec shell-buffer ctx resp)))
-                              (agent-shell-workflow--apply-post-result result shell-buffer)))))))))
-    (if (and (buffer-live-p shell-buffer)
-             (buffer-local-value (quote agent-shell-workflow--pending-clear) shell-buffer)
-             (with-current-buffer shell-buffer (derived-mode-p (quote agent-shell-mode)))
-             (fboundp (quote agent-shell-subscribe-to)))
-        (let ((sub nil))
-          (setq sub
-                (condition-case nil
-                    (agent-shell-subscribe-to
-                     :shell-buffer shell-buffer
-                     :event (quote turn-complete)
-                     :on-event
-                     (lambda (_ev)
-                       (when sub
-                         (agent-shell-unsubscribe :subscription sub)
-                         (setq sub nil))
-                       (when (buffer-live-p shell-buffer)
-                         (with-current-buffer shell-buffer
-                           (setq-local agent-shell-workflow--pending-clear nil)))
-                       (funcall do-insert)))
-                  (error
-                   (funcall do-insert)))))
-      (funcall do-insert))))
+           (agent-shell-workflow--insert-and-post spec ctx shell-buffer submit))))
+    (cond
+     ((and submit (agent-shell-workflow--buffer-busy-p shell-buffer))
+      (pcase (or (plist-get ctx :busy-action)
+                 (agent-shell-workflow--resolve-busy-action shell-buffer))
+        ('queue
+         (agent-shell-workflow--enqueue-for-buffer spec ctx shell-buffer submit))
+        ('wait
+         (agent-shell-workflow--defer-until-turn-complete shell-buffer do-insert))
+        ('insert
+         (agent-shell-workflow--insert spec ctx shell-buffer nil))
+        ('error
+         (let ((name (cond
+                      ((bufferp shell-buffer) (buffer-name shell-buffer))
+                      ((stringp shell-buffer) shell-buffer)
+                      (t (format "%s" shell-buffer)))))
+           (user-error "Agent shell `%s' is currently busy" name)))
+        (_
+         (agent-shell-workflow--enqueue-for-buffer spec ctx shell-buffer submit))))
+     ((and (buffer-live-p shell-buffer)
+           (buffer-local-value 'agent-shell-workflow--pending-clear shell-buffer)
+           (with-current-buffer shell-buffer (derived-mode-p 'agent-shell-mode))
+           (fboundp 'agent-shell-subscribe-to))
+      (agent-shell-workflow--defer-until-turn-complete shell-buffer do-insert))
+     (t
+      (funcall do-insert)))))
 
 (defun agent-shell-workflow--insert (spec ctx shell-buffer submit)
   "Render SPEC with CTX and insert it into SHELL-BUFFER.
@@ -561,22 +734,34 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
          (collected-args (agent-shell-workflow--collect-args spec args))
          (resolved-target (agent-shell-workflow--resolve-target
                            (or target (agent-shell-workflow-spec-target spec))))
+         (effective-submit (if (null submit)
+                               (agent-shell-workflow-spec-submit spec)
+                             submit))
          (shell-buffer (when (memq resolved-target '(:session-reuse :session-new))
                          (agent-shell-workflow--session-buffer resolved-target dir)))
+         (busy-action (when (and effective-submit shell-buffer)
+                        (agent-shell-workflow--resolve-busy-action-upfront shell-buffer effective-submit)))
          (initial-ctx (list :args collected-args
                             :target resolved-target
                             :shell-buffer shell-buffer
-                            :submit submit
+                            :submit effective-submit
+                            :busy-action busy-action
                             :context-dir dir)))
     (let ((default-directory dir))
       (agent-shell-workflow-exec-pre
        spec initial-ctx
        (lambda (updated-ctx)
-         (let* ((effective-dir (or (plist-get updated-ctx :context-dir) dir))
+         (let* ((merged-ctx (let ((c (copy-sequence initial-ctx))
+                                  (rem updated-ctx))
+                              (while rem
+                                (setq c (plist-put c (car rem) (cadr rem)))
+                                (setq rem (cddr rem)))
+                              c))
+                (effective-dir (or (plist-get merged-ctx :context-dir) dir))
                 (default-directory effective-dir)
-                (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) updated-ctx))
-                (ctx-with-rendered (plist-put updated-ctx :rendered rendered)))
-           (agent-shell-workflow--dispatch-rendered spec ctx-with-rendered resolved-target submit effective-dir)))))))
+                (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) merged-ctx))
+                (ctx-with-rendered (plist-put merged-ctx :rendered rendered)))
+           (agent-shell-workflow--dispatch-rendered spec ctx-with-rendered resolved-target effective-submit effective-dir)))))))
 
 ;; Integration with agent-shell-queue
 
@@ -589,24 +774,21 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
                    t))
          (buf (if (stringp target-buffer)
                   (get-buffer target-buffer)
-                target-buffer)))
-    (agent-shell-insert :text rendered
-                        :shell-buffer buf
-                        :submit submit)))
+                target-buffer))
+         (workflow-id (plist-get plist :workflow-id))
+         (spec (when workflow-id (agent-shell-workflow-get workflow-id)))
+         (ctx (plist-get plist :ctx)))
+    (if spec
+        (agent-shell-workflow--insert-and-post spec ctx buf submit)
+      (agent-shell-insert :text rendered
+                          :shell-buffer buf
+                          :submit submit))))
 
 (defun agent-shell-workflow--queue-target-handler (spec ctx target submit)
   "Target handler for `:queue' target when `agent-shell-queue' is loaded."
   (when (eq target :queue)
-    (if (fboundp 'agent-shell-queue--enqueue-args)
-        (let ((rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx)))
-          (agent-shell-queue--enqueue-args
-           (prin1-to-string (list :workflow-id (agent-shell-workflow-spec-id spec)
-                                  :rendered rendered
-                                  :submit submit))
-           'workflow
-           nil)
-          t)
-      (user-error "Target `:queue' requested but `agent-shell-queue' is not available"))))
+    (let ((shell-buf (plist-get ctx :shell-buffer)))
+      (agent-shell-workflow--enqueue-for-buffer spec ctx shell-buf submit))))
 
 (defun agent-shell-workflow--setup-queue-integration ()
   "Register `:queue' target handler and item type if queue is available."

@@ -1360,10 +1360,6 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
      (should (= (length alpha) 2))
      (should (seq-every-p (lambda (s) (equal (agent-shell-workflow-spec-category s) "Alpha")) alpha)))))
 
-(provide 'test-agent-shell-workflow)
-
-;;; test-agent-shell-workflow.el ends here
-
 ;;; ─────────────────────────────────────────────────────────
 ;;; Context clearing, Async execution, and Eager Session Resolution
 
@@ -1584,3 +1580,283 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
          (should (equal (plist-get updated-ctx :git-diff) "+diff"))
          (should (equal (plist-get updated-ctx :recent-log) "recent log")))))
     (should called)))
+
+;;; ─────────────────────────────────────────────────────────────
+;;; Busy Shell Detection, Defcustom, and Queue Dispatch
+
+(ert-deftest agent-shell-workflow/buffer-busy-p-idle ()
+  "agent-shell-workflow--buffer-busy-p returns nil for idle or nil buffers."
+  (should-not (agent-shell-workflow--buffer-busy-p nil))
+  (should-not (agent-shell-workflow--buffer-busy-p 'symbol-not-buffer))
+  (let ((buf (generate-new-buffer "asw-test-idle")))
+    (unwind-protect
+        (should-not (agent-shell-workflow--buffer-busy-p buf))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/buffer-busy-p-pending-clear ()
+  "agent-shell-workflow--buffer-busy-p returns t when pending clear is set."
+  (let ((buf (generate-new-buffer "asw-test-pending-clear")))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local agent-shell-workflow--pending-clear t)
+          (should (agent-shell-workflow--buffer-busy-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/buffer-busy-p-shell-maker-busy ()
+  "agent-shell-workflow--buffer-busy-p returns t when shell-maker is busy."
+  (let ((buf (generate-new-buffer "asw-test-shell-maker-busy")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (setq-local shell-maker--busy t))
+          (should (agent-shell-workflow--buffer-busy-p buf))
+          (with-current-buffer buf
+            (setq-local shell-maker--busy nil))
+          (cl-letf (((symbol-function 'shell-maker-busy) (lambda () t)))
+            (should (agent-shell-workflow--buffer-busy-p buf))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/buffer-busy-p-queue-running ()
+  "agent-shell-workflow--buffer-busy-p returns t when queue has running item."
+  (let ((buf (generate-new-buffer "asw-test-queue-busy")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-queue--has-running-item-p)
+                   (lambda (name) (equal name (buffer-name buf)))))
+          (should (agent-shell-workflow--buffer-busy-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/resolve-busy-action-queue-available ()
+  "agent-shell-workflow--resolve-busy-action returns `queue' when queue is available."
+  (let ((agent-shell-workflow-busy-shell-behavior 'queue))
+    (cl-letf (((symbol-function 'fboundp)
+               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) t (cl-typep sym 'symbol)))))
+      (should (eq (agent-shell-workflow--resolve-busy-action "test-buf") 'queue)))))
+
+(ert-deftest agent-shell-workflow/resolve-busy-action-queue-unavailable-falls-back-to-wait ()
+  "agent-shell-workflow--resolve-busy-action falls back to `wait' when queue is not loaded."
+  (let ((agent-shell-workflow-busy-shell-behavior 'queue))
+    (cl-letf (((symbol-function 'fboundp)
+               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) nil (cl-typep sym 'symbol)))))
+      (should (eq (agent-shell-workflow--resolve-busy-action "test-buf") 'wait)))))
+
+(ert-deftest agent-shell-workflow/resolve-busy-action-ask ()
+  "agent-shell-workflow--resolve-busy-action prompts user when set to `ask'."
+  (let ((agent-shell-workflow-busy-shell-behavior 'ask))
+    ;; User answers 'y' -> returns 'queue
+    (cl-letf (((symbol-function 'fboundp)
+               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) t (cl-typep sym 'symbol))))
+              ((symbol-function 'y-or-n-p) (lambda (&rest _) t)))
+      (should (eq (agent-shell-workflow--resolve-busy-action "test-buf") 'queue)))
+    ;; User answers 'n' -> returns 'wait
+    (cl-letf (((symbol-function 'fboundp)
+               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) t (cl-typep sym 'symbol))))
+              ((symbol-function 'y-or-n-p) (lambda (&rest _) nil)))
+      (should (eq (agent-shell-workflow--resolve-busy-action "test-buf") 'wait)))))
+
+(ert-deftest agent-shell-workflow/resolve-busy-action-passthrough ()
+  "agent-shell-workflow--resolve-busy-action passes through `wait', `insert', and `error'."
+  (let ((agent-shell-workflow-busy-shell-behavior 'wait))
+    (should (eq (agent-shell-workflow--resolve-busy-action "test-buf") 'wait)))
+  (let ((agent-shell-workflow-busy-shell-behavior 'insert))
+    (should (eq (agent-shell-workflow--resolve-busy-action "test-buf") 'insert)))
+  (let ((agent-shell-workflow-busy-shell-behavior 'error))
+    (should (eq (agent-shell-workflow--resolve-busy-action "test-buf") 'error))))
+
+(ert-deftest agent-shell-workflow/enqueue-for-buffer-enqueues-args ()
+  "agent-shell-workflow--enqueue-for-buffer enqueues item into shell-buffer bucket."
+  (let* ((buf (generate-new-buffer "asw-test-buf"))
+         (spec (agent-shell-workflow-spec--make :id 'test-wf :template "hello {{args.target}}"))
+         (ctx (list :args '(:target "world")))
+         enqueued-args)
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-queue--enqueue-args)
+                   (lambda (&rest args) (setq enqueued-args args))))
+          (should (agent-shell-workflow--enqueue-for-buffer spec ctx buf t))
+          (should enqueued-args)
+          (let ((plist (read (car enqueued-args))))
+            (should (eq (plist-get plist :workflow-id) 'test-wf))
+            (should (equal (plist-get plist :rendered) "hello world"))
+            (should (plist-get plist :submit)))
+          (should (eq (nth 1 enqueued-args) 'workflow))
+          (should (eq (nth 2 enqueued-args) buf)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/enqueue-for-buffer-errors-when-queue-unavailable ()
+  "agent-shell-workflow--enqueue-for-buffer signals user-error when queue is not loaded."
+  (let ((spec (agent-shell-workflow-spec--make :id 'test-wf :template "hello")))
+    (cl-letf (((symbol-function 'fboundp)
+               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) nil (cl-typep sym 'symbol)))))
+      (should-error (agent-shell-workflow--enqueue-for-buffer spec nil "any-buf" t)
+                    :type 'user-error))))
+
+(ert-deftest agent-shell-workflow/dispatch-to-busy-buffer-enqueues-by-default ()
+  "When submitting to a busy buffer, dispatch-to-buffer enqueues automatically by default."
+  (let* ((buf (generate-new-buffer "asw-busy-dispatch"))
+         (spec (agent-shell-workflow-spec--make :id 'busy-wf :template "work on busy"))
+         enqueued-target)
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'agent-shell-workflow--buffer-busy-p) (lambda (_) t))
+                    ((symbol-function 'agent-shell-queue--enqueue-args)
+                     (lambda (_args _kind target-buf) (setq enqueued-target target-buf))))
+            (agent-shell-workflow--dispatch-to-buffer spec nil buf t)
+            (should (eq enqueued-target buf))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/dispatch-to-busy-buffer-respects-insert-and-error ()
+  "dispatch-to-buffer handles `insert' and `error' behaviors when buffer is busy."
+  (let* ((buf (generate-new-buffer "asw-busy-custom"))
+         (spec (agent-shell-workflow-spec--make :id 'busy-wf :template "custom action"))
+         inserted-submit)
+    (unwind-protect
+        (progn
+          ;; Behavior 'insert: inserts with submit=nil
+          (let ((agent-shell-workflow-busy-shell-behavior 'insert))
+            (cl-letf (((symbol-function 'agent-shell-workflow--buffer-busy-p) (lambda (_) t))
+                      ((symbol-function 'agent-shell-workflow--insert)
+                       (lambda (_spec _ctx _shell-buf submit)
+                         (setq inserted-submit submit)
+                         '((:end . 10)))))
+              (agent-shell-workflow--dispatch-to-buffer spec nil buf t)
+              (should (null inserted-submit))))
+          ;; Behavior 'error: signals user-error
+          (let ((agent-shell-workflow-busy-shell-behavior 'error))
+            (cl-letf (((symbol-function 'agent-shell-workflow--buffer-busy-p) (lambda (_) t)))
+              (should-error (agent-shell-workflow--dispatch-to-buffer spec nil buf t)
+                            :type 'user-error))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/dispatch-to-busy-buffer-unsubmitted-does-not-queue ()
+  "When submit is nil, dispatch-to-buffer does not queue even if buffer is busy."
+  (let* ((buf (generate-new-buffer "asw-busy-unsubmitted"))
+         (spec (agent-shell-workflow-spec--make :id 'busy-wf :template "unsubmitted prompt"))
+         inserted-submit
+         enqueued-called)
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-workflow--buffer-busy-p) (lambda (_) t))
+                  ((symbol-function 'agent-shell-queue--enqueue-args)
+                   (lambda (&rest _) (setq enqueued-called t)))
+                  ((symbol-function 'agent-shell-workflow--insert)
+                   (lambda (_spec _ctx _shell-buf submit)
+                     (setq inserted-submit submit)
+                     '((:end . 10)))))
+          (agent-shell-workflow--dispatch-to-buffer spec nil buf nil)
+          (should-not enqueued-called)
+          (should (null inserted-submit)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/dispatch-queue-item-executes-and-chains-post-op ()
+  "dispatch-queue-item inserts prompt and attaches post-op when workflow spec defines one."
+  (asw-test/isolate
+   (let* ((buf (generate-new-buffer "asw-queue-exec"))
+          (post-op-called nil)
+          (item-payload (prin1-to-string (list :workflow-id 'q-post-wf
+                                               :rendered "queued text"
+                                               :ctx '(:x 1)
+                                               :submit t)))
+          (item (agent-shell-queue--make-item item-payload nil 'workflow))
+          sub-callback)
+     (unwind-protect
+         (progn
+           (register-agent-shell-workflow q-post-wf
+             :template "queued text"
+             :post-op (lambda (_shell-buf _ctx _resp)
+                        (setq post-op-called t)
+                        :done))
+           (cl-letf (((symbol-function 'agent-shell-insert)
+                      (lambda (&rest _) '((:end . 15))))
+                     ((symbol-function 'agent-shell-subscribe-to)
+                      (lambda (&rest args)
+                        (setq sub-callback (plist-get args :on-event))))
+                     ((symbol-function 'agent-shell-workflow--last-response-text)
+                      (lambda (&rest _) "response text")))
+             (agent-shell-workflow--dispatch-queue-item item buf)
+             (should sub-callback)
+             ;; Trigger turn complete
+             (funcall sub-callback nil)
+             (should post-op-called)))
+       (kill-buffer buf)))))
+
+(ert-deftest agent-shell-workflow/resolve-busy-action-upfront-nil-when-not-submitting ()
+  "resolve-busy-action-upfront returns nil when will-submit or shell-buffer is nil."
+  (should-not (agent-shell-workflow--resolve-busy-action-upfront "buf" nil))
+  (should-not (agent-shell-workflow--resolve-busy-action-upfront nil t)))
+
+(ert-deftest agent-shell-workflow/resolve-busy-action-upfront-queue-default ()
+  "resolve-busy-action-upfront returns `queue' when queue is available and behavior is `queue'."
+  (let ((agent-shell-workflow-busy-shell-behavior 'queue))
+    (cl-letf (((symbol-function 'fboundp)
+               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) t (cl-typep sym 'symbol)))))
+      (should (eq (agent-shell-workflow--resolve-busy-action-upfront "test-buf" t) 'queue)))))
+
+(ert-deftest agent-shell-workflow/resolve-busy-action-upfront-ask-when-already-busy ()
+  "resolve-busy-action-upfront asks immediate question when buffer is currently busy."
+  (let ((agent-shell-workflow-busy-shell-behavior 'ask)
+        (prompt-seen nil))
+    (cl-letf (((symbol-function 'fboundp)
+               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) t (cl-typep sym 'symbol))))
+              ((symbol-function 'agent-shell-workflow--buffer-busy-p) (lambda (_) t))
+              ((symbol-function 'y-or-n-p)
+               (lambda (p) (setq prompt-seen p) t)))
+      (should (eq (agent-shell-workflow--resolve-busy-action-upfront "test-buf" t) 'queue))
+      (should (string-match-p "currently busy" prompt-seen)))))
+
+(ert-deftest agent-shell-workflow/resolve-busy-action-upfront-ask-conditional-when-idle ()
+  "resolve-busy-action-upfront asks conditional question when buffer is currently idle."
+  (let ((agent-shell-workflow-busy-shell-behavior 'ask)
+        (prompt-seen nil))
+    (cl-letf (((symbol-function 'fboundp)
+               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) t (cl-typep sym 'symbol))))
+              ((symbol-function 'agent-shell-workflow--buffer-busy-p) (lambda (_) nil))
+              ((symbol-function 'y-or-n-p)
+               (lambda (p) (setq prompt-seen p) t)))
+      (should (eq (agent-shell-workflow--resolve-busy-action-upfront "test-buf" t) 'queue))
+      (should (string-match-p "If agent shell.*is busy" prompt-seen)))))
+
+(ert-deftest agent-shell-workflow/dispatch-asks-conditional-busy-upfront-before-pre-op ()
+  "Dispatch asks busy question upfront, and never prompts after async pre-op completes."
+  (asw-test/isolate
+   (let* ((buf (generate-new-buffer "asw-async-pre-busy"))
+          (agent-shell-workflow-busy-shell-behavior 'ask)
+          (order nil)
+          (enqueued-target nil)
+          (async-cb nil))
+     (unwind-protect
+         (progn
+           (register-agent-shell-workflow async-busy-test
+             :template "Test async busy"
+             :target :session-reuse
+             :submit t
+             :pre-op (lambda (ctx callback)
+                       (push :pre-op-started order)
+                       (setq async-cb callback)))
+           (cl-letf (((symbol-function 'agent-shell-workflow--project-buffers)
+                      (lambda (_) (list buf)))
+                     ((symbol-function 'y-or-n-p)
+                      (lambda (p)
+                        (push (cons :prompt p) order)
+                        ;; If prompted after pre-op started, signal error
+                        (if (member :pre-op-started order)
+                            (error "Interactive prompt called AFTER pre-op started: %s" p)
+                          t)))
+                     ((symbol-function 'agent-shell-queue--enqueue-args)
+                      (lambda (_args _kind target-buf)
+                        (push :enqueued order)
+                        (setq enqueued-target target-buf))))
+             ;; Buffer is idle initially when dispatch starts
+             (agent-shell-workflow-dispatch 'async-busy-test)
+             (should (member :pre-op-started order))
+             (should async-cb)
+             ;; Now make buffer busy while pre-op was running
+             (with-current-buffer buf
+               (setq-local agent-shell-workflow--pending-clear t))
+             ;; Now async pre-op finishes and calls back
+             (funcall async-cb (list :shell-buffer buf :submit t))
+             ;; Verification: Enqueued without any prompt called after pre-op
+             (should (member :enqueued order))
+             (should (eq enqueued-target buf))))
+       (kill-buffer buf)))))
+
+(provide 'test-agent-shell-workflow)
+
+;;; test-agent-shell-workflow.el ends here
