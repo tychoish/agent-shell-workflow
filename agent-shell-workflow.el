@@ -843,11 +843,8 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
      :dispatch-fn #'agent-shell-workflow--dispatch-queue-item
      :input-spec '(:kind capture))))
 
-(with-eval-after-load 'agent-shell-queue
-  (agent-shell-workflow--setup-queue-integration))
-
-(when (featurep 'agent-shell-queue)
-  (agent-shell-workflow--setup-queue-integration))
+(require 'agent-shell-queue nil t)
+(agent-shell-workflow--setup-queue-integration)
 
 (provide 'agent-shell-workflow)
 
