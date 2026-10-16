@@ -92,51 +92,75 @@ Allowed values:
 (defun agent-shell-workflow--clear-command-for-buffer (buffer)
   "Resolve the context-clearing command for BUFFER.
 Inspects the agent configuration via `agent-shell-get-config' or buffer name.
-Matches against `agent-shell-workflow-clear-commands'."
+Matches against `agent-shell-workflow-clear-commands'.
+Returns nil if no clear operation is defined for that shell type/agent."
   (let* ((buf (and buffer (get-buffer buffer)))
          (config (and buf (fboundp 'agent-shell-get-config) (agent-shell-get-config buf)))
          (ident (or (and config (map-elt config :identifier))
                     (and buf (string-match-p "\\bomp\\b" (downcase (buffer-name buf))) 'omp)))
-         (val agent-shell-workflow-clear-commands))
-    (cond
-     ((functionp val) (funcall val ident))
-     ((listp val) (or (cdr (assq ident val)) (cdr (assq t val)) "/clear"))
-     ((stringp val) val)
-     (t "/clear"))))
+         (val agent-shell-workflow-clear-commands)
+         (raw (or (and config (or (map-elt config :clear-command)
+                                  (map-elt config :clear-operation)))
+                  (cond
+                   ((functionp val) (funcall val ident))
+                   ((listp val)
+                    (let ((entry (assq ident val)))
+                      (if entry
+                          (cdr entry)
+                        (cdr (assq t val)))))
+                   ((stringp val) val)
+                   (t nil)))))
+    (if (and (stringp raw) (not (string-empty-p (string-trim raw))))
+        (string-trim raw)
+      nil)))
 
-(defun agent-shell-workflow--maybe-clear-reused-buffer (buffer)
-  "Prompt user to run context-clearing command in reused BUFFER.
-When confirmed, executes the command immediately via `agent-shell-insert`."
-  (let ((cmd (agent-shell-workflow--clear-command-for-buffer buffer)))
-    (when (and cmd (y-or-n-p (format "Run %s in %s? " cmd (buffer-name buffer))))
-      (condition-case nil
-          (agent-shell-insert :text cmd :shell-buffer buffer :submit t)
-        (error nil))
-      (when (and (buffer-live-p buffer)
-                 (with-current-buffer buffer (derived-mode-p (quote agent-shell-mode)))
-                 (fboundp (quote agent-shell-subscribe-to)))
-        (with-current-buffer buffer
-          (setq-local agent-shell-workflow--pending-clear t))
-        (let ((sub nil))
-          (setq sub
-                (condition-case nil
-                    (agent-shell-subscribe-to
-                     :shell-buffer buffer
-                     :event (quote turn-complete)
-                     :on-event
-                     (lambda (_event)
-                       (when (buffer-live-p buffer)
-                         (with-current-buffer buffer
-                           (setq-local agent-shell-workflow--pending-clear nil)))
-                       (when sub
-                         (agent-shell-unsubscribe :subscription sub)
-                         (setq sub nil))))
-                  (error
+(defun agent-shell-workflow--execute-clear (buffer cmd)
+  "Execute context-clearing CMD in BUFFER and track its completion."
+  (condition-case nil
+      (agent-shell-insert :text cmd :shell-buffer buffer :submit t)
+    (error nil))
+  (when (and (buffer-live-p buffer)
+             (with-current-buffer buffer (derived-mode-p 'agent-shell-mode))
+             (fboundp 'agent-shell-subscribe-to))
+    (with-current-buffer buffer
+      (setq-local agent-shell-workflow--pending-clear t))
+    (let ((sub nil))
+      (setq sub
+            (condition-case nil
+                (agent-shell-subscribe-to
+                 :shell-buffer buffer
+                 :event 'turn-complete
+                 :on-event
+                 (lambda (_event)
                    (when (buffer-live-p buffer)
                      (with-current-buffer buffer
                        (setq-local agent-shell-workflow--pending-clear nil)))
-                   nil)))))
-      t)))
+                   (when sub
+                     (agent-shell-unsubscribe :subscription sub)
+                     (setq sub nil))))
+              (error
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq-local agent-shell-workflow--pending-clear nil)))
+               nil)))))
+  t)
+
+(defun agent-shell-workflow--maybe-clear-reused-buffer (buffer &optional spec)
+  "Call or prompt context-clearing command in reused BUFFER according to SPEC.
+When SPEC is provided and its clear option is nil, does nothing.
+When SPEC has a non-nil clear option (such as `t') and BUFFER has a clear
+command defined, executes it immediately.
+When SPEC clear option is `ask' or SPEC is omitted, prompts the user.
+Returns non-nil if a clear command was executed, nil otherwise."
+  (let* ((clear-opt (if spec (agent-shell-workflow-spec-clear spec) 'ask))
+         (cmd (when clear-opt (agent-shell-workflow--clear-command-for-buffer buffer))))
+    (when (and cmd clear-opt)
+      (cond
+       ((eq clear-opt 'ask)
+        (when (y-or-n-p (format "Run %s in %s? " cmd (buffer-name buffer)))
+          (agent-shell-workflow--execute-clear buffer cmd)))
+       (t
+        (agent-shell-workflow--execute-clear buffer cmd))))))
 
 (defvar agent-shell-workflow-dispatch-target-functions nil
   "Hook run with (SPEC CTX TARGET SUBMIT) to handle custom workflow targets.
@@ -237,7 +261,12 @@ See `agent-shell-workflow-exec-pre'.")
    nil
    :documentation
    "Function called as (POST-OP shell-buffer ctx response-text).
-Called on turn completion; see `agent-shell-workflow-exec-post'."))
+Called on turn completion; see `agent-shell-workflow-exec-post'.")
+  (clear
+   nil
+   :documentation
+   "Non-nil to execute context-clearing slash command before dispatching prompt.
+Requires a clear operation defined for the target shell type/agent."))
 
 (defvar agent-shell-workflow-registry (make-hash-table :test #'eq)
   "Hash table of symbol id to `agent-shell-workflow-spec'.
@@ -255,10 +284,10 @@ Populate via `register-agent-shell-workflow'.")
   (require 'agent-shell-workflow-library nil t)
   (map-values agent-shell-workflow-registry))
 
-(cl-defun agent-shell-workflow-register (&key id doc category args pre-op template submit target post-op)
-  "Register a workflow spec built from ID, DOC, CATEGORY, ARGS, PRE-OP.
-TEMPLATE, SUBMIT, TARGET, and POST-OP.  Re-registering an existing ID
-replaces the entry."
+(cl-defun agent-shell-workflow-register (&key id doc category args pre-op template submit target post-op clear clear-before)
+  "Register a workflow spec built from ID, DOC, CATEGORY, ARGS, PRE-OP,
+TEMPLATE, SUBMIT, TARGET, POST-OP, and CLEAR (or CLEAR-BEFORE).
+Re-registering an existing ID replaces the entry."
   (unless id
     (error "Agent-shell-workflow: `:id' is required"))
   (unless template
@@ -267,13 +296,14 @@ replaces the entry."
            (agent-shell-workflow-spec--make
             :id id :doc doc :category (or category "General") :args args
             :pre-op pre-op :template template :submit submit
-            :target (or target :ask) :post-op post-op)
+            :target (or target :ask) :post-op post-op
+            :clear (or clear clear-before))
            agent-shell-workflow-registry))
 
 (defmacro register-agent-shell-workflow (id &rest keys)
   "Define and register a prompt workflow named ID.
 KEYS is a plist accepting the same keys as `agent-shell-workflow-register'
-\(:doc :category :args :pre-op :template :submit :target :post-op).
+\(:doc :category :args :pre-op :template :submit :target :post-op :clear :clear-before).
 :args is data (an arg-spec list), not code, and is quoted automatically."
   (declare (indent 1))
   (let ((keys (if (plist-member keys :args)
@@ -448,7 +478,7 @@ agent-shell-menu in turn would be circular."
          ((and res (not (numberp res)))
           res))))))
 
-(defun agent-shell-workflow--session-buffer (target &optional dir)
+(defun agent-shell-workflow--session-buffer (target &optional dir spec)
   "Return a live `agent-shell' buffer for TARGET in DIR, creating or prompting.
 When TARGET is `:session-new', always create a new shell buffer.
 When matching open buffers exist for DIR (default `default-directory'), prompt
@@ -481,7 +511,7 @@ Otherwise, create a new shell buffer."
               (setq reused-buf (get-buffer choice)
                     res-buf reused-buf)))))
         (when (and reused-buf (buffer-live-p reused-buf))
-          (agent-shell-workflow--maybe-clear-reused-buffer reused-buf))
+          (agent-shell-workflow--maybe-clear-reused-buffer reused-buf spec))
         res-buf))))
 
 (defun agent-shell-workflow--dispatch-rendered (spec ctx target submit &optional dir)
@@ -498,7 +528,7 @@ When SUBMIT is non-nil, submit the prompt immediately."
       (user-error "Target `:queue' requested but no queue target handler is registered"))
      (t
       (let* ((shell-buffer (or (plist-get ctx :shell-buffer)
-                               (agent-shell-workflow--session-buffer target effective-dir))))
+                               (agent-shell-workflow--session-buffer target effective-dir spec))))
         (agent-shell-workflow--dispatch-to-buffer spec ctx shell-buffer submit))))))
 
 (defun agent-shell-workflow--buffer-busy-p (buffer)
@@ -737,8 +767,19 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
          (effective-submit (if (null submit)
                                (agent-shell-workflow-spec-submit spec)
                              submit))
-         (shell-buffer (when (memq resolved-target '(:session-reuse :session-new))
-                         (agent-shell-workflow--session-buffer resolved-target dir)))
+         (shell-buffer (cond
+                        ((memq resolved-target '(:session-reuse :session-new))
+                         (agent-shell-workflow--session-buffer resolved-target dir spec))
+                        ((bufferp resolved-target)
+                         (when (and (buffer-live-p resolved-target) spec (agent-shell-workflow-spec-clear spec))
+                           (agent-shell-workflow--maybe-clear-reused-buffer resolved-target spec))
+                         resolved-target)
+                        ((and (stringp resolved-target) (get-buffer resolved-target))
+                         (let ((b (get-buffer resolved-target)))
+                           (when (and (buffer-live-p b) spec (agent-shell-workflow-spec-clear spec))
+                             (agent-shell-workflow--maybe-clear-reused-buffer b spec))
+                           b))
+                        (t nil)))
          (busy-action (when (and effective-submit shell-buffer)
                         (agent-shell-workflow--resolve-busy-action-upfront shell-buffer effective-submit)))
          (initial-ctx (list :args collected-args

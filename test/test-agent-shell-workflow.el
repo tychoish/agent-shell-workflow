@@ -1415,6 +1415,83 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
             (should-not insert-called)))
       (kill-buffer buf))))
 
+(ert-deftest agent-shell-workflow/clear-command-resolution-none ()
+  "_clear-command-for-buffer returns nil when no clear command is configured."
+  (let ((agent-shell-workflow-clear-commands '((omp . "/shake")))
+        (buf (generate-new-buffer "*generic-agent*")))
+    (unwind-protect
+        (should-not (agent-shell-workflow--clear-command-for-buffer buf))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/clear-command-resolution-explicit-nil ()
+  "_clear-command-for-buffer returns nil when shell type is explicitly mapped to nil."
+  (let ((agent-shell-workflow-clear-commands '((omp . nil) (t . "/clear")))
+        (buf (generate-new-buffer "*omp*")))
+    (unwind-protect
+        (should-not (agent-shell-workflow--clear-command-for-buffer buf))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/maybe-clear-reused-buffer-respects-spec-clear-nil ()
+  "_maybe-clear-reused-buffer does nothing without prompting when spec clear is nil."
+  (let ((buf (generate-new-buffer "*test-clear-spec-nil*"))
+        (spec (agent-shell-workflow-spec--make :id 'no-clear :template "hi" :clear nil))
+        prompted
+        insert-called)
+    (unwind-protect
+        (cl-letf (((symbol-function 'y-or-n-p)
+                   (lambda (&rest _) (setq prompted t) t))
+                  ((symbol-function 'agent-shell-insert)
+                   (lambda (&rest _) (setq insert-called t))))
+          (let ((res (agent-shell-workflow--maybe-clear-reused-buffer buf spec)))
+            (should-not res)
+            (should-not prompted)
+            (should-not insert-called)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/maybe-clear-reused-buffer-respects-spec-clear-t ()
+  "_maybe-clear-reused-buffer clears immediately without prompt when spec clear is t."
+  (let ((buf (generate-new-buffer "*test-clear-spec-t*"))
+        (spec (agent-shell-workflow-spec--make :id 'yes-clear :template "hi" :clear t))
+        prompted
+        inserted-text
+        inserted-submit)
+    (unwind-protect
+        (cl-letf (((symbol-function 'y-or-n-p)
+                   (lambda (&rest _) (setq prompted t) t))
+                  ((symbol-function 'agent-shell-insert)
+                   (lambda (&rest args)
+                     (setq inserted-text (plist-get args :text))
+                     (setq inserted-submit (plist-get args :submit)))))
+          (let ((res (agent-shell-workflow--maybe-clear-reused-buffer buf spec)))
+            (should (eq res t))
+            (should-not prompted)
+            (should (equal inserted-text "/clear"))
+            (should (eq inserted-submit t))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/maybe-clear-reused-buffer-skips-when-no-clear-defined ()
+  "_maybe-clear-reused-buffer does nothing when clear is t but no clear command is defined."
+  (let ((agent-shell-workflow-clear-commands '((omp . "/shake")))
+        (buf (generate-new-buffer "*generic-no-clear*"))
+        (spec (agent-shell-workflow-spec--make :id 'yes-clear :template "hi" :clear t))
+        prompted
+        insert-called)
+    (unwind-protect
+        (cl-letf (((symbol-function 'y-or-n-p)
+                   (lambda (&rest _) (setq prompted t) t))
+                  ((symbol-function 'agent-shell-insert)
+                   (lambda (&rest _) (setq insert-called t))))
+          (let ((res (agent-shell-workflow--maybe-clear-reused-buffer buf spec)))
+            (should-not res)
+            (should-not prompted)
+            (should-not insert-called)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/fix-ci-has-clear-and-create-commit-does-not ()
+  "Built-in fix-ci has :clear t while create-commit has :clear nil."
+  (should (agent-shell-workflow-spec-clear (agent-shell-workflow-get 'fix-ci)))
+  (should-not (agent-shell-workflow-spec-clear (agent-shell-workflow-get 'create-commit))))
+
 (ert-deftest agent-shell-workflow/run-process-async-echo ()
   "_run-process-async completes and invokes callback with stdout."
   (let ((done nil)

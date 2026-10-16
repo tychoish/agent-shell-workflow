@@ -435,7 +435,8 @@ Do NOT read the entire log file into context. Inspect the logs as files using se
 3. Present fix plan to user and ask confirmation before modifying source files.
 4. Implement targeted fix and verify with narrow tests."
   :submit t
-  :target :session-reuse)
+  :target :session-reuse
+  :clear t)
 
 ;; PR review comment remediation
 
