@@ -215,6 +215,7 @@ Uses Magit or Git directly to gather state."
 
 ## Guidelines:
 - Subject: Imperative, concise sentence matching repository conventions.
+- Metadata: Provide conventional commits style prefix 'keyword(domain): '
 - Body: 2-3 sentences explaining motivation/impact (omit if self-explanatory).
 - Attribution: Include `Co-authored-by:` trailer identifying the AI assistant.
 - Stage appropriate changes and commit."
