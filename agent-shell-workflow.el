@@ -37,6 +37,9 @@
 
 ;;; Code:
 
+(defvar agent-shell-workflow-test-mode nil
+  "When non-nil, force interactive agent config selection paths in batch tests.")
+
 (require 'cl-lib)
 (require 'map)
 (require 'seq)
@@ -431,7 +434,6 @@ Handles `:drop-context', `:restart', `:close', and `(:chain ID ARGS)'.
     (_ nil)))
 
 ;; Dispatch routing
-
 (defun agent-shell-workflow--resolve-target (target)
   "Resolve TARGET keyword `:ask' via `completing-read' into a concrete target."
   (if (eq target :ask)
@@ -442,31 +444,63 @@ Handles `:drop-context', `:restart', `:close', and `(:chain ID ARGS)'.
 
 (defun agent-shell-workflow--canonicalize-dir (dir)
   "Return canonical representation of DIR with trailing slash."
-  (file-name-as-directory (expand-file-name (or dir default-directory))))
+  (file-name-as-directory (file-truename (expand-file-name (or dir default-directory)))))
+
+(defun agent-shell-workflow--project-root (&optional dir)
+  "Return the project root for DIR, or canonical DIR if no project detected."
+  (let ((d (agent-shell-workflow--canonicalize-dir dir)))
+    (or (when-let* ((pr (ignore-errors (project-current nil d))))
+          (agent-shell-workflow--canonicalize-dir (project-root pr))))
+        (when (fboundp 'vc-root-dir)
+          (let ((default-directory d))
+            (when-let* ((vc (ignore-errors (vc-root-dir))))
+              (agent-shell-workflow--canonicalize-dir vc))))
+        d))
 
 (defun agent-shell-workflow--project-buffers (dir)
   "Return live `agent-shell' buffers whose project root matches DIR.
-Matches buffers where DIR is within the buffer's `default-directory'
-or the buffer's `default-directory' is within DIR.
-Mirrors `agent-shell-menu-project-buffers' rather than calling it directly:
-agent-shell-workflow-menu.el (which does depend on agent-shell-menu) wires a
-transient entry into agent-shell-menu-dispatch, so this file requiring
-agent-shell-menu in turn would be circular."
-  (let ((canon-dir (agent-shell-workflow--canonicalize-dir dir)))
+Matches buffers where DIR and buffer share the same project root,
+or where either directory is within the other."
+  (let* ((canon-dir (agent-shell-workflow--canonicalize-dir dir))
+         (target-root (agent-shell-workflow--project-root canon-dir)))
     (seq-filter (lambda (buf)
-                  (with-current-buffer buf
-                    (let ((buf-dir (agent-shell-workflow--canonicalize-dir default-directory)))
-                      (or (equal buf-dir canon-dir)
-                          (string-prefix-p buf-dir canon-dir)
-                          (string-prefix-p canon-dir buf-dir)))))
+                  (when (buffer-live-p buf)
+                    (with-current-buffer buf
+                      (let* ((buf-dir (agent-shell-workflow--canonicalize-dir default-directory))
+                             (buf-root (agent-shell-workflow--project-root buf-dir)))
+                        (or (equal buf-root target-root)
+                            (equal buf-dir canon-dir)
+                            (string-prefix-p buf-dir canon-dir)
+                            (string-prefix-p canon-dir buf-dir))))))
                 (agent-shell-buffers))))
 
-(defun agent-shell-workflow--create-shell (&optional dir)
-  "Create and return a new `agent-shell' buffer in DIR."
+(defun agent-shell-workflow--create-shell (&optional dir config)
+  "Create and return a new `agent-shell' buffer in DIR with CONFIG.
+When CONFIG is nil, prompts for agent selection via `agent-shell-select-config'
+if available, or falls back to `agent-shell-new-shell'."
   (let* ((canon-dir (agent-shell-workflow--canonicalize-dir (or dir default-directory)))
          (before-bufs (agent-shell-buffers)))
     (let ((default-directory canon-dir))
-      (let ((res (agent-shell-new-shell)))
+      (let ((res (cond
+                  (config
+                   (if (fboundp 'agent-shell--start)
+                       (agent-shell--start :config config
+                                           :session-strategy 'new
+                                           :new-session t
+                                           :no-focus t)
+                     (agent-shell-new-shell)))
+                  ((and (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode))
+                        (fboundp 'agent-shell-select-config)
+                        (fboundp 'agent-shell--start))
+                   (let ((cfg (agent-shell-select-config :prompt "Start agent for workflow: ")))
+                     (if cfg
+                         (agent-shell--start :config cfg
+                                             :session-strategy 'new
+                                             :new-session t
+                                             :no-focus t)
+                       (agent-shell-new-shell))))
+                  (t
+                   (agent-shell-new-shell)))))
         (cond
          ((and (bufferp res) (buffer-live-p res))
           res)
@@ -483,7 +517,8 @@ agent-shell-menu in turn would be circular."
 When TARGET is `:session-new', always create a new shell buffer.
 When matching open buffers exist for DIR (default `default-directory'), prompt
 the user whether to reuse an existing shell buffer or create a new one.
-Otherwise, create a new shell buffer."
+When no matching open buffers exist, prompt the user whether to create one.
+If declined, signals `user-error'."
   (let ((effective-dir (or dir default-directory)))
     (if (eq target :session-new)
         (agent-shell-workflow--create-shell effective-dir)
@@ -493,14 +528,18 @@ Otherwise, create a new shell buffer."
              (res-buf nil))
         (cond
          ((null buffers)
-          (setq res-buf (agent-shell-workflow--create-shell effective-dir)))
+          (if (y-or-n-p (format "No agent-shell open for %s. Create one? " dir-name))
+              (setq res-buf (agent-shell-workflow--create-shell effective-dir))
+            (user-error "Aborted: no agent-shell available for %s" dir-name)))
          ((= (length buffers) 1)
           (let ((buf (car buffers)))
             (if (y-or-n-p (format "Reuse open agent-shell %s for %s? "
                                   (buffer-name buf) dir-name))
                 (setq reused-buf buf
                       res-buf buf)
-              (setq res-buf (agent-shell-workflow--create-shell effective-dir)))))
+              (if (y-or-n-p (format "Create a new agent-shell for %s? " dir-name))
+                  (setq res-buf (agent-shell-workflow--create-shell effective-dir))
+                (user-error "Aborted: cancelled shell selection")))))
          (t
           (let* ((new-option "[New agent-shell]")
                  (choices (cons new-option (mapcar #'buffer-name buffers)))
@@ -556,11 +595,11 @@ When SUBMIT is non-nil, submit the prompt immediately."
 (defun agent-shell-workflow--resolve-busy-action-upfront (shell-buffer will-submit)
   "Determine the action to take if SHELL-BUFFER is busy, asked upfront.
 Consults `agent-shell-workflow-busy-shell-behavior'.  When set to `ask',
-prompts the user with `y-or-n-p' synchronously before preflight starts.
-If SHELL-BUFFER is already busy, asks if prompt should be queued when
-preflight completes.  If SHELL-BUFFER is not currently busy, asks
-conditionally if prompt should be queued if the shell becomes busy.
-Returns one of `queue', `wait', `insert', or `error'."
+prompts the user synchronously before preflight starts.
+If SHELL-BUFFER is already busy, asks if prompt should be queued or if a
+different shell should be selected.  If SHELL-BUFFER is not currently busy,
+asks conditionally if prompt should be queued if the shell becomes busy.
+Returns one of `queue', `wait', `select', `insert', or `error'."
   (when (and will-submit shell-buffer)
     (let* ((buf (cond
                  ((bufferp shell-buffer) shell-buffer)
@@ -573,18 +612,20 @@ Returns one of `queue', `wait', `insert', or `error'."
            (queue-avail (fboundp 'agent-shell-queue--enqueue-args)))
       (pcase agent-shell-workflow-busy-shell-behavior
         ('ask
-         (if queue-avail
-             (let* ((busy-now (agent-shell-workflow--buffer-busy-p shell-buffer))
-                    (prompt-text
-                     (if busy-now
-                         (format "Agent shell `%s' is currently busy. Add prompt to queue when preflight completes? "
-                                 buf-name)
-                       (format "If agent shell `%s' is busy when preflight completes, add prompt to queue? "
-                               buf-name))))
-               (if (y-or-n-p prompt-text)
+         (let ((busy-now (agent-shell-workflow--buffer-busy-p shell-buffer)))
+           (if busy-now
+               (if (y-or-n-p (format "Agent shell `%s' is currently busy. Add prompt to queue when preflight completes? "
+                                     buf-name))
                    'queue
-                 'wait))
-           'wait))
+                 (if (y-or-n-p "Select or create a different agent shell? ")
+                     'select
+                   'wait))
+             (if queue-avail
+                 (if (y-or-n-p (format "If agent shell `%s' is busy when preflight completes, add prompt to queue? "
+                                       buf-name))
+                     'queue
+                   'wait)
+               'wait))))
         ('queue
          (if queue-avail
              'queue
@@ -621,7 +662,7 @@ prompts the user with `y-or-n-p'.  Returns one of `queue', `wait',
       (other other))))
 
 (defun agent-shell-workflow--enqueue-for-buffer (spec ctx shell-buffer submit)
-  "Add prompt for SPEC, CTX, and SUBMIT to `agent-shell-queue' for SHELL-BUFFER.
+  "Add prompt for SPEC, CTX, and SUBMIT to `agent-shell-queue'; for SHELL-BUFFER.
 Signals a `user-error' if `agent-shell-queue' is not available."
   (if (fboundp 'agent-shell-queue--enqueue-args)
       (let* ((buf (cond
@@ -726,12 +767,16 @@ until turn-complete."
 
 (defun agent-shell-workflow--insert (spec ctx shell-buffer submit)
   "Render SPEC with CTX and insert it into SHELL-BUFFER.
-When SUBMIT is non-nil, submit immediately.  Returns the plist returned by
-`agent-shell-insert'."
-  (let ((rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx)))
+When SUBMIT is non-nil, submit immediately (or prompt if SUBMIT is `:ask'
+or `ask').  Returns the plist returned by `agent-shell-insert'."
+  (let* ((actual-submit (cond
+                         ((memq submit '(:ask ask))
+                          (y-or-n-p "Submit rendered prompt? "))
+                         (t submit)))
+         (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx)))
     (agent-shell-insert :text rendered
                         :shell-buffer shell-buffer
-                        :submit submit)))
+                        :submit actual-submit)))
 
 (defun agent-shell-workflow--last-response-text (shell-buffer start-pos)
   "Extract the agent response text in SHELL-BUFFER from START-POS to point-max.
@@ -761,48 +806,109 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
   (let* ((spec (or (agent-shell-workflow-get id)
                    (error "Agent-shell-workflow: no workflow registered with id `%s'" id)))
          (dir (or context-dir default-directory))
-         (collected-args (agent-shell-workflow--collect-args spec args))
-         (resolved-target (agent-shell-workflow--resolve-target
-                           (or target (agent-shell-workflow-spec-target spec))))
+         (initial-target (agent-shell-workflow--resolve-target
+                          (or target (agent-shell-workflow-spec-target spec))))
          (effective-submit (if (null submit)
                                (agent-shell-workflow-spec-submit spec)
                              submit))
-         (shell-buffer (cond
-                        ((memq resolved-target '(:session-reuse :session-new))
-                         (agent-shell-workflow--session-buffer resolved-target dir spec))
-                        ((bufferp resolved-target)
-                         (when (and (buffer-live-p resolved-target) spec (agent-shell-workflow-spec-clear spec))
-                           (agent-shell-workflow--maybe-clear-reused-buffer resolved-target spec))
-                         resolved-target)
-                        ((and (stringp resolved-target) (get-buffer resolved-target))
-                         (let ((b (get-buffer resolved-target)))
-                           (when (and (buffer-live-p b) spec (agent-shell-workflow-spec-clear spec))
-                             (agent-shell-workflow--maybe-clear-reused-buffer b spec))
-                           b))
-                        (t nil)))
-         (busy-action (when (and effective-submit shell-buffer)
-                        (agent-shell-workflow--resolve-busy-action-upfront shell-buffer effective-submit)))
-         (initial-ctx (list :args collected-args
-                            :target resolved-target
-                            :shell-buffer shell-buffer
-                            :submit effective-submit
-                            :busy-action busy-action
-                            :context-dir dir)))
-    (let ((default-directory dir))
-      (agent-shell-workflow-exec-pre
-       spec initial-ctx
-       (lambda (updated-ctx)
-         (let* ((merged-ctx (let ((c (copy-sequence initial-ctx))
-                                  (rem updated-ctx))
-                              (while rem
-                                (setq c (plist-put c (car rem) (cadr rem)))
-                                (setq rem (cddr rem)))
-                              c))
-                (effective-dir (or (plist-get merged-ctx :context-dir) dir))
-                (default-directory effective-dir)
-                (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) merged-ctx))
-                (ctx-with-rendered (plist-put merged-ctx :rendered rendered)))
-           (agent-shell-workflow--dispatch-rendered spec ctx-with-rendered resolved-target effective-submit effective-dir)))))))
+         shell-buffer
+         chosen-config
+         (resolved-target initial-target)
+         busy-action)
+    ;; 1. Resolve target shell and upfront busy handling before preflight
+    (let ((cur-target initial-target)
+          (done nil))
+      (while (not done)
+        (cond
+         ((eq cur-target :session-reuse)
+          (let* ((buffers (agent-shell-workflow--project-buffers dir))
+                 (dir-name (file-name-nondirectory (directory-file-name dir))))
+            (cond
+             ((null buffers)
+              (if (y-or-n-p (format "No agent-shell open for %s. Create one? " dir-name))
+                  (progn
+                    (setq cur-target :session-new)
+                    (when (and (fboundp 'agent-shell-select-config) (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode)))
+                      (setq chosen-config (agent-shell-select-config :prompt "Start agent for workflow: "))))
+                (user-error "Aborted: no agent-shell available for %s" dir-name)))
+             ((= (length buffers) 1)
+              (let ((buf (car buffers)))
+                (if (y-or-n-p (format "Reuse open agent-shell %s for %s? "
+                                      (buffer-name buf) dir-name))
+                    (setq cur-target buf)
+                  (if (y-or-n-p (format "Create a new agent-shell for %s? " dir-name))
+                      (progn
+                        (setq cur-target :session-new)
+                        (when (and (fboundp 'agent-shell-select-config) (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode)))
+                          (setq chosen-config (agent-shell-select-config :prompt "Start agent for workflow: "))))
+                    (user-error "Aborted: cancelled shell selection")))))
+             (t
+              (let* ((new-option "[New agent-shell]")
+                     (choices (cons new-option (mapcar #'buffer-name buffers)))
+                     (choice (completing-read (format "Select agent-shell for %s: " dir-name)
+                                              choices nil t nil nil
+                                              (buffer-name (car buffers)))))
+                (if (string-equal choice new-option)
+                    (progn
+                      (setq cur-target :session-new)
+                      (when (fboundp 'agent-shell-select-config)
+                        (setq chosen-config (agent-shell-select-config :prompt "Start agent for workflow: "))))
+                  (setq cur-target (get-buffer choice))))))))
+         ((eq cur-target :session-new)
+          (when (and (null chosen-config) (fboundp 'agent-shell-select-config) (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode)))
+            (setq chosen-config (agent-shell-select-config :prompt "Start agent for workflow: ")))
+          (setq done t))
+         ((or (bufferp cur-target) (stringp cur-target))
+          (let ((b (if (stringp cur-target) (get-buffer cur-target) cur-target)))
+            (if (and effective-submit (bufferp b) (buffer-live-p b))
+                (let ((b-action (agent-shell-workflow--resolve-busy-action-upfront b effective-submit)))
+                  (if (eq b-action 'select)
+                      (progn
+                        (setq cur-target :session-new)
+                        (when (and (fboundp 'agent-shell-select-config) (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode)))
+                          (setq chosen-config (agent-shell-select-config :prompt "Start agent for workflow: "))))
+                    (setq shell-buffer b
+                          busy-action b-action
+                          done t)))
+              (setq shell-buffer b
+                    done t))))
+         (t
+          (setq done t))))
+      (setq resolved-target cur-target))
+
+    ;; 2. Additional preflight clarifications and argument collection
+    (let ((collected-args (agent-shell-workflow--collect-args spec args)))
+      ;; 3. Create the shell buffer now if needed
+      (when (eq resolved-target :session-new)
+        (setq shell-buffer (agent-shell-workflow--create-shell dir chosen-config))
+        (setq resolved-target shell-buffer))
+      (when (and (bufferp shell-buffer) (buffer-live-p shell-buffer)
+                 spec (agent-shell-workflow-spec-clear spec))
+        (agent-shell-workflow--maybe-clear-reused-buffer shell-buffer spec))
+
+      ;; 4. Non-blocking preflight execution
+      (let ((initial-ctx (list :args collected-args
+                               :target resolved-target
+                               :shell-buffer shell-buffer
+                               :submit effective-submit
+                               :busy-action busy-action
+                               :context-dir dir)))
+        (let ((default-directory dir))
+          (agent-shell-workflow-exec-pre
+           spec initial-ctx
+           (lambda (updated-ctx)
+             (let* ((merged-ctx (let ((c (copy-sequence initial-ctx))
+                                      (rem updated-ctx))
+                                  (while rem
+                                    (setq c (plist-put c (car rem) (cadr rem)))
+                                    (setq rem (cddr rem)))
+                                  c))
+                    (effective-dir (or (plist-get merged-ctx :context-dir) dir))
+                    (default-directory effective-dir)
+                    (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) merged-ctx))
+                    (ctx-with-rendered (plist-put merged-ctx :rendered rendered)))
+               ;; 5. Insert rendered prompt & submit
+               (agent-shell-workflow--dispatch-rendered spec ctx-with-rendered resolved-target effective-submit effective-dir)))))))))
 
 ;; Integration with agent-shell-queue
 

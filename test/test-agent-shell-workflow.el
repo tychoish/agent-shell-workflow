@@ -791,23 +791,51 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
     (should (eq (agent-shell-workflow--session-buffer :session-new) 'created-shell))))
 
 (ert-deftest agent-shell-workflow/session-buffer-session-reuse-fallback ()
-  "agent-shell-workflow--session-buffer falls back to creating shell when no project buffers exist."
+  "agent-shell-workflow--session-buffer prompts to create shell when no project buffers exist."
+  (let (prompt-seen)
+    (cl-letf (((symbol-function 'agent-shell-workflow--project-buffers)
+               (lambda (_dir) nil))
+              ((symbol-function 'y-or-n-p)
+               (lambda (prompt) (setq prompt-seen prompt) t))
+              ((symbol-function 'agent-shell-workflow--create-shell)
+               (lambda (&optional _dir) 'fallback-shell)))
+      (should (eq (agent-shell-workflow--session-buffer :session-reuse) 'fallback-shell))
+      (should (string-match-p "No agent-shell open" prompt-seen)))))
+
+(ert-deftest agent-shell-workflow/session-buffer-session-reuse-fallback-declined ()
+  "agent-shell-workflow--session-buffer aborts when user declines creating shell."
   (cl-letf (((symbol-function 'agent-shell-workflow--project-buffers)
              (lambda (_dir) nil))
-            ((symbol-function 'agent-shell-workflow--create-shell)
-             (lambda (&optional _dir) 'fallback-shell)))
-    (should (eq (agent-shell-workflow--session-buffer :session-reuse) 'fallback-shell))))
+            ((symbol-function 'y-or-n-p)
+             (lambda (_prompt) nil)))
+    (should-error (agent-shell-workflow--session-buffer :session-reuse)
+                  :type 'user-error)))
 
 (ert-deftest agent-shell-workflow/session-buffer-session-reuse-declined ()
-  "agent-shell-workflow--session-buffer creates shell when user declines reuse."
-  (let ((buf (generate-new-buffer "asp-reuse-declined")))
+  "agent-shell-workflow--session-buffer creates shell when user declines reuse but accepts creating new."
+  (let ((buf (generate-new-buffer "asp-reuse-declined"))
+        (call-count 0))
     (unwind-protect
         (cl-letf (((symbol-function 'agent-shell-workflow--project-buffers)
                    (lambda (_dir) (list buf)))
-                  ((symbol-function 'y-or-n-p) (lambda (_prompt) nil))
+                  ((symbol-function 'y-or-n-p)
+                   (lambda (_prompt)
+                     (cl-incf call-count)
+                     (if (= call-count 1) nil t)))
                   ((symbol-function 'agent-shell-workflow--create-shell)
                    (lambda (&optional _dir) 'declined-shell)))
           (should (eq (agent-shell-workflow--session-buffer :session-reuse) 'declined-shell)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/session-buffer-session-reuse-declined-both ()
+  "agent-shell-workflow--session-buffer aborts when user declines reuse and declines creating new."
+  (let ((buf (generate-new-buffer "asp-reuse-declined-both")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-workflow--project-buffers)
+                   (lambda (_dir) (list buf)))
+                  ((symbol-function 'y-or-n-p) (lambda (_prompt) nil)))
+          (should-error (agent-shell-workflow--session-buffer :session-reuse)
+                        :type 'user-error))
       (kill-buffer buf))))
 
 (ert-deftest agent-shell-workflow/session-buffer-session-reuse-multiple-prompts ()
@@ -1933,6 +1961,352 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
              (should (member :enqueued order))
              (should (eq enqueued-target buf))))
        (kill-buffer buf)))))
+
+(ert-deftest agent-shell-workflow/resolve-busy-action-upfront-busy-declined-selects-different ()
+  "When buffer is busy and user declines queuing, prompt to select a different shell."
+  (let ((agent-shell-workflow-busy-shell-behavior 'ask)
+        (prompts nil))
+    (cl-letf (((symbol-function 'fboundp) (lambda (_) t))
+              ((symbol-function 'agent-shell-workflow--buffer-busy-p) (lambda (_) t))
+              ((symbol-function 'y-or-n-p)
+               (lambda (p)
+                 (push p prompts)
+                 (if (string-match-p "currently busy" p)
+                     nil
+                   t))))
+      (should (eq (agent-shell-workflow--resolve-busy-action-upfront "test-buf" t) 'select))
+      (should (= (length prompts) 2)))))
+
+(ert-deftest agent-shell-workflow/resolve-busy-action-upfront-busy-declined-both ()
+  "When buffer is busy and user declines both queue and select, fall back to wait."
+  (let ((agent-shell-workflow-busy-shell-behavior 'ask)
+        (prompts nil))
+    (cl-letf (((symbol-function 'fboundp) (lambda (_) t))
+              ((symbol-function 'agent-shell-workflow--buffer-busy-p) (lambda (_) t))
+              ((symbol-function 'y-or-n-p)
+               (lambda (p)
+                 (push p prompts)
+                 nil)))
+      (should (eq (agent-shell-workflow--resolve-busy-action-upfront "test-buf" t) 'wait))
+      (should (= (length prompts) 2)))))
+
+(ert-deftest agent-shell-workflow/dispatch-busy-shell-select-different-creates-new ()
+  "When upfront busy choice is `select', dispatch loops to create a new shell session."
+  (asw-test/isolate
+   (let* ((busy-buf (generate-new-buffer "busy-buf"))
+          (new-buf (generate-new-buffer "new-buf"))
+          (agent-shell-workflow-busy-shell-behavior 'ask)
+          (new-shell-created nil)
+          (inserted-buf nil))
+     (unwind-protect
+         (progn
+           (register-agent-shell-workflow busy-select-wf
+             :template "Run task"
+             :target :session-reuse
+             :submit t)
+           (cl-letf (((symbol-function 'agent-shell-workflow--project-buffers)
+                      (lambda (_) (list busy-buf)))
+                     ((symbol-function 'agent-shell-workflow--buffer-busy-p)
+                      (lambda (b) (eq b busy-buf)))
+                     ((symbol-function 'y-or-n-p)
+                      (lambda (p)
+                        (cond
+                         ((string-match-p "Reuse open agent-shell" p) t)
+                         ((string-match-p "currently busy" p) nil)
+                         ((string-match-p "Select or create" p) t)
+                         (t t))))
+                     ((symbol-function 'agent-shell-workflow--create-shell)
+                      (lambda (&rest _)
+                        (setq new-shell-created t)
+                        new-buf))
+                     ((symbol-function 'agent-shell-insert)
+                      (lambda (&rest keys)
+                        (setq inserted-buf (plist-get keys :shell-buffer))
+                        (list :shell-buffer inserted-buf :start 1 :end 1))))
+             (agent-shell-workflow-dispatch 'busy-select-wf)
+             (should new-shell-created)
+             (should (eq inserted-buf new-buf))))
+       (kill-buffer busy-buf)
+       (kill-buffer new-buf)))))
+
+(ert-deftest agent-shell-workflow/insert-submit-ask-prompts-user ()
+  "`agent-shell-workflow--insert' prompts when submit is `:ask'."
+  (asw-test/isolate
+   (register-agent-shell-workflow submit-ask-wf
+     :template "Hello ask")
+   (let* ((spec (agent-shell-workflow-get 'submit-ask-wf))
+          (asked nil)
+          (submitted-val nil))
+     (cl-letf (((symbol-function 'y-or-n-p)
+                (lambda (p)
+                  (setq asked p)
+                  t))
+               ((symbol-function 'agent-shell-insert)
+                (lambda (&rest keys)
+                  (setq submitted-val (plist-get keys :submit)))))
+       (agent-shell-workflow--insert spec nil "buf" :ask)
+       (should (string-match-p "Submit rendered prompt" asked))
+       (should (eq submitted-val t))))))
+
+
+(ert-deftest agent-shell-workflow/dispatch-flow-no-shell-creates-after-clarifications ()
+  "Flow: No shell open prompts to create, selects agent, gathers clarifications,
+then creates shell, runs pre-op, inserts prompt, and submits with opt-in prompt."
+  (asw-test/isolate
+   (register-agent-shell-workflow flow-no-shell
+     :template "Task: {{args.task}}"
+     :target :session-reuse
+     :submit :ask
+     :args ((task :required t :prompt "Task description: "))
+     :pre-op (lambda (ctx callback)
+               (funcall callback ctx)))
+   (let* ((order nil)
+          (new-buf (generate-new-buffer "asw-flow-new-buf"))
+          (created-shell-config nil)
+          (inserted-buf nil)
+          (inserted-text nil)
+          (inserted-submit nil)
+          (agent-shell-workflow-test-mode t))
+     (unwind-protect
+         (cl-letf* (((symbol-function 'agent-shell-workflow--project-buffers)
+                     (lambda (_dir) nil))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (p)
+                       (cond
+                        ((string-match-p "No agent-shell open" p)
+                         (push :prompt-create-shell order)
+                         t)
+                        ((string-match-p "Submit rendered prompt" p)
+                         (push :prompt-submit order)
+                         t)
+                        (t
+                         (push (list :unexpected-prompt p) order)
+                         t))))
+                    ((symbol-function 'agent-shell-select-config)
+                     (lambda (&rest _)
+                       (push :select-agent-config order)
+                       'test-agent-cfg))
+                    ((symbol-function 'read-string)
+                     (lambda (_prompt &rest _)
+                       (push :preflight-clarification order)
+                       "clean refactor"))
+                    ((symbol-function 'agent-shell-workflow--create-shell)
+                     (lambda (_dir &optional cfg)
+                       (push :create-shell order)
+                       (setq created-shell-config cfg)
+                       new-buf))
+                    ((symbol-function 'agent-shell-insert)
+                     (lambda (&rest keys)
+                       (push :insert order)
+                       (setq inserted-buf (plist-get keys :shell-buffer))
+                       (setq inserted-text (plist-get keys :text))
+                       (setq inserted-submit (plist-get keys :submit))
+                       (list :shell-buffer inserted-buf :start 1 :end 1))))
+           (agent-shell-workflow-dispatch 'flow-no-shell)
+           (should (equal (nreverse order)
+                          '(:prompt-create-shell
+                            :select-agent-config
+                            :preflight-clarification
+                            :create-shell
+                            :prompt-submit
+                            :insert)))
+           (should (eq created-shell-config 'test-agent-cfg))
+           (should (eq inserted-buf new-buf))
+           (should (equal inserted-text "Task: clean refactor"))
+           (should (eq inserted-submit t)))
+       (kill-buffer new-buf)))))
+
+(ert-deftest agent-shell-workflow/dispatch-flow-reuse-shell-with-conditional-busy ()
+  "Flow: Eligible shell open asks reuse, sets conditional busy upfront, gathers clarifications,
+and reuses existing shell without creating a new one."
+  (asw-test/isolate
+   (register-agent-shell-workflow flow-reuse-shell
+     :template "Task: {{args.task}}"
+     :target :session-reuse
+     :submit t
+     :args ((task :required t :prompt "Task description: "))
+     :pre-op (lambda (ctx callback)
+               (funcall callback ctx)))
+   (let* ((order nil)
+          (existing-buf (generate-new-buffer "asw-flow-existing-buf"))
+          (created-called nil)
+          (inserted-buf nil)
+          (agent-shell-workflow-busy-shell-behavior 'ask))
+     (unwind-protect
+         (cl-letf* (((symbol-function 'agent-shell-workflow--project-buffers)
+                     (lambda (_dir) (list existing-buf)))
+                    ((symbol-function 'agent-shell-workflow--buffer-busy-p)
+                     (lambda (_) nil))
+                    ((symbol-function 'fboundp) (lambda (_) t))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (p)
+                       (cond
+                        ((string-match-p "Reuse open agent-shell" p)
+                         (push :prompt-reuse order)
+                         t)
+                        ((string-match-p "busy when preflight completes" p)
+                         (push :prompt-conditional-busy order)
+                         t)
+                        (t (push (list :unexpected-prompt p) order) t))))
+                    ((symbol-function 'read-string)
+                     (lambda (&rest _)
+                       (push :preflight-clarification order)
+                       "fix build"))
+                    ((symbol-function 'agent-shell-workflow--create-shell)
+                     (lambda (&rest _)
+                       (setq created-called t)))
+                    ((symbol-function 'agent-shell-insert)
+                     (lambda (&rest keys)
+                       (push :insert order)
+                       (setq inserted-buf (plist-get keys :shell-buffer))
+                       (list :shell-buffer inserted-buf :start 1 :end 1))))
+           (agent-shell-workflow-dispatch 'flow-reuse-shell)
+           (should (equal (nreverse order)
+                          '(:prompt-reuse
+                            :prompt-conditional-busy
+                            :preflight-clarification
+                            :insert)))
+           (should-not created-called)
+           (should (eq inserted-buf existing-buf)))
+       (kill-buffer existing-buf)))))
+
+(ert-deftest agent-shell-workflow/dispatch-flow-multiple-shells-choice ()
+  "Flow: Multiple eligible shells prompt completing-read to select target."
+  (asw-test/isolate
+   (register-agent-shell-workflow flow-multi-shell
+     :template "Run task"
+     :target :session-reuse
+     :submit t)
+   (let* ((b1 (generate-new-buffer "asw-multi-b1"))
+          (b2 (generate-new-buffer "asw-multi-b2"))
+          (chosen-buf nil))
+     (unwind-protect
+         (cl-letf* (((symbol-function 'agent-shell-workflow--project-buffers)
+                     (lambda (_dir) (list b1 b2)))
+                    ((symbol-function 'completing-read)
+                     (lambda (_prompt choices &rest _)
+                       (should (member "[New agent-shell]" choices))
+                       (should (member (buffer-name b1) choices))
+                       (should (member (buffer-name b2) choices))
+                       (buffer-name b2)))
+                    ((symbol-function 'agent-shell-insert)
+                     (lambda (&rest keys)
+                       (setq chosen-buf (plist-get keys :shell-buffer))
+                       (list :shell-buffer chosen-buf :start 1 :end 1))))
+           (agent-shell-workflow-dispatch 'flow-multi-shell)
+           (should (eq chosen-buf b2)))
+       (kill-buffer b1)
+       (kill-buffer b2)))))
+
+(ert-deftest agent-shell-workflow/dispatch-flow-busy-shell-select-different-shell ()
+  "Flow: Selected shell is busy, user declines queue and selects new shell,
+agent config selected, clarifications asked, then shell created."
+  (asw-test/isolate
+   (register-agent-shell-workflow flow-busy-select
+     :template "Task: {{args.task}}"
+     :target :session-reuse
+     :submit t
+     :args ((task :required t :prompt "Task description: ")))
+   (let* ((order nil)
+          (busy-buf (generate-new-buffer "asw-flow-busy-buf"))
+          (new-buf (generate-new-buffer "asw-flow-busy-new-buf"))
+          (inserted-buf nil)
+          (agent-shell-workflow-busy-shell-behavior 'ask)
+          (agent-shell-workflow-test-mode t))
+     (unwind-protect
+         (cl-letf* (((symbol-function 'agent-shell-workflow--project-buffers)
+                     (lambda (_dir) (list busy-buf)))
+                    ((symbol-function 'agent-shell-workflow--buffer-busy-p)
+                     (lambda (b) (eq b busy-buf)))
+                    ((symbol-function 'fboundp) (lambda (_) t))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (p)
+                       (cond
+                        ((string-match-p "Reuse open agent-shell" p)
+                         (push :prompt-reuse order)
+                         t)
+                        ((string-match-p "currently busy" p)
+                         (push :prompt-busy-queue order)
+                         nil)
+                        ((string-match-p "Select or create" p)
+                         (push :prompt-select-different order)
+                         t)
+                        (t (push (list :unexpected-prompt p) order) t))))
+                    ((symbol-function 'agent-shell-select-config)
+                     (lambda (&rest _)
+                       (push :select-agent-config order)
+                       'cfg-new))
+                    ((symbol-function 'read-string)
+                     (lambda (&rest _)
+                       (push :preflight-clarification order)
+                       "new task"))
+                    ((symbol-function 'agent-shell-workflow--create-shell)
+                     (lambda (_dir cfg)
+                       (push (list :create-shell cfg) order)
+                       new-buf))
+                    ((symbol-function 'agent-shell-insert)
+                     (lambda (&rest keys)
+                       (push :insert order)
+                       (setq inserted-buf (plist-get keys :shell-buffer))
+                       (list :shell-buffer inserted-buf :start 1 :end 1))))
+           (agent-shell-workflow-dispatch 'flow-busy-select)
+           (should (equal (nreverse order)
+                          '(:prompt-reuse
+                            :prompt-busy-queue
+                            :prompt-select-different
+                            :select-agent-config
+                            :preflight-clarification
+                            (:create-shell cfg-new)
+                            :insert)))
+           (should (eq inserted-buf new-buf)))
+       (kill-buffer busy-buf)
+       (kill-buffer new-buf)))))
+
+(ert-deftest agent-shell-workflow/dispatch-flow-busy-shell-enqueue ()
+  "Flow: Selected shell is busy, user opts to enqueue, preflight clarifications run,
+and prompt is enqueued for target shell."
+  (asw-test/isolate
+   (register-agent-shell-workflow flow-busy-queue
+     :template "Task: {{args.task}}"
+     :target :session-reuse
+     :submit t
+     :args ((task :required t :prompt "Task description: ")))
+   (let* ((order nil)
+          (busy-buf (generate-new-buffer "asw-flow-busy-buf2"))
+          (enqueued-buf nil)
+          (agent-shell-workflow-busy-shell-behavior 'ask))
+     (unwind-protect
+         (cl-letf* (((symbol-function 'agent-shell-workflow--project-buffers)
+                     (lambda (_dir) (list busy-buf)))
+                    ((symbol-function 'agent-shell-workflow--buffer-busy-p)
+                     (lambda (b) (eq b busy-buf)))
+                    ((symbol-function 'fboundp) (lambda (_) t))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (p)
+                       (cond
+                        ((string-match-p "Reuse open agent-shell" p)
+                         (push :prompt-reuse order)
+                         t)
+                        ((string-match-p "currently busy" p)
+                         (push :prompt-busy-queue order)
+                         t)
+                        (t (push (list :unexpected-prompt p) order) t))))
+                    ((symbol-function 'read-string)
+                     (lambda (&rest _)
+                       (push :preflight-clarification order)
+                       "queue task"))
+                    ((symbol-function 'agent-shell-queue--enqueue-args)
+                     (lambda (_args _kind target-buf)
+                       (push :enqueued order)
+                       (setq enqueued-buf target-buf))))
+           (agent-shell-workflow-dispatch 'flow-busy-queue)
+           (should (equal (nreverse order)
+                          '(:prompt-reuse
+                            :prompt-busy-queue
+                            :preflight-clarification
+                            :enqueued)))
+           (should (eq enqueued-buf busy-buf)))
+       (kill-buffer busy-buf)))))
 
 (provide 'test-agent-shell-workflow)
 
