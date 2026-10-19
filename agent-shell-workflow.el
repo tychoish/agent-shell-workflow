@@ -661,6 +661,19 @@ prompts the user with `y-or-n-p'.  Returns one of `queue', `wait',
          'wait))
       (other other))))
 
+(defun agent-shell-workflow--sanitize-for-serialization (obj)
+  "Convert unreadable objects in OBJ to readable representations."
+  (cond
+   ((bufferp obj) (buffer-name obj))
+   ((processp obj) (process-name obj))
+   ((markerp obj) (marker-position obj))
+   ((consp obj)
+    (cons (agent-shell-workflow--sanitize-for-serialization (car obj))
+          (agent-shell-workflow--sanitize-for-serialization (cdr obj))))
+   ((vectorp obj)
+    (vconcat (mapcar #'agent-shell-workflow--sanitize-for-serialization obj)))
+   (t obj)))
+
 (defun agent-shell-workflow--enqueue-for-buffer (spec ctx shell-buffer submit)
   "Add prompt for SPEC, CTX, and SUBMIT to `agent-shell-queue'; for SHELL-BUFFER.
 Signals a `user-error' if `agent-shell-queue' is not available."
@@ -673,11 +686,12 @@ Signals a `user-error' if `agent-shell-queue' is not available."
                         ((bufferp buf) (buffer-name buf))
                         ((stringp shell-buffer) shell-buffer)
                         (t (format "%s" shell-buffer))))
-             (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx)))
+             (rendered (or (plist-get ctx :rendered)
+                        (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx))))
         (agent-shell-queue--enqueue-args
          (prin1-to-string (list :workflow-id (agent-shell-workflow-spec-id spec)
                                 :rendered rendered
-                                :ctx ctx
+                                :ctx (agent-shell-workflow--sanitize-for-serialization ctx)
                                 :submit submit))
          'workflow
          buf)
@@ -731,15 +745,20 @@ Clears `agent-shell-workflow--pending-clear' if set."
 
 (defun agent-shell-workflow--dispatch-to-buffer (spec ctx shell-buffer submit)
   "Insert and optionally submit prompt in SHELL-BUFFER for SPEC and CTX.
+If a context clear is currently pending in SHELL-BUFFER, defers insertion
+until turn-complete.
 If SUBMIT is non-nil and SHELL-BUFFER is busy, handles the busy state
 according to `agent-shell-workflow-busy-shell-behavior' or pre-resolved
-`:busy-action' in CTX.
-If a context clear is currently pending in SHELL-BUFFER, defers insertion
-until turn-complete."
+`:busy-action' in CTX."
   (let ((do-insert
          (lambda ()
            (agent-shell-workflow--insert-and-post spec ctx shell-buffer submit))))
     (cond
+     ((and (buffer-live-p shell-buffer)
+           (buffer-local-value 'agent-shell-workflow--pending-clear shell-buffer)
+           (with-current-buffer shell-buffer (derived-mode-p 'agent-shell-mode))
+           (fboundp 'agent-shell-subscribe-to))
+      (agent-shell-workflow--defer-until-turn-complete shell-buffer do-insert))
      ((and submit (agent-shell-workflow--buffer-busy-p shell-buffer))
       (pcase (or (plist-get ctx :busy-action)
                  (agent-shell-workflow--resolve-busy-action shell-buffer))
@@ -757,11 +776,6 @@ until turn-complete."
            (user-error "Agent shell `%s' is currently busy" name)))
         (_
          (agent-shell-workflow--enqueue-for-buffer spec ctx shell-buffer submit))))
-     ((and (buffer-live-p shell-buffer)
-           (buffer-local-value 'agent-shell-workflow--pending-clear shell-buffer)
-           (with-current-buffer shell-buffer (derived-mode-p 'agent-shell-mode))
-           (fboundp 'agent-shell-subscribe-to))
-      (agent-shell-workflow--defer-until-turn-complete shell-buffer do-insert))
      (t
       (funcall do-insert)))))
 
@@ -879,12 +893,15 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
     ;; 2. Additional preflight clarifications and argument collection
     (let ((collected-args (agent-shell-workflow--collect-args spec args)))
       ;; 3. Create the shell buffer now if needed
-      (when (eq resolved-target :session-new)
-        (setq shell-buffer (agent-shell-workflow--create-shell dir chosen-config))
-        (setq resolved-target shell-buffer))
-      (when (and (bufferp shell-buffer) (buffer-live-p shell-buffer)
-                 spec (agent-shell-workflow-spec-clear spec))
-        (agent-shell-workflow--maybe-clear-reused-buffer shell-buffer spec))
+      (let ((is-new (eq resolved-target :session-new)))
+        (when is-new
+          (setq shell-buffer (agent-shell-workflow--create-shell dir chosen-config))
+          (setq resolved-target shell-buffer))
+        (when (and (not is-new)
+                   (not (eq busy-action 'queue))
+                   (bufferp shell-buffer) (buffer-live-p shell-buffer)
+                   spec (agent-shell-workflow-spec-clear spec))
+          (agent-shell-workflow--maybe-clear-reused-buffer shell-buffer spec)))
 
       ;; 4. Non-blocking preflight execution
       (let ((initial-ctx (list :args collected-args
@@ -914,19 +931,33 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
 
 (defun agent-shell-workflow--dispatch-queue-item (item target-buffer)
   "Execute a queued workflow ITEM into TARGET-BUFFER."
-  (let* ((plist (read (agent-shell-queue-item-args item)))
-         (rendered (plist-get plist :rendered))
-         (submit (if (plist-member plist :submit)
+  (let* ((raw (agent-shell-queue-item-args item))
+         (clean-raw (if (stringp raw)
+                        (replace-regexp-in-string "#<[^>]+>" "\"<unreadable>\"" raw)
+                      raw))
+         (plist (condition-case nil
+                    (if (stringp clean-raw)
+                        (read clean-raw)
+                      clean-raw)
+                  (error nil)))
+         (rendered (or (and (listp plist) (plist-get plist :rendered))
+                       (if (stringp raw) raw (format "%s" raw))))
+         (submit (if (and (listp plist) (plist-member plist :submit))
                      (plist-get plist :submit)
                    t))
-         (buf (if (stringp target-buffer)
-                  (get-buffer target-buffer)
-                target-buffer))
-         (workflow-id (plist-get plist :workflow-id))
+         (buf (cond
+               ((bufferp target-buffer) target-buffer)
+               ((stringp target-buffer) (get-buffer target-buffer))
+               (t (current-buffer))))
+         (workflow-id (and (listp plist) (plist-get plist :workflow-id)))
          (spec (when workflow-id (agent-shell-workflow-get workflow-id)))
-         (ctx (plist-get plist :ctx)))
+         (ctx (and (listp plist) (plist-get plist :ctx))))
     (if spec
-        (agent-shell-workflow--insert-and-post spec ctx buf submit)
+        (let ((effective-ctx (if (listp ctx) (copy-sequence ctx) nil)))
+          (setq effective-ctx (plist-put effective-ctx :shell-buffer buf))
+          (setq effective-ctx (plist-put effective-ctx :target buf))
+          (setq effective-ctx (plist-put effective-ctx :rendered rendered))
+          (agent-shell-workflow--insert-and-post spec effective-ctx buf submit))
       (agent-shell-insert :text rendered
                           :shell-buffer buf
                           :submit submit))))

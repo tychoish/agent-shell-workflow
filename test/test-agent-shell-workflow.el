@@ -2308,6 +2308,110 @@ and prompt is enqueued for target shell."
            (should (eq enqueued-buf busy-buf)))
        (kill-buffer busy-buf)))))
 
+
+(ert-deftest agent-shell-workflow/dispatch-new-shell-skips-clear-operation ()
+  "Creating a new shell buffer skips clear operation even when spec has :clear t."
+  (let ((spec (agent-shell-workflow-spec--make
+               :id 'test-new-shell-clear
+               :template "echo hi"
+               :target :session-new
+               :clear t))
+        (dummy-buf (generate-new-buffer "*asw-test-dummy*"))
+        (clear-called nil)
+        (created-shell nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-workflow-get)
+                   (lambda (id) (if (eq id 'test-new-shell-clear) spec nil)))
+                  ((symbol-function 'agent-shell-workflow--create-shell)
+                   (lambda (&rest _)
+                     (setq created-shell t)
+                     dummy-buf))
+                  ((symbol-function 'agent-shell-workflow--maybe-clear-reused-buffer)
+                   (lambda (&rest _)
+                     (setq clear-called t)))
+                  ((symbol-function 'agent-shell-workflow--dispatch-rendered)
+                   (lambda (&rest _) t)))
+          (agent-shell-workflow-dispatch 'test-new-shell-clear)
+          (should created-shell)
+          (should-not clear-called))
+      (kill-buffer dummy-buf))))
+
+(ert-deftest agent-shell-workflow/dispatch-to-buffer-waits-for-pending-clear-with-submit-t ()
+  "When pending clear is active and submit is t, defer instead of queueing."
+  (let ((buf (generate-new-buffer "*asw-pending-clear-submit*"))
+        (inserted nil)
+        (queued nil)
+        (sub-callback nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (agent-shell-mode)
+            (setq-local agent-shell-workflow--pending-clear t))
+          (cl-letf (((symbol-function 'agent-shell-subscribe-to)
+                     (lambda (&rest args)
+                       (setq sub-callback (plist-get args :on-event))
+                       'test-sub))
+                    ((symbol-function 'agent-shell-unsubscribe)
+                     (lambda (&rest _) t))
+                    ((symbol-function 'agent-shell-workflow--enqueue-for-buffer)
+                     (lambda (&rest _) (setq queued t)))
+                    ((symbol-function 'agent-shell-workflow--insert)
+                     (lambda (&rest _) (setq inserted t) '((:end . 10)))))
+            (agent-shell-workflow--dispatch-to-buffer
+             (agent-shell-workflow-spec--make :template "hi")
+             nil buf t)
+            (should-not queued)
+            (should-not inserted)
+            (should sub-callback)
+            (funcall sub-callback nil)
+            (should inserted)
+            (should-not (buffer-local-value 'agent-shell-workflow--pending-clear buf))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/enqueue-for-buffer-sanitizes-live-buffers ()
+  "Enqueuing for buffer serializes buffer objects safely as readable strings."
+  (let ((buf (generate-new-buffer "*asw-enqueue-buf*"))
+        (captured-args nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-queue--enqueue-args)
+                   (lambda (args _kind _buf) (setq captured-args args))))
+          (agent-shell-workflow--enqueue-for-buffer
+           (agent-shell-workflow-spec--make :id 'san-test :template "hi {{val}}")
+           (list :shell-buffer buf :val "world" :nested (list buf))
+           buf
+           t)
+          (should captured-args)
+          (should (stringp captured-args))
+          ;; Deserializing via read must not signal invalid-read-syntax
+          (let ((parsed (read captured-args)))
+            (should (equal (plist-get parsed :workflow-id) 'san-test))
+            (should (equal (plist-get parsed :rendered) "hi world"))
+            (should (equal (plist-get (plist-get parsed :ctx) :shell-buffer)
+                           (buffer-name buf)))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/dispatch-queue-item-tolerates-unreadable-syntax ()
+  "Queue item containing unreadable #<buffer ...> syntax parses safely and dispatches."
+  (asw-test/isolate
+   (let* ((buf (generate-new-buffer "*asw-dqi-buf*"))
+          (inserted-text nil)
+          (inserted-buf nil)
+          (inserted-submit nil)
+          (item (agent-shell-queue--make-item
+                 "(:workflow-id nil :rendered \"echo safe\" :ctx (:shell-buffer #<buffer *test*> :target #<buffer *test*>))"
+                 nil 'workflow)))
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell-insert)
+                    (lambda (&rest args)
+                      (setq inserted-text (plist-get args :text))
+                      (setq inserted-buf (plist-get args :shell-buffer))
+                      (setq inserted-submit (plist-get args :submit)))))
+           (agent-shell-workflow--dispatch-queue-item item buf)
+           (should (equal inserted-text "echo safe"))
+           (should (eq inserted-buf buf))
+           (should (eq inserted-submit t)))
+       (kill-buffer buf)))))
+
 (provide 'test-agent-shell-workflow)
 
 ;;; test-agent-shell-workflow.el ends here
