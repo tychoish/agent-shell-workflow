@@ -2412,6 +2412,131 @@ and prompt is enqueued for target shell."
            (should (eq inserted-submit t)))
        (kill-buffer buf)))))
 
+(ert-deftest agent-shell-workflow/fresh-shell-p-new-shell-flag ()
+  "agent-shell-workflow--fresh-shell-p identifies buffer with new-shell flag as fresh."
+  (let ((buf (generate-new-buffer "*asw-fresh-flag*")))
+    (unwind-protect
+        (progn
+          (should-not (agent-shell-workflow--fresh-shell-p buf))
+          (with-current-buffer buf
+            (setq-local agent-shell-workflow--new-shell t))
+          (should (agent-shell-workflow--fresh-shell-p buf))
+          (with-current-buffer buf
+            (setq-local agent-shell-workflow--new-shell nil))
+          (should-not (agent-shell-workflow--fresh-shell-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/fresh-shell-p-agent-shell-mode ()
+  "agent-shell-workflow--fresh-shell-p identifies fresh agent-shell-mode buffer."
+  (let ((buf (generate-new-buffer "*asw-fresh-mode*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (agent-shell-mode))
+          (should (agent-shell-workflow--fresh-shell-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/fresh-shell-p-dirty-agent-shell-mode ()
+  "agent-shell-workflow--fresh-shell-p returns nil for active/used agent-shell-mode buffer."
+  (let ((buf (generate-new-buffer "*asw-dirty-mode*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (agent-shell-mode)
+            ;; Simulate a previous request having been run
+            (setq-local shell-maker--current-request-id 1))
+          (should-not (agent-shell-workflow--fresh-shell-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/maybe-clear-reused-buffer-skips-fresh-shell ()
+  "agent-shell-workflow--maybe-clear-reused-buffer does nothing on a fresh shell."
+  (let ((buf (generate-new-buffer "*asw-skip-clear-fresh*"))
+        (spec (agent-shell-workflow-spec--make :id 'clear-fresh :template "hi" :clear t))
+        clear-executed
+        prompted)
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (agent-shell-mode))
+          (cl-letf (((symbol-function 'y-or-n-p)
+                     (lambda (&rest _) (setq prompted t) t))
+                    ((symbol-function 'agent-shell-workflow--execute-clear)
+                     (lambda (&rest _) (setq clear-executed t))))
+            (let ((res (agent-shell-workflow--maybe-clear-reused-buffer buf spec)))
+              (should-not res)
+              (should-not clear-executed)
+              (should-not prompted))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/dispatch-fresh-shell-target-skips-clear ()
+  "Dispatching to a fresh shell buffer skips clear operation even when spec has :clear t."
+  (let ((spec (agent-shell-workflow-spec--make
+               :id 'test-dispatch-fresh-clear
+               :template "echo hi"
+               :clear t))
+        (fresh-buf (generate-new-buffer "*asw-target-fresh*"))
+        clear-called
+        dispatched)
+    (unwind-protect
+        (progn
+          (with-current-buffer fresh-buf
+            (agent-shell-mode))
+          (cl-letf (((symbol-function 'agent-shell-workflow-get)
+                     (lambda (id) (if (eq id 'test-dispatch-fresh-clear) spec nil)))
+                    ((symbol-function 'agent-shell-workflow--maybe-clear-reused-buffer)
+                     (lambda (&rest _) (setq clear-called t)))
+                    ((symbol-function 'agent-shell-workflow--dispatch-rendered)
+                     (lambda (&rest _) (setq dispatched t))))
+            (agent-shell-workflow-dispatch 'test-dispatch-fresh-clear :target fresh-buf)
+            (should dispatched)
+            (should-not clear-called)))
+      (kill-buffer fresh-buf))))
+
+(ert-deftest agent-shell-workflow/dispatch-dirty-shell-target-runs-clear ()
+  "Dispatching to a used shell buffer executes clear operation when spec has :clear t."
+  (let ((spec (agent-shell-workflow-spec--make
+               :id 'test-dispatch-dirty-clear
+               :template "echo hi"
+               :clear t))
+        (dirty-buf (generate-new-buffer "*asw-target-dirty*"))
+        clear-called
+        dispatched)
+    (unwind-protect
+        (progn
+          (with-current-buffer dirty-buf
+            (agent-shell-mode)
+            (setq-local shell-maker--current-request-id 1))
+          (cl-letf (((symbol-function 'agent-shell-workflow-get)
+                     (lambda (id) (if (eq id 'test-dispatch-dirty-clear) spec nil)))
+                    ((symbol-function 'agent-shell-workflow--execute-clear)
+                     (lambda (&rest _) (setq clear-called t)))
+                    ((symbol-function 'agent-shell-workflow--dispatch-rendered)
+                     (lambda (&rest _) (setq dispatched t))))
+            (agent-shell-workflow-dispatch 'test-dispatch-dirty-clear :target dirty-buf)
+            (should dispatched)
+            (should clear-called)))
+      (kill-buffer dirty-buf))))
+
+(ert-deftest agent-shell-workflow/session-buffer-skips-clear-on-fresh-buffer ()
+  "agent-shell-workflow--session-buffer skips clear when reusing a fresh shell buffer."
+  (let ((buf (generate-new-buffer "*asw-session-fresh*"))
+        (spec (agent-shell-workflow-spec--make :id 'sb-fresh :template "hi" :clear t))
+        clear-called)
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (agent-shell-mode))
+          (cl-letf (((symbol-function 'agent-shell-workflow--project-buffers)
+                     (lambda (_dir) (list buf)))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (_prompt) t))
+                    ((symbol-function 'agent-shell-workflow--maybe-clear-reused-buffer)
+                     (lambda (&rest _) (setq clear-called t))))
+            (let ((res (agent-shell-workflow--session-buffer :session-reuse default-directory spec)))
+              (should (eq res buf))
+              (should-not clear-called))))
+      (kill-buffer buf))))
+
 (provide 'test-agent-shell-workflow)
 
 ;;; test-agent-shell-workflow.el ends here

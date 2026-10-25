@@ -92,6 +92,42 @@ Allowed values:
 (defvar-local agent-shell-workflow--pending-clear nil
   "Non-nil when a context clearing command is pending in this shell buffer.")
 
+(defvar-local agent-shell-workflow--new-shell nil
+  "Non-nil if this shell buffer was newly created and has not received input.")
+
+(defun agent-shell-workflow--fresh-shell-p (buffer)
+  "Return non-nil if BUFFER is a new or fresh agent-shell buffer.
+A shell buffer is fresh if it has been marked as new by
+`agent-shell-workflow--create-shell', or if it is an `agent-shell-mode'
+buffer that has not yet executed any turns or user inputs."
+  (when-let* ((buf (if (bufferp buffer) buffer (and (stringp buffer) (get-buffer buffer))))
+              ((buffer-live-p buf)))
+    (with-current-buffer buf
+      (cond
+       (agent-shell-workflow--new-shell t)
+       ((not (derived-mode-p 'agent-shell-mode)) nil)
+       ((and (bound-and-true-p shell-maker--current-request-id)
+             (not (zerop shell-maker--current-request-id)))
+        nil)
+       ((ignore-errors
+          (when-let* ((state (bound-and-true-p agent-shell--state)))
+            (map-nested-elt state '(:session :title))))
+        nil)
+       ((ignore-errors
+          (when-let* ((state (bound-and-true-p agent-shell--state))
+                      (usage (map-elt state :usage)))
+            (if (fboundp 'agent-shell--usage-has-data-p)
+                (agent-shell--usage-has-data-p usage)
+              (or (> (or (alist-get :total-tokens usage) 0) 0)
+                  (> (or (alist-get :context-size usage) 0) 0)))))
+        nil)
+       ((and (bound-and-true-p comint-last-input-start)
+             (bound-and-true-p comint-last-input-end)
+             (< (marker-position comint-last-input-start)
+                (marker-position comint-last-input-end)))
+        nil)
+       (t t)))))
+
 (defun agent-shell-workflow--clear-command-for-buffer (buffer)
   "Resolve the context-clearing command for BUFFER.
 Inspects the agent configuration via `agent-shell-get-config' or buffer name.
@@ -150,20 +186,20 @@ Returns nil if no clear operation is defined for that shell type/agent."
 
 (defun agent-shell-workflow--maybe-clear-reused-buffer (buffer &optional spec)
   "Call or prompt context-clearing command in reused BUFFER according to SPEC.
+When BUFFER is a new or fresh shell buffer, does nothing.
 When SPEC is provided and its clear option is nil, does nothing.
 When SPEC has a non-nil clear option (such as `t') and BUFFER has a clear
 command defined, executes it immediately.
 When SPEC clear option is `ask' or SPEC is omitted, prompts the user.
 Returns non-nil if a clear command was executed, nil otherwise."
-  (let* ((clear-opt (if spec (agent-shell-workflow-spec-clear spec) 'ask))
-         (cmd (when clear-opt (agent-shell-workflow--clear-command-for-buffer buffer))))
-    (when (and cmd clear-opt)
-      (cond
-       ((eq clear-opt 'ask)
-        (when (y-or-n-p (format "Run %s in %s? " cmd (buffer-name buffer)))
-          (agent-shell-workflow--execute-clear buffer cmd)))
-       (t
-        (agent-shell-workflow--execute-clear buffer cmd))))))
+  (when-let* ((buf (if (bufferp buffer) buffer (and (stringp buffer) (get-buffer buffer))))
+              ((buffer-live-p buf))
+              ((not (agent-shell-workflow--fresh-shell-p buf)))
+              (clear-opt (if spec (agent-shell-workflow-spec-clear spec) 'ask))
+              (cmd (agent-shell-workflow--clear-command-for-buffer buf)))
+    (when (or (not (eq clear-opt 'ask))
+              (y-or-n-p (format "Run %s in %s? " cmd (buffer-name buf))))
+      (agent-shell-workflow--execute-clear buf cmd))))
 
 (defvar agent-shell-workflow-dispatch-target-functions nil
   "Hook run with (SPEC CTX TARGET SUBMIT) to handle custom workflow targets.
@@ -501,16 +537,20 @@ if available, or falls back to `agent-shell-new-shell'."
                        (agent-shell-new-shell))))
                   (t
                    (agent-shell-new-shell)))))
-        (cond
-         ((and (bufferp res) (buffer-live-p res))
-          res)
-         ((seq-find (lambda (b) (not (memq b before-bufs)))
-                    (agent-shell-buffers)))
-         ((seq-first (agent-shell-workflow--project-buffers canon-dir)))
-         ((when (derived-mode-p 'agent-shell-mode)
-            (current-buffer)))
-         ((and res (not (numberp res)))
-          res))))))
+        (let ((buf (cond
+                    ((buffer-live-p res)
+                     res)
+                    ((seq-find (lambda (b) (not (memq b before-bufs)))
+                               (agent-shell-buffers)))
+                    ((seq-first (agent-shell-workflow--project-buffers canon-dir)))
+                    ((when (derived-mode-p 'agent-shell-mode)
+                       (current-buffer)))
+                    ((and res (not (numberp res)))
+                     res))))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              (setq-local agent-shell-workflow--new-shell t)))
+          buf)))))
 
 (defun agent-shell-workflow--session-buffer (target &optional dir spec)
   "Return a live `agent-shell' buffer for TARGET in DIR, creating or prompting.
@@ -549,7 +589,8 @@ If declined, signals `user-error'."
                 (setq res-buf (agent-shell-workflow--create-shell effective-dir))
               (setq reused-buf (get-buffer choice)
                     res-buf reused-buf)))))
-        (when (and reused-buf (buffer-live-p reused-buf))
+        (when (and (buffer-live-p reused-buf)
+                   (not (agent-shell-workflow--fresh-shell-p reused-buf)))
           (agent-shell-workflow--maybe-clear-reused-buffer reused-buf spec))
         res-buf))))
 
@@ -788,6 +829,9 @@ or `ask').  Returns the plist returned by `agent-shell-insert'."
                           (y-or-n-p "Submit rendered prompt? "))
                          (t submit)))
          (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx)))
+    (when (buffer-live-p shell-buffer)
+      (with-current-buffer shell-buffer
+        (setq-local agent-shell-workflow--new-shell nil)))
     (agent-shell-insert :text rendered
                         :shell-buffer shell-buffer
                         :submit actual-submit)))
@@ -893,14 +937,13 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
     ;; 2. Additional preflight clarifications and argument collection
     (let ((collected-args (agent-shell-workflow--collect-args spec args)))
       ;; 3. Create the shell buffer now if needed
-      (let ((is-new (eq resolved-target :session-new)))
-        (when is-new
-          (setq shell-buffer (agent-shell-workflow--create-shell dir chosen-config))
-          (setq resolved-target shell-buffer))
-        (when (and (not is-new)
+      (if (eq resolved-target :session-new)
+          (setq shell-buffer (agent-shell-workflow--create-shell dir chosen-config)
+                resolved-target shell-buffer)
+        (when (and (buffer-live-p shell-buffer)
                    (not (eq busy-action 'queue))
-                   (bufferp shell-buffer) (buffer-live-p shell-buffer)
-                   spec (agent-shell-workflow-spec-clear spec))
+                   (agent-shell-workflow-spec-clear spec)
+                   (not (agent-shell-workflow--fresh-shell-p shell-buffer)))
           (agent-shell-workflow--maybe-clear-reused-buffer shell-buffer spec)))
 
       ;; 4. Non-blocking preflight execution
