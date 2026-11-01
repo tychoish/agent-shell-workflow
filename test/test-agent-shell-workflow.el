@@ -22,6 +22,7 @@
 (defmacro asw-test/isolate (&rest body)
   "Execute BODY with a clean prompt registry and isolated queue state."
   `(let ((agent-shell-workflow-registry (make-hash-table :test #'eq))
+         (agent-shell-workflow--in-flight-dispatches (make-hash-table :test 'equal))
          (agent-shell-queue--store
           (agent-shell-queue--make-store :items nil :format 'plist :file nil))
          (agent-shell-queue--queue
@@ -2536,6 +2537,86 @@ and prompt is enqueued for target shell."
               (should (eq res buf))
               (should-not clear-called))))
       (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/buffer-busy-p-fresh-shell-is-never-busy ()
+  "A fresh agent-shell buffer is never considered busy even if internal flags are set."
+  (let ((buf (generate-new-buffer "*asw-fresh-busy-test*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (agent-shell-mode)
+          (setq-local agent-shell-workflow--new-shell t)
+          (setq-local shell-maker--busy t)
+          (setq-local agent-shell--busy t)
+          (should-not (agent-shell-workflow--buffer-busy-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/create-shell-displays-buffer ()
+  "agent-shell-workflow--create-shell displays the buffer in a window."
+  (let ((displayed-buffer nil)
+        (test-buf (generate-new-buffer "*asw-create-test*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell--start)
+                   (lambda (&rest _) test-buf))
+                  ((symbol-function 'display-buffer)
+                   (lambda (buf &rest _) (setq displayed-buffer buf))))
+          (let ((noninteractive nil))
+            (agent-shell-workflow--create-shell "/tmp" "test-config")
+            (should (eq displayed-buffer test-buf))
+            (with-current-buffer test-buf
+              (should agent-shell-workflow--new-shell))))
+      (kill-buffer test-buf))))
+
+(ert-deftest agent-shell-workflow/dispatch-debounces-rapid-duplicate-calls ()
+  "Rapid duplicate dispatches for the same workflow in the same directory are debounced."
+  (asw-test/isolate
+   (let* ((call-count 0)
+          (spec (agent-shell-workflow-spec--make
+                 :id 'test-debounce
+                 :template "hello"
+                 :target :test-target)))
+     (cl-letf (((symbol-function 'agent-shell-workflow-get)
+                (lambda (id) (if (eq id 'test-debounce) spec nil)))
+               ((symbol-function 'agent-shell-workflow--collect-args)
+                (lambda (&rest _) nil))
+               ((symbol-function 'agent-shell-workflow-exec-pre)
+                (lambda (_spec ctx callback)
+                  (setq call-count (1+ call-count))
+                  (funcall callback ctx)))
+               ((symbol-function 'agent-shell-workflow--dispatch-rendered)
+                (lambda (&rest _) t)))
+       ;; First dispatch executes
+       (let ((agent-shell-workflow-debounce-interval 2.0))
+         (agent-shell-workflow-dispatch 'test-debounce :context-dir "/tmp/debounce-dir")
+         (should (= call-count 1))
+         ;; Second rapid dispatch within interval is dropped
+         (agent-shell-workflow-dispatch 'test-debounce :context-dir "/tmp/debounce-dir")
+         (should (= call-count 1))
+         ;; Dispatch in a different directory is not dropped
+         (agent-shell-workflow-dispatch 'test-debounce :context-dir "/tmp/other-dir")
+         (should (= call-count 2)))))))
+
+(ert-deftest agent-shell-workflow/dispatch-debouncing-disabled-when-nil ()
+  "When debounce-interval is nil, successive dispatches are not dropped."
+  (asw-test/isolate
+   (let* ((call-count 0)
+          (spec (agent-shell-workflow-spec--make
+                 :id 'test-no-debounce
+                 :template "hello"
+                 :target :test-target)))
+     (cl-letf (((symbol-function 'agent-shell-workflow-get)
+                (lambda (id) (if (eq id 'test-no-debounce) spec nil)))
+               ((symbol-function 'agent-shell-workflow--collect-args)
+                (lambda (&rest _) nil))
+               ((symbol-function 'agent-shell-workflow-exec-pre)
+                (lambda (_spec ctx callback)
+                  (setq call-count (1+ call-count))
+                  (funcall callback ctx)))
+               ((symbol-function 'agent-shell-workflow--dispatch-rendered)
+                (lambda (&rest _) t)))
+       (let ((agent-shell-workflow-debounce-interval nil))
+         (agent-shell-workflow-dispatch 'test-no-debounce :context-dir "/tmp/test-dir")
+         (agent-shell-workflow-dispatch 'test-no-debounce :context-dir "/tmp/test-dir")
+         (should (= call-count 2)))))))
 
 (provide 'test-agent-shell-workflow)
 

@@ -89,6 +89,18 @@ Allowed values:
                  (const :tag "Signal an error" error))
   :group 'agent-shell-workflow)
 
+(defcustom agent-shell-workflow-debounce-interval 2.0
+  "Interval in seconds between dispatching the same workflow in a directory.
+Prevents accidental double submissions from repeated clicks or keypresses.
+When set to 0 or nil, debouncing is disabled."
+  :type '(choice (const :tag "Disabled" nil)
+                 (number :tag "Seconds"))
+  :group 'agent-shell-workflow)
+
+(defvar agent-shell-workflow--in-flight-dispatches (make-hash-table :test 'equal)
+  "Hash table tracking active or recently dispatched workflows.
+Keys are composite identifiers `(id dir)', values are dispatch timestamps.")
+
 (defvar-local agent-shell-workflow--pending-clear nil
   "Non-nil when a context clearing command is pending in this shell buffer.")
 
@@ -163,25 +175,30 @@ Returns nil if no clear operation is defined for that shell type/agent."
              (fboundp 'agent-shell-subscribe-to))
     (with-current-buffer buffer
       (setq-local agent-shell-workflow--pending-clear t))
-    (let ((sub nil))
-      (setq sub
-            (condition-case nil
-                (agent-shell-subscribe-to
-                 :shell-buffer buffer
-                 :event 'turn-complete
-                 :on-event
-                 (lambda (_event)
-                   (when (buffer-live-p buffer)
-                     (with-current-buffer buffer
-                       (setq-local agent-shell-workflow--pending-clear nil)))
-                   (when sub
-                     (agent-shell-unsubscribe :subscription sub)
-                     (setq sub nil))))
-              (error
+    (let ((sub nil)
+          (timer nil))
+      (let ((clear-fn
+             (lambda ()
+               (when timer
+                 (cancel-timer timer)
+                 (setq timer nil))
                (when (buffer-live-p buffer)
                  (with-current-buffer buffer
                    (setq-local agent-shell-workflow--pending-clear nil)))
-               nil)))))
+               (when sub
+                 (agent-shell-unsubscribe :subscription sub)
+                 (setq sub nil)))))
+        (setq sub
+              (condition-case nil
+                  (agent-shell-subscribe-to
+                   :shell-buffer buffer
+                   :event 'turn-complete
+                   :on-event (lambda (_event) (funcall clear-fn)))
+                (error
+                 (funcall clear-fn)
+                 nil)))
+        (when sub
+          (setq timer (run-with-timer 3.0 nil clear-fn))))))
   t)
 
 (defun agent-shell-workflow--maybe-clear-reused-buffer (buffer &optional spec)
@@ -549,7 +566,9 @@ if available, or falls back to `agent-shell-new-shell'."
                      res))))
           (when (buffer-live-p buf)
             (with-current-buffer buf
-              (setq-local agent-shell-workflow--new-shell t)))
+              (setq-local agent-shell-workflow--new-shell t))
+            (unless noninteractive
+              (display-buffer buf)))
           buf)))))
 
 (defun agent-shell-workflow--session-buffer (target &optional dir spec)
@@ -619,19 +638,20 @@ When SUBMIT is non-nil, submit the prompt immediately."
               (t nil))))
     (when (and buf (buffer-live-p buf))
       (with-current-buffer buf
-        (or (and (boundp 'agent-shell-workflow--pending-clear)
-                 agent-shell-workflow--pending-clear)
-            (and (boundp 'shell-maker--busy)
-                 shell-maker--busy)
-            (and (fboundp 'shell-maker-busy)
-                 (ignore-errors (shell-maker-busy)))
-            (and (boundp 'agent-shell--busy)
-                 agent-shell--busy)
-            (and (boundp 'agent-shell--state)
-                 (fboundp 'agent-shell--active-requests-p)
-                 (ignore-errors (agent-shell--active-requests-p agent-shell--state)))
-            (and (fboundp 'agent-shell-queue--has-running-item-p)
-                 (ignore-errors (agent-shell-queue--has-running-item-p (buffer-name buf)))))))))
+        (unless (agent-shell-workflow--fresh-shell-p buf)
+          (or (and (boundp 'agent-shell-workflow--pending-clear)
+                   agent-shell-workflow--pending-clear)
+              (and (boundp 'shell-maker--busy)
+                   shell-maker--busy)
+              (and (fboundp 'shell-maker-busy)
+                   (ignore-errors (shell-maker-busy)))
+              (and (boundp 'agent-shell--busy)
+                   agent-shell--busy)
+              (and (boundp 'agent-shell--state)
+                   (fboundp 'agent-shell--active-requests-p)
+                   (ignore-errors (agent-shell--active-requests-p agent-shell--state)))
+              (and (fboundp 'agent-shell-queue--has-running-item-p)
+                   (ignore-errors (agent-shell-queue--has-running-item-p (buffer-name buf))))))))))
 
 (defun agent-shell-workflow--resolve-busy-action-upfront (shell-buffer will-submit)
   "Determine the action to take if SHELL-BUFFER is busy, asked upfront.
@@ -748,23 +768,33 @@ Clears `agent-shell-workflow--pending-clear' if set."
   (if (and (buffer-live-p shell-buffer)
            (with-current-buffer shell-buffer (derived-mode-p 'agent-shell-mode))
            (fboundp 'agent-shell-subscribe-to))
-      (let ((sub nil))
-        (setq sub
-              (condition-case nil
-                  (agent-shell-subscribe-to
-                   :shell-buffer shell-buffer
-                   :event 'turn-complete
-                   :on-event
-                   (lambda (_ev)
-                     (when sub
-                       (agent-shell-unsubscribe :subscription sub)
-                       (setq sub nil))
-                     (when (buffer-live-p shell-buffer)
-                       (with-current-buffer shell-buffer
-                         (setq-local agent-shell-workflow--pending-clear nil)))
-                     (funcall callback)))
-                (error
-                 (funcall callback)))))
+      (let ((sub nil)
+            (timer nil)
+            (called nil))
+        (let ((fire (lambda ()
+                      (unless called
+                        (setq called t)
+                        (when timer
+                          (cancel-timer timer)
+                          (setq timer nil))
+                        (when sub
+                          (agent-shell-unsubscribe :subscription sub)
+                          (setq sub nil))
+                        (when (buffer-live-p shell-buffer)
+                          (with-current-buffer shell-buffer
+                            (setq-local agent-shell-workflow--pending-clear nil)))
+                        (funcall callback)))))
+          (setq sub
+                (condition-case nil
+                    (agent-shell-subscribe-to
+                     :shell-buffer shell-buffer
+                     :event 'turn-complete
+                     :on-event (lambda (_ev) (funcall fire)))
+                  (error
+                   (funcall fire)
+                   nil)))
+          (when sub
+            (setq timer (run-with-timer 5.0 nil fire)))))
     (funcall callback)))
 
 (defun agent-shell-workflow--insert-and-post (spec ctx shell-buffer submit)
@@ -831,7 +861,12 @@ or `ask').  Returns the plist returned by `agent-shell-insert'."
          (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx)))
     (when (buffer-live-p shell-buffer)
       (with-current-buffer shell-buffer
-        (setq-local agent-shell-workflow--new-shell nil)))
+        (setq-local agent-shell-workflow--new-shell nil))
+      (unless noninteractive
+        (display-buffer shell-buffer))
+      (message "Submitting prompt for workflow `%s' to `%s'..."
+               (agent-shell-workflow-spec-id spec)
+               (buffer-name shell-buffer)))
     (agent-shell-insert :text rendered
                         :shell-buffer shell-buffer
                         :submit actual-submit)))
@@ -864,16 +899,29 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
   (let* ((spec (or (agent-shell-workflow-get id)
                    (error "Agent-shell-workflow: no workflow registered with id `%s'" id)))
          (dir (or context-dir default-directory))
-         (initial-target (agent-shell-workflow--resolve-target
-                          (or target (agent-shell-workflow-spec-target spec))))
-         (effective-submit (if (null submit)
-                               (agent-shell-workflow-spec-submit spec)
-                             submit))
-         shell-buffer
-         chosen-config
-         (resolved-target initial-target)
-         busy-action)
-    ;; 1. Resolve target shell and upfront busy handling before preflight
+         (canon-dir (agent-shell-workflow--canonicalize-dir dir))
+         (debounce-key (list id canon-dir))
+         (now (float-time))
+         (last-time (gethash debounce-key agent-shell-workflow--in-flight-dispatches)))
+    (if (and agent-shell-workflow-debounce-interval
+             last-time
+             (< (- now last-time) agent-shell-workflow-debounce-interval))
+        (progn
+          (message "Workflow `%s' was just dispatched for %s; ignoring duplicate request"
+                   id (file-name-nondirectory (directory-file-name canon-dir)))
+          nil)
+      (when agent-shell-workflow-debounce-interval
+        (puthash debounce-key now agent-shell-workflow--in-flight-dispatches))
+      (let* ((initial-target (agent-shell-workflow--resolve-target
+                              (or target (agent-shell-workflow-spec-target spec))))
+             (effective-submit (if (null submit)
+                                   (agent-shell-workflow-spec-submit spec)
+                                 submit))
+             shell-buffer
+             chosen-config
+             (resolved-target initial-target)
+             busy-action)
+        ;; 1. Resolve target shell and upfront busy handling before preflight
     (let ((cur-target initial-target)
           (done nil))
       (while (not done)
@@ -938,8 +986,14 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
     (let ((collected-args (agent-shell-workflow--collect-args spec args)))
       ;; 3. Create the shell buffer now if needed
       (if (eq resolved-target :session-new)
-          (setq shell-buffer (agent-shell-workflow--create-shell dir chosen-config)
-                resolved-target shell-buffer)
+          (progn
+            (setq shell-buffer (agent-shell-workflow--create-shell dir chosen-config)
+                  resolved-target shell-buffer)
+            (when (buffer-live-p shell-buffer)
+              (unless noninteractive
+                (display-buffer shell-buffer))
+              (message "Created agent-shell `%s' for workflow `%s'"
+                       (buffer-name shell-buffer) id)))
         (when (and (buffer-live-p shell-buffer)
                    (not (eq busy-action 'queue))
                    (agent-shell-workflow-spec-clear spec)
@@ -947,6 +1001,7 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
           (agent-shell-workflow--maybe-clear-reused-buffer shell-buffer spec)))
 
       ;; 4. Non-blocking preflight execution
+      (message "Running preflight for workflow `%s'..." id)
       (let ((initial-ctx (list :args collected-args
                                :target resolved-target
                                :shell-buffer shell-buffer
@@ -968,7 +1023,7 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
                     (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) merged-ctx))
                     (ctx-with-rendered (plist-put merged-ctx :rendered rendered)))
                ;; 5. Insert rendered prompt & submit
-               (agent-shell-workflow--dispatch-rendered spec ctx-with-rendered resolved-target effective-submit effective-dir)))))))))
+               (agent-shell-workflow--dispatch-rendered spec ctx-with-rendered resolved-target effective-submit effective-dir)))))))))))
 
 ;; Integration with agent-shell-queue
 
