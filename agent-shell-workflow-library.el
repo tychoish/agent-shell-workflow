@@ -33,7 +33,12 @@
 
 (require 'seq)
 (require 'agent-shell-workflow)
-(eval-when-compile (require 'agent-shell-workflow))
+(eval-when-compile
+  (require 'agent-shell-workflow))
+
+;; Domain workflow modules
+(require 'agent-shell-workflow-github)
+(require 'agent-shell-workflow-pipeline)
 
 ;; Shared shell and git utilities
 (defun agent-shell-workflow-library--shell (&rest args)
@@ -160,11 +165,7 @@ Recent history:
 (defun agent-shell-workflow-library--create-commit-pre-op (ctx &optional callback)
   "Gather git status, diff against HEAD, and recent log history for CTX.
 Uses Magit to gather state."
-  (let* ((args (plist-get ctx :args))
-         (files (plist-get args :files))
-         (has-files (and (stringp files) (not (string-empty-p files))))
-         (file-args (when has-files (list "--" files)))
-         (finish
+  (let* ((finish
           (lambda (status diff log)
             (let ((updated-ctx (copy-sequence ctx)))
               (setq updated-ctx (plist-put updated-ctx :git-status (if (string-empty-p status) "(clean)" status)))
@@ -173,28 +174,25 @@ Uses Magit to gather state."
               updated-ctx))))
     (if callback
         (agent-shell-workflow--gather-async
-         (list (append '(:status "git" "status" "--short") file-args)
-               (append '(:diff "git" "diff" "HEAD") file-args)
+         (list '(:status "git" "status" "--short")
+               '(:diff "git" "diff" "HEAD")
                '(:log "git" "log" "--oneline" "-n" "5"))
          (lambda (results)
            (let ((status (or (cdr (assq :status results)) ""))
                  (diff (or (cdr (assq :diff results)) ""))
                  (log (or (cdr (assq :log results)) "")))
              (funcall callback (funcall finish status diff log)))))
-      (let ((status (apply #'agent-shell-workflow-library--git-output
-                           (append '("status" "--short") file-args)))
-            (diff (agent-shell-workflow-library--diff-summary
-                   (append '("HEAD") file-args) 5))
+      (let ((status (agent-shell-workflow-library--git-output "status" "--short"))
+            (diff (agent-shell-workflow-library--git-output "diff" "HEAD"))
             (log (agent-shell-workflow-library--git-output "log" "--oneline" "-n" "5")))
         (funcall finish status diff log)))))
 
 (register-agent-shell-workflow create-commit
-  :doc "Draft and create a git commit with concise message and attribution"
+  :doc "Commit all uncommitted changes in a single conventional commit"
   :category "Git"
-  :args ((files :prompt "Files to commit (optional): " :optional t)
-         (instructions :prompt "Additional instructions (optional): " :optional t))
+  :args ((instructions :prompt "Additional instructions (optional): " :optional t))
   :pre-op #'agent-shell-workflow-library--create-commit-pre-op
-  :template "Create a git commit for the current changes:
+  :template "Create one git commit containing all uncommitted changes:
 
 ## Working Tree Status:
 {{git-status}}
@@ -208,18 +206,29 @@ Uses Magit to gather state."
 {{args.instructions}}
 
 ## Guidelines:
-- Subject: Imperative, concise sentence matching repository conventions.
-- Metadata: Provide conventional commits style prefix 'keyword(domain): '
-- Body: 2-3 sentences explaining motivation/impact (omit if self-explanatory).
-- Attribution: Include `Co-authored-by:` trailer identifying the AI assistant.
-- Stage appropriate changes and commit."
+- Treat the supplied Git status, diff, and history as authoritative; do not rerun
+  `git status`, `git diff`, or `git log` to check them.
+- The diff excludes untracked files; read their contents directly as needed.
+- Stage all changes, including untracked and already staged changes, and commit.
+- Use conventional commit style: `type(scope): imperative subject` (scope optional).
+- Include a short body when the motivation is not self-explanatory.
+- Include a `Co-authored-by:` trailer identifying the AI assistant."
+  :submit t
+  :target :session-reuse)
+
+(register-agent-shell-workflow create-commit-series
+  :doc "Organize uncommitted changes into a logical series of conventional commits"
+  :category "Git"
+  :args ((instructions :prompt "Additional instructions (optional): " :optional t))
+  :template "Inspect the uncommitted changes and create a logical series of commits.
+Group related changes, preserve existing work, and commit all changes.
+Use conventional commit style: `type(scope): imperative subject` (scope optional).
+Include a short body when the motivation is not self-explanatory and a
+`Co-authored-by:` trailer identifying the AI assistant in each commit.
+
+{{args.instructions}}"
   :submit t
   :target :session-reuse)
 
 (provide 'agent-shell-workflow-library)
-
-;; Domain workflow modules
-(require 'agent-shell-workflow-github)
-(require 'agent-shell-workflow-pipeline)
-
 ;;; agent-shell-workflow-library.el ends here

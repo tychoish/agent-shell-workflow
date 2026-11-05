@@ -391,7 +391,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 
 (ert-deftest agent-shell-workflow/library-registers-built-ins ()
   "The example prompt library registers all four built-in workflows."
-  (dolist (id '(create-commit fix-ci pr-review-patch expand-coverage refactor-module executor-pipeline-run executor-pipeline-verify))
+  (dolist (id '(create-commit create-commit-series fix-ci pr-review-patch expand-coverage refactor-module executor-pipeline-run executor-pipeline-verify))
     (should (agent-shell-workflow-get id))))
 
 (ert-deftest agent-shell-workflow/library-diff-summary-short-diff ()
@@ -719,15 +719,30 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
       (should (string-match-p "HEAD" (plist-get ctx :git-diff)))
       (should (string-match-p "log --oneline -n 5" (plist-get ctx :recent-log))))))
 
-(ert-deftest agent-shell-workflow/library-create-commit-pre-op-with-files ()
-  "create-commit pre-op scopes status and diff to specified files."
-  (cl-letf (((symbol-function 'agent-shell-workflow-library--git-output)
-             (lambda (&rest args) (mapconcat #'identity args " "))))
-    (let ((ctx (agent-shell-workflow-library--create-commit-pre-op
-                (list :args (list :files "src/lib.el")))))
-      (should (string-match-p "status --short -- src/lib.el" (plist-get ctx :git-status)))
-      (should (string-match-p "HEAD -- src/lib.el" (plist-get ctx :git-diff)))
-      (should (string-match-p "log --oneline -n 5" (plist-get ctx :recent-log))))))
+(ert-deftest agent-shell-workflow/library-create-commit-pre-op-keeps-full-diff ()
+  "Synchronous preflight supplies the complete diff for the commit prompt."
+  (let ((diff (mapconcat (lambda (n) (format "+line %d" n)) (number-sequence 1 10) "\n")))
+    (cl-letf (((symbol-function 'agent-shell-workflow-library--git-output)
+               (lambda (&rest args) (if (equal (car args) "diff") diff "sample"))))
+      (should (equal (plist-get (agent-shell-workflow-library--create-commit-pre-op nil)
+                                :git-diff)
+                     diff)))))
+
+(ert-deftest agent-shell-workflow/library-commit-variants ()
+  "Single and series commit prompts have distinct scope and preflight needs."
+  (let* ((single (agent-shell-workflow-get 'create-commit))
+         (series (agent-shell-workflow-get 'create-commit-series))
+         (single-text (agent-shell-workflow-spec-template single))
+         (series-text (agent-shell-workflow-spec-template series)))
+    (should (agent-shell-workflow-spec-pre-op single))
+    (should-not (agent-shell-workflow-spec-pre-op series))
+    (should (string-match-p "do not rerun" single-text))
+    (should (string-match-p "untracked" single-text))
+    (should (string-match-p "{{git-diff}}" single-text))
+    (should-not (string-match-p "{{git-diff}}" series-text))
+    (dolist (text (list single-text series-text))
+      (should (string-match-p "conventional commit" text))
+      (should (string-match-p "Co-authored-by" text)))))
 
 ;;; ─────────────────────────────────────────────────────────────
 ;;; ACR menu
