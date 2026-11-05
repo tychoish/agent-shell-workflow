@@ -1118,9 +1118,9 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
 (require 'agent-shell-queue nil t)
 (agent-shell-workflow--setup-queue-integration)
 
-(provide 'agent-shell-workflow)
+(autoload 'agent-shell-workflow-select "agent-shell-workflow-menu" nil t)
+(autoload 'agent-shell-workflow-dispatch-menu "agent-shell-workflow-menu" nil t)
 
-(require 'agent-shell-workflow-library)
-(require 'agent-shell-workflow-menu)
+(provide 'agent-shell-workflow)
 
 ;;; agent-shell-workflow.el ends here

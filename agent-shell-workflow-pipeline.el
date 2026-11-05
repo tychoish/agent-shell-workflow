@@ -33,7 +33,7 @@
 (require 'seq)
 (require 'json)
 (require 'agent-shell-workflow)
-(require 'agent-shell-workflow-library)
+(require 'agent-shell-workflow-utils)
 (eval-when-compile (require 'agent-shell-workflow))
 
 (declare-function sprite-mcp-spawn "sprite-mcp" (&rest args))

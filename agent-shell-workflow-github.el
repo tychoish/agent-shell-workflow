@@ -33,7 +33,7 @@
 (require 'seq)
 (require 'json)
 (require 'agent-shell-workflow)
-(require 'agent-shell-workflow-library)
+(require 'agent-shell-workflow-utils)
 (eval-when-compile (require 'agent-shell-workflow))
 
 (declare-function magit-get-current-branch "magit-git" ())

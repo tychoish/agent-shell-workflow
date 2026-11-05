@@ -24,14 +24,14 @@
 
 ;;; Commentary:
 
-;; Base prompt recipes and shared shell/git utilities for `agent-shell-workflow`.
+;; Base prompt recipes for `agent-shell-workflow`.
 ;; Includes test coverage expansion, refactoring cleanups, and git commit authoring.
 ;; Also acts as an umbrella loader for domain workflows in `agent-shell-workflow-github'
 ;; and `agent-shell-workflow-pipeline'.
 
 ;;; Code:
 
-(require 'seq)
+(require 'agent-shell-workflow-utils)
 (require 'agent-shell-workflow)
 (eval-when-compile
   (require 'agent-shell-workflow))
@@ -39,70 +39,6 @@
 ;; Domain workflow modules
 (require 'agent-shell-workflow-github)
 (require 'agent-shell-workflow-pipeline)
-
-;; Shared shell and git utilities
-(defun agent-shell-workflow-library--shell (&rest args)
-  "Run ARGS as a shell command in `default-directory` and return its output.
-Trailing newline is trimmed.  Errors are captured inline in the result
-rather than signaled, so a pre-op can surface tool failures to the agent
-instead of aborting the workflow."
-  (string-trim
-   (with-output-to-string
-     (with-current-buffer standard-output
-       (apply #'call-process (car args) nil t nil (cdr args))))))
-
-(defun agent-shell-workflow-library--git-output (&rest args)
-  "Run Git with ARGS using Magit and return its trimmed output."
-  (string-trim (or (apply #'magit-git-output args) "")))
-
-(defun agent-shell-workflow-library--diff-summary (args &optional max-lines)
-  "Return git diff for ARGS, truncating to `--stat` if lines exceed MAX-LINES.
-MAX-LINES defaults to 5.  When diff has <= MAX-LINES lines, returns full diff.
-When diff exceeds MAX-LINES lines, returns `git diff --stat` output with
-a note."
-  (let* ((limit (or max-lines 5))
-         (full-diff (apply #'agent-shell-workflow-library--git-output (append '("diff") args)))
-         (trimmed (string-trim full-diff)))
-    (if (string-empty-p trimmed)
-        "(no changes)"
-      (let ((lines (split-string trimmed "\n" t)))
-        (if (<= (length lines) limit)
-            trimmed
-          (let* ((stat (apply #'agent-shell-workflow-library--git-output (append '("diff" "--stat") args)))
-                 (trimmed-stat (string-trim (or stat ""))))
-            (if (not (string-empty-p trimmed-stat))
-                (format "%s\n(Diff exceeds %d lines — run `git diff%s` to view full diff)"
-                        trimmed-stat limit
-                        (if args (concat " " (mapconcat #'identity args " ")) ""))
-              (format "%s\n...\n(Truncated — run `git diff` to view full diff)"
-                      (mapconcat #'identity (seq-take lines limit) "\n")))))))))
-
-(defun agent-shell-workflow-library--gather (ctx pairs)
-  "Populate CTX with the output of each shell command in PAIRS.
-PAIRS is a list of (CTX-KEY COMMAND ARG...) entries; each COMMAND is run
-via `agent-shell-workflow-library--shell` and stored under CTX-KEY."
-  (dolist (pair pairs ctx)
-    (plist-put ctx (car pair) (apply #'agent-shell-workflow-library--shell (cdr pair)))))
-
-(defalias 'agent-shell-workflow-library--gather-async #'agent-shell-workflow--gather-async)
-
-;; Local filesystem helpers for prompt artifacts
-(defun agent-shell-workflow-library--project-root ()
-  "Return the root directory of the current project or repository."
-  (file-name-as-directory
-   (expand-file-name
-    (or (ignore-errors (vc-root-dir))
-        (ignore-errors (locate-dominating-file default-directory ".git"))
-        default-directory))))
-
-(defun agent-shell-workflow-library--write-file (file-path content)
-  "Write CONTENT string to FILE-PATH, creating parent directories as needed."
-  (let ((dir (file-name-directory file-path))
-        (text (or content "")))
-    (when (and dir (not (file-directory-p dir)))
-      (make-directory dir t))
-    (with-temp-file file-path
-      (insert text))))
 
 ;; Test coverage expansion
 

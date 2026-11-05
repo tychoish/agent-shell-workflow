@@ -389,6 +389,20 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 ;;; ─────────────────────────────────────────────────────────────
 ;;; Built-in library prompts
 
+(ert-deftest agent-shell-workflow/built-in-load-order ()
+  "Built-in modules load and register workflows from each entry point."
+  (dolist (entry '(agent-shell-workflow agent-shell-workflow-library
+                   agent-shell-workflow-github agent-shell-workflow-pipeline
+                   agent-shell-workflow-menu))
+    (let ((features (seq-remove
+                     (lambda (feature)
+                       (string-prefix-p "agent-shell-workflow" (symbol-name feature)))
+                     features))
+          (agent-shell-workflow-registry (make-hash-table :test #'eq)))
+      (require entry)
+      (dolist (id '(create-commit fix-ci executor-pipeline-run))
+        (should (agent-shell-workflow-get id))))))
+
 (ert-deftest agent-shell-workflow/library-registers-built-ins ()
   "The example prompt library registers all four built-in workflows."
   (dolist (id '(create-commit create-commit-series fix-ci pr-review-patch expand-coverage refactor-module executor-pipeline-run executor-pipeline-verify))
