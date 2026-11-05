@@ -91,11 +91,11 @@ root otherwise.  Populates :op-id, :repo-root, :worktree-dir, :context-dir,
   (let* ((wt-dir (plist-get ctx :worktree-dir))
          (args (plist-get ctx :args))
          (diff (if (and wt-dir (file-directory-p wt-dir))
-                   (let ((d (apply #'agent-shell-workflow-library--shell
-                                   "git" (list "-C" wt-dir "diff" "HEAD"))))
+                   (let ((d (agent-shell-workflow-library--git-output
+                             "-C" wt-dir "diff" "HEAD")))
                      (if (string-empty-p (string-trim d))
-                         (apply #'agent-shell-workflow-library--shell
-                                "git" (list "-C" wt-dir "diff" "HEAD~1"))
+                         (agent-shell-workflow-library--git-output
+                          "-C" wt-dir "diff" "HEAD~1")
                        d))
                  "")))
     `(:chain executor-pipeline-verify

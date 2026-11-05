@@ -5,7 +5,7 @@
 ;; Keywords: tools, agent-shell
 ;; Version: 0.1.0
 ;; URL: https://github.com/tychoish/agent-shell-workflow
-;; Package-Requires: ((emacs "29.1") (agent-shell "0.1") (transient "0.4") (annotated-completing-read "0.1"))
+;; Package-Requires: ((emacs "29.1") (agent-shell "0.1") (transient "0.4") (annotated-completing-read "0.1") (magit "3.3"))
 
 ;; This file is not part of GNU Emacs
 
@@ -45,6 +45,7 @@
 (require 'seq)
 (require 'subr-x)
 (require 'agent-shell)
+(require 'magit-process)
 
 (declare-function agent-shell-queue-enqueue-clear "agent-shell-queue")
 (declare-function agent-shell-queue--collect-visible-response-text "agent-shell-queue")
@@ -225,12 +226,44 @@ has been handled.")
 
 ;; Subprocess execution primitives
 
+(defun agent-shell-workflow--run-git-async (args dir callback)
+  "Run Git with ARGS in DIR using Magit, then call CALLBACK with its output."
+  (let ((default-directory (or dir default-directory))
+        (magit-pre-start-git-hook nil)
+        (magit-process-connection-type nil)
+        (magit-process-popup-time -1)
+        (magit-inhibit-refresh t)
+        (output ""))
+    (condition-case err
+        (let* ((proc (apply #'magit-start-git nil args))
+               (filter (process-filter proc))
+               (sentinel (process-sentinel proc)))
+          (set-process-filter
+           proc (lambda (process chunk)
+                  (setq output (concat output chunk))
+                  (when filter (funcall filter process chunk))))
+          (set-process-sentinel
+           proc (lambda (process event)
+                  (when (memq (process-status process) '(exit signal))
+                    (unwind-protect
+                        (when sentinel (funcall sentinel process event))
+                      (let ((out (string-trim output))
+                            (status (process-exit-status process)))
+                        (funcall callback
+                                 (if (and (not (zerop status)) (string-empty-p out))
+                                     (format "[Command git exited with status %s]" status)
+                                   out))))))))
+      (error (funcall callback (format "[Error executing git: %s]"
+                                       (error-message-string err)))))))
+
 (defun agent-shell-workflow--run-process-async (program args dir callback)
   "Run PROGRAM with ARGS in DIR asynchronously.
 Calls CALLBACK with the trimmed stdout string on exit.
 If execution fails or process exits with non-zero status and empty output,
 CALLBACK receives a descriptive error string."
-  (let* ((output-buffer (generate-new-buffer " *agent-shell-workflow-proc*"))
+  (if (equal program "git")
+      (agent-shell-workflow--run-git-async args dir callback)
+    (let* ((output-buffer (generate-new-buffer " *agent-shell-workflow-proc*"))
          (default-directory (or dir default-directory)))
     (condition-case err
         (make-process
@@ -238,6 +271,7 @@ CALLBACK receives a descriptive error string."
          :buffer output-buffer
          :command (cons program args)
          :noquery t
+         :connection-type 'pipe
          :sentinel
          (lambda (proc _event)
            (when (memq (process-status proc) '(exit signal))
@@ -252,7 +286,7 @@ CALLBACK receives a descriptive error string."
       (error
        (when (buffer-live-p output-buffer)
          (kill-buffer output-buffer))
-       (funcall callback (format "[Error executing %s: %s]" program (error-message-string err)))))))
+       (funcall callback (format "[Error executing %s: %s]" program (error-message-string err))))))))
 
 (defun agent-shell-workflow--gather-async (pairs callback-or-dir &optional dir-or-callback)
   "Run shell command PAIRS asynchronously and collect their outputs.

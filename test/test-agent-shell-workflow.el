@@ -17,6 +17,9 @@
 (require 'agent-shell-workflow-menu)
 (require 'agent-shell-workflow-library)
 
+(defconst asw-test--root
+  (file-name-directory (directory-file-name (file-name-directory load-file-name))))
+
 ;;; Isolation macro (mirrors asq-types-test/isolate)
 
 (defmacro asw-test/isolate (&rest body)
@@ -703,21 +706,12 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
       (should (string-match-p "log --oneline -n 5 -- foo.el" (plist-get ctx :recent-history))))))
 
 (ert-deftest agent-shell-workflow/library-git-output-delegates-to-magit ()
-  "agent-shell-workflow-library--git-output uses magit-git-output when available."
+  "agent-shell-workflow-library--git-output uses magit-git-output."
   (let (called-with)
     (cl-letf (((symbol-function 'magit-git-output)
                (lambda (&rest args) (setq called-with args) " magit-result \n")))
       (should (equal (agent-shell-workflow-library--git-output "status" "--short") "magit-result"))
       (should (equal called-with '("status" "--short"))))))
-
-(ert-deftest agent-shell-workflow/library-git-output-falls-back-to-shell ()
-  "agent-shell-workflow-library--git-output falls back to shell when magit is absent."
-  (let (called-with)
-    (cl-letf (((symbol-function 'magit-git-output) nil)
-              ((symbol-function 'agent-shell-workflow-library--shell)
-               (lambda (&rest args) (setq called-with args) "shell-result")))
-      (should (equal (agent-shell-workflow-library--git-output "status" "--short") "shell-result"))
-      (should (equal called-with '("git" "status" "--short"))))))
 
 (ert-deftest agent-shell-workflow/library-create-commit-pre-op-without-files ()
   "create-commit pre-op gathers status, diff HEAD, and recent log without files arg."
@@ -922,7 +916,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
                    :branch "branch-op-101"
                    :args (list :file "test.el" :instruction "Fix bug"))))
     (cl-letf (((symbol-function 'file-directory-p) (lambda (_) t))
-              ((symbol-function 'agent-shell-workflow-library--shell)
+              ((symbol-function 'agent-shell-workflow-library--git-output)
                (lambda (&rest args)
                  (if (member "HEAD" args)
                      "+ (fixed bug)"
@@ -1308,7 +1302,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
                    :branch "branch-fallback"
                    :args (list :file "test.el" :instruction "Fix commit"))))
     (cl-letf (((symbol-function 'file-directory-p) (lambda (_) t))
-              ((symbol-function 'agent-shell-workflow-library--shell)
+              ((symbol-function 'agent-shell-workflow-library--git-output)
                (lambda (&rest args)
                  (cond
                   ((member "HEAD" args) "   ")
@@ -1533,6 +1527,44 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
     (while (not done)
       (accept-process-output nil 0.05))
     (should (equal result "async-test-output"))))
+
+(ert-deftest agent-shell-workflow/run-process-async-uses-pipe ()
+  "Background commands do not inherit the interactive PTY default."
+  (let ((process-connection-type t)
+        (done nil)
+        (result nil)
+        (deadline (+ (float-time) 5)))
+    (agent-shell-workflow--run-process-async
+     "sh" (list "-c" "if test -t 1; then echo tty; else echo pipe; fi") nil
+     (lambda (out) (setq result out done t)))
+    (while (and (not done) (< (float-time) deadline))
+      (accept-process-output nil 0.05))
+    (should done)
+    (should (equal result "pipe"))))
+
+(ert-deftest agent-shell-workflow/run-git-async-uses-magit ()
+  "Collect a real Git result through Magit without blocking on a pager."
+  (let ((default-directory asw-test--root)
+        (process-connection-type t)
+        (process-environment (cons "GIT_PAGER=sleep 30" process-environment))
+        (magit-start (symbol-function 'magit-start-git))
+        (called nil)
+        (done nil)
+        (result nil)
+        (deadline (+ (float-time) 5)))
+    (cl-letf (((symbol-function 'magit-start-git)
+               (lambda (&rest args)
+                 (setq called t)
+                 (apply magit-start args))))
+      (agent-shell-workflow--run-process-async
+       "git" '("rev-parse" "--show-toplevel") nil
+       (lambda (out) (setq result out done t)))
+      (while (and (not done) (< (float-time) deadline))
+        (accept-process-output nil 0.05)))
+    (should called)
+    (should done)
+    (should (equal (file-name-as-directory (file-truename result))
+                   (file-name-as-directory (file-truename default-directory))))))
 
 (ert-deftest agent-shell-workflow/gather-async-multi ()
   "_gather-async runs specs and collects alist in key order."

@@ -35,8 +35,6 @@
 (require 'agent-shell-workflow)
 (eval-when-compile (require 'agent-shell-workflow))
 
-(declare-function magit-git-output "magit-git" (&rest args))
-
 ;; Shared shell and git utilities
 (defun agent-shell-workflow-library--shell (&rest args)
   "Run ARGS as a shell command in `default-directory` and return its output.
@@ -49,12 +47,8 @@ instead of aborting the workflow."
        (apply #'call-process (car args) nil t nil (cdr args))))))
 
 (defun agent-shell-workflow-library--git-output (&rest args)
-  "Run git with ARGS in `default-directory` and return trimmed output.
-Uses `magit-git-output` when available, falling back to
-`agent-shell-workflow-library--shell`."
-  (if (fboundp 'magit-git-output)
-      (string-trim (or (apply #'magit-git-output args) ""))
-    (apply #'agent-shell-workflow-library--shell "git" args)))
+  "Run Git with ARGS using Magit and return its trimmed output."
+  (string-trim (or (apply #'magit-git-output args) "")))
 
 (defun agent-shell-workflow-library--diff-summary (args &optional max-lines)
   "Return git diff for ARGS, truncating to `--stat` if lines exceed MAX-LINES.
@@ -165,7 +159,7 @@ Recent history:
 
 (defun agent-shell-workflow-library--create-commit-pre-op (ctx &optional callback)
   "Gather git status, diff against HEAD, and recent log history for CTX.
-Uses Magit or Git directly to gather state."
+Uses Magit to gather state."
   (let* ((args (plist-get ctx :args))
          (files (plist-get args :files))
          (has-files (and (stringp files) (not (string-empty-p files))))

@@ -41,7 +41,6 @@
 (declare-function magit-dash--repo-at-point "magit-dash" ())
 (declare-function magit-dash-repo-name "magit-dash" (repo))
 (declare-function annotated-completing-read "annotated-completing-read")
-(declare-function vc-git-branches "vc-git" ())
 
 ;; GitHub time parsing and repository resolution
 (defun agent-shell-workflow-library--iso-to-seconds (iso-str)
@@ -106,15 +105,8 @@ Optional LIMIT sets maximum runs to fetch (defaults to 20)."
       (when (listp parsed) parsed))))
 
 (defun agent-shell-workflow-library--current-branch ()
-  "Return current git branch name or `main`."
-  (or (ignore-errors
-        (and (fboundp 'magit-get-current-branch)
-             (magit-get-current-branch)))
-      (ignore-errors
-        (car (vc-git-branches)))
-      (let ((b (ignore-errors (string-trim (shell-command-to-string "git branch --show-current")))))
-        (unless (or (null b) (string-empty-p b)) b))
-      "main"))
+  "Return the current Git branch name, or `main'."
+  (or (ignore-errors (magit-get-current-branch)) "main"))
 
 (defun agent-shell-workflow-library--resolve-ci-run (repo &optional target-branch)
   "Return a run-id for REPO and TARGET-BRANCH.
