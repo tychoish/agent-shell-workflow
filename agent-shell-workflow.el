@@ -245,14 +245,17 @@ has been handled.")
           (set-process-sentinel
            proc (lambda (process event)
                   (when (memq (process-status process) '(exit signal))
-                    (unwind-protect
-                        (when sentinel (funcall sentinel process event))
-                      (let ((out (string-trim output))
-                            (status (process-exit-status process)))
-                        (funcall callback
-                                 (if (and (not (zerop status)) (string-empty-p out))
-                                     (format "[Command git exited with status %s]" status)
-                                   out))))))))
+                    (when sentinel
+                      (condition-case err
+                          (funcall sentinel process event)
+                        (error (message "Magit process sentinel failed: %s"
+                                        (error-message-string err)))))
+                    (let ((out (string-trim output))
+                          (status (process-exit-status process)))
+                      (funcall callback
+                               (if (and (not (zerop status)) (string-empty-p out))
+                                   (format "[Command git exited with status %s]" status)
+                                 out)))))))
       (error (funcall callback (format "[Error executing git: %s]"
                                        (error-message-string err)))))))
 

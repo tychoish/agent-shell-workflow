@@ -17,9 +17,6 @@
 (require 'agent-shell-workflow-menu)
 (require 'agent-shell-workflow-library)
 
-(defconst asw-test--root
-  (file-name-directory (directory-file-name (file-name-directory load-file-name))))
-
 ;;; Isolation macro (mirrors asq-types-test/isolate)
 
 (defmacro asw-test/isolate (&rest body)
@@ -1544,27 +1541,49 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 
 (ert-deftest agent-shell-workflow/run-git-async-uses-magit ()
   "Collect a real Git result through Magit without blocking on a pager."
-  (let ((default-directory asw-test--root)
-        (process-connection-type t)
-        (process-environment (cons "GIT_PAGER=sleep 30" process-environment))
-        (magit-start (symbol-function 'magit-start-git))
-        (called nil)
-        (done nil)
+  (let* ((repo (make-temp-file "asw-git-test-" t))
+         (default-directory (file-name-as-directory repo))
+         (process-connection-type t)
+         (process-environment (cons "GIT_PAGER=sleep 30" process-environment))
+         (magit-start (symbol-function 'magit-start-git))
+         (called nil)
+         (done nil)
+         (result nil)
+         (deadline (+ (float-time) 5)))
+    (unwind-protect
+        (progn
+          (should (zerop (call-process "git" nil nil nil "init" "-q")))
+          (cl-letf (((symbol-function 'magit-start-git)
+		     (lambda (&rest args)
+                       (setq called t)
+                       (apply magit-start args))))
+	    (agent-shell-workflow--run-process-async
+	     "git" '("rev-parse" "--show-toplevel") nil
+	     (lambda (out) (setq result out done t)))
+	    (while (and (not done) (< (float-time) deadline))
+              (accept-process-output nil 0.05)))
+          (should called)
+          (should done)
+          (should (equal (file-name-as-directory (file-truename result))
+                         (file-name-as-directory (file-truename repo)))))
+      (delete-directory repo t))))
+
+(ert-deftest agent-shell-workflow/run-git-async-sentinel-error ()
+  "A Magit sentinel error does not escape or suppress the callback."
+  (let ((done nil)
         (result nil)
         (deadline (+ (float-time) 5)))
     (cl-letf (((symbol-function 'magit-start-git)
-               (lambda (&rest args)
-                 (setq called t)
-                 (apply magit-start args))))
-      (agent-shell-workflow--run-process-async
-       "git" '("rev-parse" "--show-toplevel") nil
-       (lambda (out) (setq result out done t)))
+               (lambda (&rest _)
+                 (let ((proc (start-process "asw-test-git" nil "sh" "-c" "echo result")))
+                   (set-process-sentinel proc (lambda (&rest _) (error "sentinel failure")))
+                   proc))))
+      (agent-shell-workflow--run-git-async
+       nil nil (lambda (out) (setq result out done t)))
       (while (and (not done) (< (float-time) deadline))
         (accept-process-output nil 0.05)))
-    (should called)
     (should done)
-    (should (equal (file-name-as-directory (file-truename result))
-                   (file-name-as-directory (file-truename default-directory))))))
+    (should (equal result "result"))))
 
 (ert-deftest agent-shell-workflow/gather-async-multi ()
   "_gather-async runs specs and collects alist in key order."
