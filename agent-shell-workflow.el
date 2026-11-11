@@ -476,6 +476,16 @@ CTX is a plist; {{args.KEY}} looks inside the :args sub-plist, any other
 
 ;; Pre/post operation execution
 
+(define-error 'agent-shell-workflow-skip
+  "Workflow turn skipped by pre-op" 'user-error)
+
+(defun agent-shell-workflow-skip (&optional reason)
+  "Abort the current workflow turn cleanly from within a pre-op.
+Signals `agent-shell-workflow-skip' carrying REASON.  The dispatcher
+reports REASON with `message', never calls the pre-op's callback, and
+therefore renders and submits nothing."
+  (signal 'agent-shell-workflow-skip (list (or reason "nothing to do"))))
+
 (defun agent-shell-workflow-exec-pre (spec ctx callback)
   "Run SPEC's pre-op against CTX, then call CALLBACK with the updated ctx.
 When SPEC has no pre-op, CALLBACK is invoked with CTX unchanged.
@@ -488,8 +498,19 @@ its callback argument with the updated ctx."
       (let ((arity (func-arity pre-op)))
         (if (or (> (car arity) 1)
                 (and (= (car arity) 1) (or (eq (cdr arity) 'many) (>= (cdr arity) 2))))
-            (funcall pre-op ctx callback)
-          (funcall callback (funcall pre-op ctx)))))))
+            (condition-case skip
+                (funcall pre-op ctx callback)
+              (agent-shell-workflow-skip
+               (message "Workflow skipped: %s" (cadr skip))))
+          ;; Only the pre-op itself is guarded; CALLBACK runs outside the
+          ;; handler so downstream errors are not mistaken for skips.
+          (let ((result (condition-case skip
+                            (list (funcall pre-op ctx))
+                          (agent-shell-workflow-skip
+                           (message "Workflow skipped: %s" (cadr skip))
+                           nil))))
+            (when result
+              (funcall callback (car result)))))))))
 
 (defun agent-shell-workflow-exec-post (spec shell-buffer ctx response-text)
   "Run SPEC's post-op with SHELL-BUFFER, CTX, and RESPONSE-TEXT.
@@ -652,10 +673,14 @@ If declined, signals `user-error'."
 
 (defun agent-shell-workflow--dispatch-rendered (spec ctx target submit &optional dir)
   "Deliver the rendered prompt for SPEC and CTX to TARGET in DIR.
-When SUBMIT is non-nil, submit the prompt immediately."
+When SUBMIT is non-nil, submit the prompt immediately.
+Once the turn has been handed off without error (inserted, queued or
+deferred), the function named by CTX's `:after-handoff' (a symbol, so
+it survives queue serialization) is called with CTX."
   (let* ((target (agent-shell-workflow--resolve-target (or target (agent-shell-workflow-spec-target spec))))
          (submit (if (null submit) (agent-shell-workflow-spec-submit spec) submit))
-         (effective-dir (or dir (plist-get ctx :context-dir) default-directory)))
+         (effective-dir (or dir (plist-get ctx :context-dir) default-directory))
+         (result
     (cond
      ((run-hook-with-args-until-success 'agent-shell-workflow-dispatch-target-functions
                                         spec ctx target submit)
@@ -666,6 +691,14 @@ When SUBMIT is non-nil, submit the prompt immediately."
       (let* ((shell-buffer (or (plist-get ctx :shell-buffer)
                                (agent-shell-workflow--session-buffer target effective-dir spec))))
         (agent-shell-workflow--dispatch-to-buffer spec ctx shell-buffer submit))))))
+    (when-let* ((after (plist-get ctx :after-handoff))
+                ((functionp after)))
+      (condition-case err
+          (funcall after ctx)
+        (error (message "Workflow `%s' after-handoff failed: %s"
+                        (agent-shell-workflow-spec-id spec)
+                        (error-message-string err)))))
+    result))
 
 (defun agent-shell-workflow--buffer-busy-p (buffer)
   "Return non-nil if BUFFER is currently busy executing a turn or command."
