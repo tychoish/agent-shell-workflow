@@ -31,6 +31,7 @@
 ;;; Code:
 
 (require 'seq)
+(require 'cl-lib)
 (require 'json)
 (require 'agent-shell-workflow)
 (require 'agent-shell-workflow-utils)
@@ -594,6 +595,456 @@ Do NOT read all raw comment data into context at once. Review comments in `{{pr-
 4. Apply confirmed changes and verify tests pass."
   :submit t
   :target :session-reuse)
+
+;; PR status synchronizer and `pr-status-sync' workflow
+
+(require 'org)
+(require 'subr-x)
+(require 'orgx nil t)
+
+(declare-function magit-dash-gh-pr-status-collect-all "magit-dash-gh-pr" (&optional dir))
+(declare-function magit-dash-gh-pr-attach-tracking "magit-dash-gh-pr" (pr))
+(declare-function magit-dash-gh-pr-commit-tracking "magit-dash-gh-pr" (prs))
+(declare-function magit-dash-gh-pr-tracking-fingerprint "magit-dash-gh-pr" (prs))
+(defvar org-directory)
+(defvar magit-dash-gh-pr-status-max-prs)
+
+(defcustom agent-shell-workflow-pr-status-file
+  (expand-file-name "pr-review-status.org"
+                    (if (boundp 'org-directory) org-directory "~/org"))
+  "Org file kept in sync with the open PR list by `pr-status-sync'."
+  :type 'file
+  :group 'agent-shell-workflow)
+
+(defvar agent-shell-workflow-github--pr-status-fingerprint nil
+  "Fingerprint of the PR set last synced by `pr-status-sync' (in memory only).")
+
+(defvar agent-shell-workflow-github--pr-status-last-count 0
+  "Number of PRs in the last committed `pr-status-sync' (in memory only).")
+
+(defvar agent-shell-workflow-github--pr-status-failures 0
+  "Consecutive PR collection failures in the `pr-status-sync' pre-op.")
+
+(defconst agent-shell-workflow-github--failure-warn-threshold 3
+  "Consecutive collection failures after which a warning replaces a message.")
+
+(defun agent-shell-workflow-github--pr-field (pr key)
+  "Return tracking KEY of PR."
+  (plist-get (plist-get pr :tracking) key))
+
+(defun agent-shell-workflow-github--pr-step (pr)
+  "Return the STEP string (the bucket name) for PR."
+  (agent-shell-workflow-github--line (or (plist-get pr :bucket) "unknown")))
+
+(defun agent-shell-workflow-github--line (value)
+  "Return VALUE as a single-line string safe to embed in Org.
+Control characters (including newlines) collapse to single spaces."
+  (string-trim
+   (replace-regexp-in-string "[[:cntrl:]]+" " "
+                             (format "%s" (if (null value) "" value)))))
+
+(defun agent-shell-workflow-github--pr-heading-text (pr)
+  "Return the sanitized task heading text (without stars or keyword) for PR."
+  (let ((text (agent-shell-workflow-github--line
+               (format "%s: %s" (plist-get pr :number)
+                       (or (agent-shell-workflow-github--pr-field pr :action-summary)
+                           (plist-get pr :title) "")))))
+    ;; A trailing :word: would be parsed as heading tags.
+    (string-trim-right
+     (replace-regexp-in-string "[ \t]+:[[:alnum:]_@#%:]+:\\'" "" text))))
+
+(defun agent-shell-workflow-github--body-line (value)
+  "Return VALUE as a safe Org list item line (no trailing newline), or nil if empty."
+  (let ((l (agent-shell-workflow-github--line value)))
+    (unless (string-empty-p l) (concat "- " l))))
+
+(defun agent-shell-workflow-github--cell (value)
+  "Return VALUE formatted as a single-line Org table cell string."
+  (replace-regexp-in-string "|" "/" (agent-shell-workflow-github--line value)))
+
+(defun agent-shell-workflow-github--find-heading (title)
+  "Return position of the level-1 heading titled TITLE, or nil.
+Tolerates a TODO keyword, priority cookie and tags, and ignores
+text inside example/src/export/comment blocks."
+  (org-with-wide-buffer
+   (goto-char (point-min))
+   (let ((re (concat "^\\* +\\(?:[A-Z]+ +\\)?\\(?:\\[#[A-Z0-9]+\\] +\\)?"
+                     (regexp-quote title)
+                     "\\(?:[ \t]+:[[:alnum:]_@#%:]+:\\)?[ \t]*$"))
+         found)
+     (while (and (not found) (re-search-forward re nil t))
+       (unless (org-in-block-p '("example" "src" "export" "comment"
+                                 "verse" "quote" "center"))
+         (setq found (line-beginning-position))))
+     found)))
+
+(defun agent-shell-workflow-github--ensure-skeleton ()
+  "Ensure the current Org buffer has the title, filetags, Summary and Tasks."
+  (org-with-wide-buffer
+   (when (zerop (buffer-size))
+     (insert "#+title: Open PR status (@me)\n#+filetags: :agent:prs:\n\n"))
+   (dolist (h '("Summary" "Tasks"))
+     (unless (agent-shell-workflow-github--find-heading h)
+       (goto-char (point-max))
+       (unless (or (bobp) (bolp)) (insert "\n"))
+       (insert (format "* %s\n" h))))))
+
+(defun agent-shell-workflow-github--task-entries ()
+  "Return an alist ((REPO . PR) . MARKER) of entries with REPO and PR properties."
+  (let (res)
+    (org-with-wide-buffer
+     (org-map-entries
+      (lambda ()
+        (let ((repo (org-entry-get nil "REPO"))
+              (pr (org-entry-get nil "PR")))
+          (when (and repo pr)
+            (push (cons (cons repo pr) (copy-marker (point))) res))))
+      t))
+    (nreverse res)))
+
+(defun agent-shell-workflow-github--set-prop (prop value pos)
+  "Set PROP to single-line VALUE on the entry at POS."
+  (let ((value (agent-shell-workflow-github--line value)))
+    (if (fboundp 'orgx-entry-set-property)
+        (orgx-entry-set-property prop value pos)
+      (org-with-point-at pos (org-entry-put nil prop value)))))
+
+(defun agent-shell-workflow-github--write-summary (prs)
+  "Replace the body of the Summary section with a refresh line and table of PRS."
+  (org-with-wide-buffer
+   (goto-char (agent-shell-workflow-github--find-heading "Summary"))
+   (forward-line 1)
+   ;; The heading may be the last line, with no trailing newline.
+   (unless (bolp) (insert "\n"))
+   (let ((start (point))
+         (end (save-excursion
+                (cond ((looking-at org-outline-regexp-bol) (point))
+                      ((outline-next-heading) (point))
+                      (t (point-max))))))
+     (delete-region start end)
+     (insert (format "Last refreshed: %s\n\n" (format-time-string "[%F %a %R]")))
+     (let ((table-start (point)))
+       (insert "| PR | Repo | Branch | Approvals | CI failing | Unresolved | Bucket |\n|-\n")
+       (dolist (pr prs)
+         (insert (format "| %s |\n"
+                         (mapconcat
+                          #'agent-shell-workflow-github--cell
+                          (list (plist-get pr :number) (plist-get pr :repo)
+                                (plist-get pr :branch)
+                                (or (plist-get pr :approvals) 0)
+                                (length (agent-shell-workflow-github--pr-field
+                                         pr :failing-checks))
+                                (or (plist-get pr :threads-open) 0)
+                                (plist-get pr :bucket))
+                          " | "))))
+       (save-excursion (goto-char table-start) (org-table-align)))
+     (insert "\n"))))
+
+(defun agent-shell-workflow-github--open-keyword ()
+  "Return the keyword for an open task, or nil when none is defined.
+That is TODO if defined, else the first open keyword.  With a keyword
+set such as `#+TODO: | DONE' open tasks carry no keyword; matching and
+closing are then done by the REPO and PR properties."
+  (if (member "TODO" org-not-done-keywords)
+      "TODO"
+    (car org-not-done-keywords)))
+
+(defun agent-shell-workflow-github--append-task (pr)
+  "Append a new task entry for PR under the Tasks heading."
+  (org-with-wide-buffer
+   (goto-char (agent-shell-workflow-github--find-heading "Tasks"))
+   (let* ((stars (make-string (1+ (org-current-level)) ?*))
+          (kw (agent-shell-workflow-github--open-keyword))
+          (l #'agent-shell-workflow-github--line))
+     (org-end-of-subtree t t)
+     (unless (bolp) (insert "\n"))
+     (insert
+      (format "%s %s%s\n:PROPERTIES:\n:REPO: %s\n:PR: %s\n:STEP: %s\n:LAST_SEEN: %s\n:BRANCH: %s\n:URL: %s\n:END:\n%s%s %s\n"
+              stars (if kw (concat kw " ") "")
+              (agent-shell-workflow-github--pr-heading-text pr)
+              (funcall l (plist-get pr :repo)) (funcall l (plist-get pr :number))
+              (agent-shell-workflow-github--pr-step pr)
+              (funcall l (agent-shell-workflow-github--pr-field pr :last-seen))
+              (funcall l (plist-get pr :branch)) (funcall l (plist-get pr :url))
+              (mapconcat (lambda (s) (concat s "\n"))
+                         (delq nil
+                               (list (agent-shell-workflow-github--body-line
+                                      (plist-get pr :title))
+                                     (agent-shell-workflow-github--body-line
+                                      (agent-shell-workflow-github--pr-field
+                                       pr :delta-reason))))
+                         "")
+              (concat stars "*") "Notes and In-Flight Decisions")))))
+
+(defun agent-shell-workflow-github--set-todo (marker state)
+  "Set the TODO state of the entry at MARKER to STATE (\"\" clears it).
+No logging, notes, dependency checks or state-change hooks run."
+  (let ((org-log-done nil)
+        (org-todo-log-states nil)
+        (org-enforce-todo-dependencies nil)
+        (org-enforce-todo-checkbox-dependencies nil)
+        (org-after-todo-state-change-hook nil)
+        (org-blocker-hook nil))
+    (cl-letf (((symbol-function 'org-add-log-setup) #'ignore)
+              ((symbol-function 'org-add-log-note) #'ignore))
+      (org-with-point-at marker
+        (org-back-to-heading t)
+        (org-todo (if (string-empty-p state) 'none state))))))
+
+(defun agent-shell-workflow-github--update-task (marker pr)
+  "Update STEP and LAST_SEEN (and the heading on step change) of PR at MARKER.
+A task in a done state is reopened since PR is present (open)."
+  (let ((step (agent-shell-workflow-github--pr-step pr))
+        (state (org-with-point-at marker (org-get-todo-state))))
+    (unless (equal step (org-with-point-at marker (org-entry-get nil "STEP")))
+      (agent-shell-workflow-github--set-prop "STEP" step marker)
+      (org-with-point-at marker
+        (org-back-to-heading t)
+        (when (looking-at org-complex-heading-regexp)
+          (replace-match (agent-shell-workflow-github--pr-heading-text pr)
+                         t t nil 4))))
+    (when (and state (member state org-done-keywords))
+      (agent-shell-workflow-github--set-todo
+       marker (or (agent-shell-workflow-github--open-keyword) "")))
+    (agent-shell-workflow-github--set-prop
+     "LAST_SEEN"
+     (agent-shell-workflow-github--pr-field pr :last-seen) marker)))
+
+(defun agent-shell-workflow-github--close-task (marker)
+  "Mark the task at MARKER DONE and set CLOSED, without prompts or logging."
+  (agent-shell-workflow-github--set-todo
+   marker (or (car org-done-keywords) "DONE"))
+  (org-with-point-at marker
+    (org-back-to-heading t)
+    (unless (org-entry-get nil "CLOSED")
+      (org-add-planning-info 'closed (org-current-effective-time)))))
+
+(defun agent-shell-workflow-github--close-allowed-p (prs)
+  "Return non-nil when PRS is complete enough to close vanished tasks.
+An empty or truncated (>= max-prs) list is never trusted."
+  (and prs
+       (< (length prs)
+          (or (bound-and-true-p magit-dash-gh-pr-status-max-prs) 50))))
+
+(defun agent-shell-workflow-github--sync-buffer (prs)
+  "Apply PRS to the current Org buffer."
+  (agent-shell-workflow-github--ensure-skeleton)
+  (agent-shell-workflow-github--write-summary prs)
+  (let ((entries (agent-shell-workflow-github--task-entries))
+        (seen nil))
+    (dolist (pr prs)
+      (let* ((key (cons (agent-shell-workflow-github--line (plist-get pr :repo))
+                        (agent-shell-workflow-github--line (plist-get pr :number))))
+             (hit (assoc key entries)))
+        (push key seen)
+        (if hit
+            (agent-shell-workflow-github--update-task (cdr hit) pr)
+          (agent-shell-workflow-github--append-task pr))))
+    (when (agent-shell-workflow-github--close-allowed-p prs)
+      (dolist (e entries)
+        (unless (member (car e) seen)
+          (let ((state (org-with-point-at (cdr e) (org-get-todo-state))))
+            (when (if state
+                      (member state org-not-done-keywords)
+                    (null org-not-done-keywords))
+              (agent-shell-workflow-github--close-task (cdr e)))))))
+    (dolist (e entries) (set-marker (cdr e) nil))))
+
+(defun agent-shell-workflow-github-pr-sync (prs &optional file)
+  "Non-destructively sync the PR status Org FILE with PRS.
+PRS are PR plists carrying a `:tracking' plist (see
+`magit-dash-gh-pr-attach-tracking').  FILE defaults to
+`agent-shell-workflow-pr-status-file'.  Only the Summary body is
+rewritten; existing task entries are matched by their REPO and PR
+properties and get only STEP/LAST_SEEN (and heading on step change)
+updated.  PRs no longer open are marked DONE only when PRS is
+non-empty and below `magit-dash-gh-pr-status-max-prs' (an empty or
+truncated list is not trusted).  A symlinked FILE stays a symlink.
+Signals an error when a buffer visiting FILE has unsaved changes.
+Return FILE."
+  (let* ((file (expand-file-name (or file agent-shell-workflow-pr-status-file)))
+         (target (file-truename file))
+         (visiting (or (find-buffer-visiting file) (find-buffer-visiting target)))
+         (dir (file-name-directory target))
+         content mode tmp)
+    (when (and visiting (buffer-modified-p visiting))
+      (user-error "Buffer %s has unsaved changes; save or revert before syncing PR status"
+                  (buffer-name visiting)))
+    (make-directory dir t)
+    (setq mode (and (file-exists-p target) (file-modes target)))
+    (with-temp-buffer
+      (let ((inhibit-read-only t)
+            (inhibit-message t))
+        (when (file-exists-p target) (insert-file-contents target))
+        (delay-mode-hooks (org-mode))
+        (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+                  ((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+          (agent-shell-workflow-github--sync-buffer prs))
+        (setq content (buffer-string))))
+    (setq tmp (make-temp-file (expand-file-name ".pr-status-" dir)))
+    (unwind-protect
+        (progn
+          (let ((coding-system-for-write 'utf-8-unix))
+            (write-region content nil tmp nil 'silent))
+          (when mode (set-file-modes tmp mode))
+          (rename-file tmp target t)
+          (setq tmp nil))
+      (when (and tmp (file-exists-p tmp)) (delete-file tmp)))
+    (when (and visiting (buffer-live-p visiting))
+      (with-current-buffer visiting
+        (let ((inhibit-read-only t))
+          (revert-buffer t t t))))
+    file))
+
+(defun agent-shell-workflow-github--delta-lines (prs)
+  "Return compact delta lines for PRS whose delta is not `unchanged'."
+  (delq nil
+        (mapcar
+         (lambda (pr)
+           (unless (eq (agent-shell-workflow-github--pr-field pr :delta-type)
+                       'unchanged)
+             (format "- %s#%s %s — %s — %s"
+                     (plist-get pr :repo) (plist-get pr :number)
+                     (plist-get pr :bucket)
+                     (agent-shell-workflow-github--pr-field pr :delta-reason)
+                     (agent-shell-workflow-github--pr-field pr :action-summary))))
+         prs)))
+
+(defun agent-shell-workflow-github--note-collection-failure (reason)
+  "Record a consecutive collection failure and report REASON (message or warning)."
+  (cl-incf agent-shell-workflow-github--pr-status-failures)
+  (if (>= agent-shell-workflow-github--pr-status-failures
+          agent-shell-workflow-github--failure-warn-threshold)
+      (display-warning
+       'agent-shell-workflow
+       (format "pr-status-sync: %d consecutive collection failures: %s"
+               agent-shell-workflow-github--pr-status-failures reason)
+       :warning)
+    (message "pr-status-sync: %s" reason)))
+
+(defun agent-shell-workflow-github--pr-status-commit (ctx)
+  "Commit the PR tracking and fingerprint staged in CTX by the pre-op.
+Runs from `:after-handoff' once the turn has been handed off."
+  (when-let* ((prs-cell (plist-member ctx :pr-status-pending-prs)))
+    (magit-dash-gh-pr-commit-tracking (cadr prs-cell))
+    (setq agent-shell-workflow-github--pr-status-fingerprint
+          (plist-get ctx :pr-status-pending-fingerprint)
+          agent-shell-workflow-github--pr-status-last-count
+          (length (cadr prs-cell)))))
+
+(defun agent-shell-workflow-github--pr-status-sync-pre-op (ctx)
+  "Collect PR state, sync the status file, and add the delta to CTX.
+Skips the turn (via `agent-shell-workflow-skip') when collection fails,
+returns nothing after a previously non-empty sync, or the PR
+fingerprint is unchanged since the last sync.  Tracking and the
+fingerprint are only staged in CTX; `:after-handoff' commits them."
+  (require 'magit-dash-gh-pr nil t)
+  (let* ((collected
+          (condition-case err
+              (progn
+                (unless (fboundp 'magit-dash-gh-pr-status-collect-all)
+                  (error "magit-dash PR tracking is not available"))
+                (prog1 (magit-dash-gh-pr-status-collect-all)
+                  (setq agent-shell-workflow-github--pr-status-failures 0)))
+            (error
+             (let ((reason (format "PR collection failed (%s); status file left untouched"
+                                   (error-message-string err))))
+               (agent-shell-workflow-github--note-collection-failure reason)
+               (agent-shell-workflow-skip reason)))))
+         (prs (mapcar #'magit-dash-gh-pr-attach-tracking collected))
+         (fingerprint (magit-dash-gh-pr-tracking-fingerprint prs)))
+    (when (and (null prs)
+               agent-shell-workflow-github--pr-status-fingerprint
+               (> agent-shell-workflow-github--pr-status-last-count 0))
+      (agent-shell-workflow-skip
+       "PR collection returned nothing after a non-empty sync; status file left untouched"))
+    (when (equal fingerprint agent-shell-workflow-github--pr-status-fingerprint)
+      (agent-shell-workflow-skip "PR status unchanged; no turn needed"))
+    (let ((file (agent-shell-workflow-github-pr-sync prs))
+          (lines (agent-shell-workflow-github--delta-lines prs)))
+      (setq ctx (plist-put ctx :pr-status-file file))
+      (setq ctx (plist-put ctx :pr-status-pending-prs prs))
+      (setq ctx (plist-put ctx :pr-status-pending-fingerprint fingerprint))
+      (setq ctx (plist-put ctx :after-handoff
+                           'agent-shell-workflow-github--pr-status-commit))
+      (plist-put ctx :pr-status-delta
+                 (if lines
+                     (string-join lines "\n")
+                   "- (no per-PR changes; set membership changed)")))))
+
+;; No :model is set: the workflow spec has no model slot, so the model comes
+;; from the target session.  Use a small/cheap model session for this turn.
+(register-agent-shell-workflow pr-status-sync
+  :doc "Sync the PR status Org file and triage only changed PRs (skips when nothing changed)"
+  :category "Code Review"
+  :pre-op #'agent-shell-workflow-github--pr-status-sync-pre-op
+  :template "The PR status file `{{pr-status-file}}` was just updated automatically (summary table, task headings, STEP and LAST_SEEN). Do NOT rewrite or re-read the whole file.
+
+## Changed PRs:
+{{pr-status-delta}}
+
+## Instructions:
+For each changed PR above, add a short triage note (one or two lines: what changed, what to do next) using the orgx MCP tools:
+- `org_heading_append_note` with match_property \"PR\" and match_value the PR number.
+- `org_heading_set_property` (same match_property/match_value) only if a property needs correcting.
+Keep your output brief."
+  :submit t
+  :target :session-reuse
+  :clear t)
+
+;;; Periodic `pr-status-sync' trigger
+
+(defcustom agent-shell-workflow-pr-status-timer-interval 3600
+  "Seconds between automatic `pr-status-sync' dispatches."
+  :type 'natnum
+  :group 'agent-shell-workflow)
+
+(defcustom agent-shell-workflow-pr-status-timer-target 'queue
+  "Where timer-driven `pr-status-sync' runs are dispatched.
+`queue' enqueues a background item via agent-shell-queue so no live
+session is interrupted; `session' uses the workflow's own target."
+  :type '(choice (const :tag "Background queue" queue)
+                 (const :tag "Session" session))
+  :group 'agent-shell-workflow)
+
+(defvar agent-shell-workflow-pr-status--timer nil
+  "Timer driving periodic `pr-status-sync', or nil when stopped.")
+
+(defun agent-shell-workflow-pr-status--dispatch ()
+  "Dispatch `pr-status-sync' once.  Never signals; skip is not an error."
+  (condition-case err
+      (apply #'agent-shell-workflow-dispatch 'pr-status-sync
+             (when (eq agent-shell-workflow-pr-status-timer-target 'queue)
+               (list :target :queue)))
+    (agent-shell-workflow-skip
+     (message "pr-status-sync: skipped (%s)" (cadr err)) nil)
+    (error
+     (message "pr-status-sync timer: %s" (error-message-string err)) nil)))
+
+;;;###autoload
+(defun agent-shell-workflow-pr-status-run-now ()
+  "Dispatch `pr-status-sync' once, now."
+  (interactive)
+  (agent-shell-workflow-pr-status--dispatch))
+
+;;;###autoload
+(defun agent-shell-workflow-pr-status-timer-stop ()
+  "Stop the periodic `pr-status-sync' timer.  Safe when not running."
+  (interactive)
+  (when (timerp agent-shell-workflow-pr-status--timer)
+    (cancel-timer agent-shell-workflow-pr-status--timer))
+  (setq agent-shell-workflow-pr-status--timer nil))
+
+;;;###autoload
+(defun agent-shell-workflow-pr-status-timer-start ()
+  "Start (or restart) the periodic `pr-status-sync' timer.
+Uses the current `agent-shell-workflow-pr-status-timer-interval'."
+  (interactive)
+  (agent-shell-workflow-pr-status-timer-stop)
+  (setq agent-shell-workflow-pr-status--timer
+        (run-with-timer agent-shell-workflow-pr-status-timer-interval
+                        agent-shell-workflow-pr-status-timer-interval
+                        #'agent-shell-workflow-pr-status--dispatch)))
 
 (provide 'agent-shell-workflow-github)
 
