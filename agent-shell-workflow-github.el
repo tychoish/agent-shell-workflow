@@ -319,7 +319,9 @@ RAW-COMMENTS is fallback plain text from `gh pr view --comments`."
 Artifacts (failed-step log, jobs metadata JSON, triage index, and fix
 plan) are written under a unique directory in <project-root>/.agent/fix-ci/
 so the agent can inspect them as files without collisions across runs
-or attempts.  When CALLBACK is given, executes asynchronously."
+or attempts.  ARGS may carry :root, the checkout to use instead of the
+project root of `default-directory'.  When CALLBACK is given, executes
+asynchronously."
   (let* ((args (plist-get ctx :args))
          (raw-repo (or (plist-get args :repo)
                        (ignore-errors
@@ -342,7 +344,9 @@ or attempts.  When CALLBACK is given, executes asynchronously."
     (if (and repo-slug run-id-str)
         (let ((finish
                (lambda (ci-summary ci-log ci-jobs)
-                 (let* ((root (agent-shell-workflow-library--project-root))
+                 (let* ((root (if-let* ((r (plist-get args :root)))
+                                         (file-name-as-directory (expand-file-name r))
+                                       (agent-shell-workflow-library--project-root)))
                         (parsed-jobs (ignore-errors (json-parse-string ci-jobs :object-type 'alist :array-type 'list)))
                         (run-branch (or (plist-get args :branch)
                                         (and (listp parsed-jobs) (alist-get 'headBranch parsed-jobs))
@@ -397,7 +401,8 @@ or attempts.  When CALLBACK is given, executes asynchronously."
                  (let* ((summary (or (cdr (assq :ci-summary results)) ""))
                         (log (or (cdr (assq :ci-log results)) ""))
                         (jobs (or (cdr (assq :ci-jobs results)) "")))
-                   (funcall callback (funcall finish summary log jobs)))))
+                   (funcall callback (funcall finish summary log jobs))))
+               (plist-get args :root))
             ;; Synchronous path
             (let* ((ci-summary (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug))
                    (ci-log (agent-shell-workflow-library--shell "gh" "run" "view" run-id-str "--repo" repo-slug "--log-failed"))
@@ -699,7 +704,7 @@ text inside example/src/export/comment blocks."
         (let ((repo (org-entry-get nil "REPO"))
               (pr (org-entry-get nil "PR")))
           (when (and repo pr)
-            (push (cons (cons repo pr) (copy-marker (point))) res))))
+            (push (cons (cons repo pr) (copy-marker (point) t)) res))))
       t))
     (nreverse res)))
 
@@ -751,16 +756,19 @@ closing are then done by the REPO and PR properties."
     (car org-not-done-keywords)))
 
 (defun agent-shell-workflow-github--append-task (pr)
-  "Append a new task entry for PR under the Tasks heading."
+  "Append a new task entry for PR under the Tasks heading, with its actions.
+No notes heading is created: `org_heading_append_note' creates one on demand."
   (org-with-wide-buffer
    (goto-char (agent-shell-workflow-github--find-heading "Tasks"))
    (let* ((stars (make-string (1+ (org-current-level)) ?*))
           (kw (agent-shell-workflow-github--open-keyword))
-          (l #'agent-shell-workflow-github--line))
+          (l #'agent-shell-workflow-github--line)
+          start)
      (org-end-of-subtree t t)
      (unless (bolp) (insert "\n"))
+     (setq start (copy-marker (point)))
      (insert
-      (format "%s %s%s\n:PROPERTIES:\n:REPO: %s\n:PR: %s\n:STEP: %s\n:LAST_SEEN: %s\n:BRANCH: %s\n:URL: %s\n:END:\n%s%s %s\n"
+      (format "%s %s%s\n:PROPERTIES:\n:REPO: %s\n:PR: %s\n:STEP: %s\n:LAST_SEEN: %s\n:BRANCH: %s\n:URL: %s\n:END:\n%s"
               stars (if kw (concat kw " ") "")
               (agent-shell-workflow-github--pr-heading-text pr)
               (funcall l (plist-get pr :repo)) (funcall l (plist-get pr :number))
@@ -774,8 +782,10 @@ closing are then done by the REPO and PR properties."
                                      (agent-shell-workflow-github--body-line
                                       (agent-shell-workflow-github--pr-field
                                        pr :delta-reason))))
-                         "")
-              (concat stars "*") "Notes and In-Flight Decisions")))))
+                         "")))
+     (set-marker-insertion-type start t)
+     (agent-shell-workflow-github--sync-actions start pr)
+     (set-marker start nil))))
 
 (defun agent-shell-workflow-github--set-todo (marker state)
   "Set the TODO state of the entry at MARKER to STATE (\"\" clears it).
@@ -792,6 +802,289 @@ No logging, notes, dependency checks or state-change hooks run."
         (org-back-to-heading t)
         (org-todo (if (string-empty-p state) 'none state))))))
 
+;;; Action items and CI preflight
+
+(defcustom agent-shell-workflow-pr-status-ci-preflight
+  '(("casaphq/go-monorepo" :dir "~/src/go-monorepo"))
+  "Repositories whose failing CI is downloaded for fix-ci action items.
+An alist of (SLUG . PLIST) where `:dir' is the local checkout the
+`fix-ci' workflow pre-op writes its artifacts under (.agent/fix-ci/).
+Repositories not listed get a fix-ci action without downloaded logs."
+  :type '(alist :key-type string :value-type plist)
+  :group 'agent-shell-workflow)
+
+(defvar agent-shell-workflow-github--preflight-requests nil
+  "Preflight requests (REPO NUMBER FINGERPRINT) collected during a sync.")
+
+(defvar agent-shell-workflow-github--preflight-procs (make-hash-table :test #'equal)
+  "Map \"repo#number\" to t while a preflight of that PR is running.")
+
+(defun agent-shell-workflow-github--failing-alist (pr)
+  "Return ((NAME . URL-or-nil) ...) of the failing checks of PR, sorted by name."
+  (let ((full (plist-get pr :failing))
+        (names (agent-shell-workflow-github--pr-field pr :failing-checks)))
+    (sort (if full
+              (mapcar (lambda (f) (if (consp f) (cons (car f) (cdr f)) (cons f nil)))
+                      full)
+            (mapcar (lambda (n) (cons n nil)) names))
+          (lambda (a b) (string< (car a) (car b))))))
+
+(defun agent-shell-workflow-github--plural (n word)
+  "Return \"N WORD\" with WORD pluralised with an s unless N is 1."
+  (format "%d %s%s" n word (if (= n 1) "" "s")))
+
+(defun agent-shell-workflow-github--pr-actions (pr)
+  "Return the outstanding activities of PR as a list of (KIND TEXT . FAILING).
+FAILING is the failing-check alist, set only for `fix-ci'.  One activity
+exists per kind, so each can be tracked and closed independently."
+  (let* ((failing (agent-shell-workflow-github--failing-alist pr))
+         (koalaty (seq-filter (lambda (f) (string-match-p "koalaty" (car f))) failing))
+         (tests (seq-remove (lambda (f) (member f koalaty)) failing))
+         (threads (or (plist-get pr :threads-open) 0))
+         (changes (or (plist-get pr :changes-requested) 0))
+         (missing (- (or (plist-get pr :required) 1) (or (plist-get pr :approvals) 0)))
+         (base (or (plist-get pr :base) "base"))
+         (merge-state (plist-get pr :merge-state))
+         acts)
+    (when tests
+      (push `(fix-ci ,(format "fix failing tests: %s" (mapconcat #'car tests ", "))
+                     . ,tests)
+            acts))
+    (when koalaty
+      (push '(koalaty "raise koalaty rating") acts))
+    (when (equal merge-state "DIRTY")
+      (push (list 'conflicts (format "fix merge conflicts with %s" base)) acts))
+    (when (equal merge-state "BEHIND")
+      (push (list 'behind (format "update branch from %s" base)) acts))
+    (when (> threads 0)
+      (push (list 'threads (format "respond to %s"
+                                   (agent-shell-workflow-github--plural
+                                    threads "open review thread")))
+            acts))
+    (when (> changes 0)
+      (push (list 'changes (format "address changes requested by %s"
+                                   (agent-shell-workflow-github--plural
+                                    changes "reviewer")))
+            acts))
+    (when (> missing 0)
+      (push (list 'reviews (format "find %s" (agent-shell-workflow-github--plural
+                                              missing "more review")))
+            acts))
+    (when (plist-get pr :draft)
+      (push '(draft "mark ready for review") acts))
+    (when (eq (plist-get pr :bucket) 'ready)
+      (push '(merge "merge") acts))
+    (nreverse acts)))
+
+(defun agent-shell-workflow-github--task-open-p (marker)
+  "Return non-nil when the task at MARKER is open (not in a done state)."
+  (let ((state (org-with-point-at marker (org-get-todo-state))))
+    (if state
+        (member state org-not-done-keywords)
+      (null org-not-done-keywords))))
+
+(defun agent-shell-workflow-github--set-heading-text (marker text)
+  "Replace the heading text of the entry at MARKER with TEXT."
+  (org-with-point-at marker
+    (org-back-to-heading t)
+    (when (looking-at org-complex-heading-regexp)
+      (unless (equal (match-string 4) text)
+        (replace-match text t t nil 4)))))
+
+(defun agent-shell-workflow-github--action-children (marker)
+  "Return ((KIND . MARKER) ...) of the action items under the entry at MARKER."
+  (org-with-point-at marker
+    (org-back-to-heading t)
+    (let ((level (org-current-level))
+          (end (save-excursion (org-end-of-subtree t t) (point)))
+          res)
+      (save-excursion
+        (while (and (outline-next-heading) (< (point) end))
+          (when-let* (((= (org-current-level) (1+ level)))
+                      (kind (org-entry-get nil "ACTION")))
+            (push (cons kind (copy-marker (point) t)) res))))
+      (nreverse res))))
+
+(defun agent-shell-workflow-github--append-action (marker kind text)
+  "Insert an open action item KIND with TEXT as the last child of MARKER's entry.
+Return a marker at the new heading."
+  (org-with-point-at marker
+    (org-back-to-heading t)
+    (let ((stars (make-string (1+ (org-current-level)) ?*))
+          (kw (agent-shell-workflow-github--open-keyword))
+          start)
+      (org-end-of-subtree t t)
+      (unless (bolp) (insert "\n"))
+      (setq start (point))
+      (insert (format "%s %s%s\n:PROPERTIES:\n:ACTION: %s\n:END:\n"
+                      stars (if kw (concat kw " ") "") text kind))
+      (copy-marker start t))))
+
+(defun agent-shell-workflow-github--set-body-line (marker prefix text)
+  "Set the body line \"- PREFIX: TEXT\" of the entry at MARKER.
+An existing line starting with \"- PREFIX:\" is replaced, else the line is
+inserted before the rest of the body; TEXT nil deletes the line."
+  (org-with-point-at marker
+    (org-back-to-heading t)
+    (let* ((end (save-excursion (outline-next-heading) (point)))
+           (re (format "^- %s:.*\n" (regexp-quote prefix)))
+           (line (and text (format "- %s: %s\n" prefix text))))
+      (if (save-excursion (re-search-forward re end t))
+          (replace-match (or line "") t t)
+        (when line
+          (org-end-of-meta-data nil)
+          (insert line))))))
+
+(defun agent-shell-workflow-github--ci-fingerprint (failing)
+  "Return a fingerprint of the failing-check alist FAILING.
+Check URLs carry the run and job ids, so a re-run changes it."
+  (md5 (mapconcat (lambda (f) (format "%s %s" (car f) (or (cdr f) ""))) failing "\n")))
+
+(defun agent-shell-workflow-github--ci-run-id (failing)
+  "Return the GitHub Actions run id found in the URLs of FAILING, or nil."
+  (seq-some (lambda (f)
+              (and (cdr f) (string-match "/runs/\\([0-9]+\\)" (cdr f))
+                   (match-string 1 (cdr f))))
+            failing))
+
+(defun agent-shell-workflow-github--preflight-config (pr)
+  "Return the preflight plist configured for the repository of PR, or nil."
+  (cdr (assoc (plist-get pr :repo) agent-shell-workflow-pr-status-ci-preflight)))
+
+(defun agent-shell-workflow-github--org-link (target label)
+  "Return an Org link to TARGET described by LABEL, or LABEL without TARGET."
+  (if target
+      (format "[[%s][%s]]" target (replace-regexp-in-string "[][]" "" label))
+    label))
+
+(defun agent-shell-workflow-github--sync-ci-action (marker pr failing)
+  "Refresh the failing-test links, staleness and preflight of the fix-ci item.
+MARKER is the action heading, PR its pull request, FAILING the failing
+checks.  A changed check fingerprint marks existing logs STALE; a missing
+or stale log set queues a preflight when one is configured."
+  (let* ((fp (agent-shell-workflow-github--ci-fingerprint failing))
+         (old (org-with-point-at marker (org-entry-get nil "CI_FINGERPRINT")))
+         (fetched (org-with-point-at marker (org-entry-get nil "LOGS_FETCHED")))
+         (logged (org-with-point-at marker (org-entry-get nil "LOGS_FINGERPRINT")))
+         (run-id (agent-shell-workflow-github--ci-run-id failing))
+         (number (plist-get pr :number)))
+    (agent-shell-workflow-github--set-prop "CI_FINGERPRINT" fp marker)
+    (agent-shell-workflow-github--set-body-line
+     marker "Failing"
+     (mapconcat (lambda (f)
+                  (agent-shell-workflow-github--org-link
+                   (cdr f) (agent-shell-workflow-github--line (car f))))
+                failing ", "))
+    (agent-shell-workflow-github--set-body-line
+     marker "Prompt"
+     (format "fix-ci workflow, repo %s%s" (plist-get pr :repo)
+             (if run-id (format ", run %s" run-id) "")))
+    (when run-id (agent-shell-workflow-github--set-prop "RUN_ID" run-id marker))
+    (let ((stale (and fetched (not (equal logged fp)))))
+      (when (and fetched old (not (equal old fp)) (not stale))
+        (setq stale t))
+      (if stale
+          (agent-shell-workflow-github--set-prop "STALE" "t" marker)
+        (org-with-point-at marker (org-entry-delete nil "STALE")))
+      (when (and (or stale (not fetched)) run-id
+                 (agent-shell-workflow-github--preflight-config pr))
+        (push (list (plist-get pr :repo) number fp run-id (plist-get pr :branch))
+              agent-shell-workflow-github--preflight-requests)))))
+
+(defun agent-shell-workflow-github--sync-actions (marker pr)
+  "Reconcile the action item children of the PR task at MARKER with PR.
+Missing actions are added, closed ones reopened, resolved ones closed, and
+wording kept current.  The fix-ci item also tracks CI logs (see
+`agent-shell-workflow-github--sync-ci-action')."
+  (let ((existing (agent-shell-workflow-github--action-children marker))
+        (wanted (agent-shell-workflow-github--pr-actions pr)))
+    (dolist (act wanted)
+      (let* ((kind (symbol-name (car act)))
+             (text (agent-shell-workflow-github--line (cadr act)))
+             (hit (assoc kind existing))
+             (m (if hit
+                    (cdr hit)
+                  (agent-shell-workflow-github--append-action marker kind text))))
+        (when hit
+          (agent-shell-workflow-github--set-heading-text m text)
+          (unless (agent-shell-workflow-github--task-open-p m)
+            (agent-shell-workflow-github--set-todo
+             m (or (agent-shell-workflow-github--open-keyword) ""))
+            (org-with-point-at m (org-entry-delete nil "CLOSED"))))
+        (when (eq (car act) 'fix-ci)
+          (agent-shell-workflow-github--sync-ci-action m pr (cddr act)))
+        (unless hit (set-marker m nil))))
+    (dolist (e existing)
+      (when (and (not (assq (intern (car e)) wanted))
+                 (agent-shell-workflow-github--task-open-p (cdr e)))
+        (agent-shell-workflow-github--close-task (cdr e))))
+    (dolist (e existing) (set-marker (cdr e) nil))))
+
+(defun agent-shell-workflow-github--record-preflight (file repo number fp ok detail)
+  "Record a finished fix-ci preflight for REPO#NUMBER in FILE.
+FP is the check fingerprint the run was started for.  On success (OK),
+DETAIL is the fix-ci context plist; its artifact directory and triage index
+are linked, the fetch time stored, and STALE cleared when FP is still
+current.  On failure DETAIL is the error text, stored as PREFLIGHT_ERROR."
+  (agent-shell-workflow-github--edit-file
+   file
+   (lambda ()
+     (when-let* ((parent (cdr (assoc (cons repo (format "%s" number))
+                                     (agent-shell-workflow-github--task-entries))))
+                 (child (cdr (assoc "fix-ci"
+                                    (agent-shell-workflow-github--action-children
+                                     parent)))))
+       (if (not ok)
+           (agent-shell-workflow-github--set-prop "PREFLIGHT_ERROR" detail child)
+         (let* ((root (file-name-as-directory
+                       (expand-file-name
+                        (plist-get (cdr (assoc repo agent-shell-workflow-pr-status-ci-preflight))
+                                   :dir))))
+                (dir (expand-file-name (plist-get detail :ci-dir) root))
+                (index (expand-file-name (plist-get detail :ci-index-file) root)))
+           (org-with-point-at child (org-entry-delete nil "PREFLIGHT_ERROR"))
+           (agent-shell-workflow-github--set-prop
+            "LOGS_FETCHED" (format-time-string "[%F %a %R]") child)
+           (agent-shell-workflow-github--set-prop "LOGS_FINGERPRINT" fp child)
+           (agent-shell-workflow-github--set-body-line
+            child "Logs"
+            (format "[[file:%s][%s]], [[file:%s][triage index]]"
+                    dir (abbreviate-file-name dir) index))
+           (when (equal fp (org-with-point-at child
+                             (org-entry-get nil "CI_FINGERPRINT")))
+             (org-with-point-at child (org-entry-delete nil "STALE")))))))))
+
+(defun agent-shell-workflow-github--start-preflight (file request)
+  "Run the fix-ci workflow pre-op for REQUEST, recording the result into FILE.
+REQUEST is (REPO NUMBER FP RUN-ID BRANCH).  The pre-op downloads the failed
+logs, jobs metadata and triage index asynchronously.  Does nothing when one
+is already running for that PR or none is configured."
+  (pcase-let* ((`(,repo ,number ,fp ,run-id ,branch) request)
+               (cfg (cdr (assoc repo agent-shell-workflow-pr-status-ci-preflight)))
+               (key (format "%s#%s" repo number)))
+    (when (and cfg (not (gethash key agent-shell-workflow-github--preflight-procs)))
+      (puthash key t agent-shell-workflow-github--preflight-procs)
+      (let ((done (lambda (ok detail)
+                    (remhash key agent-shell-workflow-github--preflight-procs)
+                    (condition-case err
+                        (agent-shell-workflow-github--record-preflight
+                         file repo number fp ok detail)
+                      (error (message "pr-status-sync: preflight for %s not recorded: %s"
+                                      key (error-message-string err)))))))
+        (condition-case err
+            (agent-shell-workflow-library--fix-ci-pre-op
+             (list :args (list :repo repo :branch branch :run-id (string-to-number run-id)
+                               :root (plist-get cfg :dir)))
+             (lambda (ctx) (funcall done t ctx)))
+          (error (funcall done nil (agent-shell-workflow-github--line
+                                    (error-message-string err)))))))))
+
+(defun agent-shell-workflow-github--start-preflights (file)
+  "Start every preflight queued by the sync that just wrote FILE."
+  (dolist (req (nreverse (delete-dups agent-shell-workflow-github--preflight-requests)))
+    (agent-shell-workflow-github--start-preflight file req))
+  (setq agent-shell-workflow-github--preflight-requests nil))
+
 (defun agent-shell-workflow-github--update-task (marker pr)
   "Update STEP and LAST_SEEN (and the heading on step change) of PR at MARKER.
 A task in a done state is reopened since PR is present (open)."
@@ -799,17 +1092,15 @@ A task in a done state is reopened since PR is present (open)."
         (state (org-with-point-at marker (org-get-todo-state))))
     (unless (equal step (org-with-point-at marker (org-entry-get nil "STEP")))
       (agent-shell-workflow-github--set-prop "STEP" step marker)
-      (org-with-point-at marker
-        (org-back-to-heading t)
-        (when (looking-at org-complex-heading-regexp)
-          (replace-match (agent-shell-workflow-github--pr-heading-text pr)
-                         t t nil 4))))
+      (agent-shell-workflow-github--set-heading-text
+       marker (agent-shell-workflow-github--pr-heading-text pr)))
     (when (and state (member state org-done-keywords))
       (agent-shell-workflow-github--set-todo
        marker (or (agent-shell-workflow-github--open-keyword) "")))
     (agent-shell-workflow-github--set-prop
      "LAST_SEEN"
-     (agent-shell-workflow-github--pr-field pr :last-seen) marker)))
+     (agent-shell-workflow-github--pr-field pr :last-seen) marker)
+    (agent-shell-workflow-github--sync-actions marker pr)))
 
 (defun agent-shell-workflow-github--close-task (marker)
   "Mark the task at MARKER DONE and set CLOSED, without prompts or logging."
@@ -819,6 +1110,14 @@ A task in a done state is reopened since PR is present (open)."
     (org-back-to-heading t)
     (unless (org-entry-get nil "CLOSED")
       (org-add-planning-info 'closed (org-current-effective-time)))))
+
+(defun agent-shell-workflow-github--close-with-actions (marker)
+  "Close the PR task at MARKER and every open action item under it."
+  (dolist (c (agent-shell-workflow-github--action-children marker))
+    (when (agent-shell-workflow-github--task-open-p (cdr c))
+      (agent-shell-workflow-github--close-task (cdr c)))
+    (set-marker (cdr c) nil))
+  (agent-shell-workflow-github--close-task marker))
 
 (defun agent-shell-workflow-github--close-allowed-p (prs)
   "Return non-nil when PRS is complete enough to close vanished tasks.
@@ -844,26 +1143,16 @@ An empty or truncated (>= max-prs) list is never trusted."
     (when (agent-shell-workflow-github--close-allowed-p prs)
       (dolist (e entries)
         (unless (member (car e) seen)
-          (let ((state (org-with-point-at (cdr e) (org-get-todo-state))))
-            (when (if state
-                      (member state org-not-done-keywords)
-                    (null org-not-done-keywords))
-              (agent-shell-workflow-github--close-task (cdr e)))))))
+          (when (agent-shell-workflow-github--task-open-p (cdr e))
+            (agent-shell-workflow-github--close-with-actions (cdr e))))))
     (dolist (e entries) (set-marker (cdr e) nil))))
 
-(defun agent-shell-workflow-github-pr-sync (prs &optional file)
-  "Non-destructively sync the PR status Org FILE with PRS.
-PRS are PR plists carrying a `:tracking' plist (see
-`magit-dash-gh-pr-attach-tracking').  FILE defaults to
-`agent-shell-workflow-pr-status-file'.  Only the Summary body is
-rewritten; existing task entries are matched by their REPO and PR
-properties and get only STEP/LAST_SEEN (and heading on step change)
-updated.  PRs no longer open are marked DONE only when PRS is
-non-empty and below `magit-dash-gh-pr-status-max-prs' (an empty or
-truncated list is not trusted).  A symlinked FILE stays a symlink.
-Signals an error when a buffer visiting FILE has unsaved changes.
-Return FILE."
-  (let* ((file (expand-file-name (or file agent-shell-workflow-pr-status-file)))
+(defun agent-shell-workflow-github--edit-file (file fn)
+  "Call FN in an Org buffer holding FILE's content, then write the result back.
+FILE is written atomically, a symlink is preserved, and a buffer visiting
+FILE is reverted afterwards.  Signals an error when a buffer visiting FILE
+has unsaved changes.  Return FILE."
+  (let* ((file (expand-file-name file))
          (target (file-truename file))
          (visiting (or (find-buffer-visiting file) (find-buffer-visiting target)))
          (dir (file-name-directory target))
@@ -880,7 +1169,7 @@ Return FILE."
         (delay-mode-hooks (org-mode))
         (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
                   ((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
-          (agent-shell-workflow-github--sync-buffer prs))
+          (funcall fn))
         (setq content (buffer-string))))
     (setq tmp (make-temp-file (expand-file-name ".pr-status-" dir)))
     (unwind-protect
@@ -895,6 +1184,28 @@ Return FILE."
       (with-current-buffer visiting
         (let ((inhibit-read-only t))
           (revert-buffer t t t))))
+    file))
+
+(defun agent-shell-workflow-github-pr-sync (prs &optional file)
+  "Non-destructively sync the PR status Org FILE with PRS.
+PRS are PR plists carrying a `:tracking' plist (see
+`magit-dash-gh-pr-attach-tracking').  FILE defaults to
+`agent-shell-workflow-pr-status-file'.  Only the Summary body is
+rewritten; existing task entries are matched by their REPO and PR
+properties and get STEP/LAST_SEEN (and heading on step change)
+updated, plus one action item child per outstanding activity (see
+`agent-shell-workflow-github--pr-actions').  PRs no longer open are
+marked DONE, with their actions, only when PRS is non-empty and below
+`magit-dash-gh-pr-status-max-prs' (an empty or truncated list is not
+trusted).  CI log preflights requested by new or stale fix-ci actions
+are started once FILE is written.  A symlinked FILE stays a symlink.
+Signals an error when a buffer visiting FILE has unsaved changes.
+Return FILE."
+  (let* ((file (expand-file-name (or file agent-shell-workflow-pr-status-file)))
+         (agent-shell-workflow-github--preflight-requests nil))
+    (agent-shell-workflow-github--edit-file
+     file (lambda () (agent-shell-workflow-github--sync-buffer prs)))
+    (agent-shell-workflow-github--start-preflights file)
     file))
 
 (defun agent-shell-workflow-github--delta-lines (prs)
@@ -986,9 +1297,9 @@ fingerprint are only staged in CTX; `:after-handoff' commits them."
 
 ## Instructions:
 For each changed PR above, add a short triage note (one or two lines: what changed, what to do next) using the orgx MCP tools:
-- `org_heading_append_note` with match_property \"PR\" and match_value the PR number.
+- `org_heading_append_note` with match_property \"PR\" and match_value the PR number. Omit `target_section`; append to the PR task itself.
 - `org_heading_set_property` (same match_property/match_value) only if a property needs correcting.
-Keep your output brief."
+Each PR task already has one action item child per activity (fix tests, find reviews, respond to threads, and so on) and the sync owns them; do not add, remove or re-state them. Keep your output brief."
   :submit t
   :target :session-reuse
   :clear t)

@@ -357,10 +357,10 @@ User note line.
                             :url title))
         (agent-shell-workflow-github-pr-sync (list pr) f)
         (let ((s (aswg-test/slurp f)))
-          ;; Summary, Tasks, the one task, its Notes child.
+          ;; Summary, Tasks, the one task, its single review action.
           (should (= 4 (aswg-test/count s "^\\*+ ")))
-          (should (= 1 (aswg-test/count s "^:PROPERTIES:$")))
-          (should (= 1 (aswg-test/count s "^:END:$")))
+          (should (= 2 (aswg-test/count s "^:PROPERTIES:$")))
+          (should (= 2 (aswg-test/count s "^:END:$")))
           (should (= 0 (aswg-test/count s "^#\\+begin")))
           (should (= 1 (length (aswg-test/states f)))))))))
 
@@ -519,3 +519,157 @@ User note line.
       (should (equal calls '((pr-status-sync)))))))
 
 (provide 'test-agent-shell-workflow-github)
+
+;;; Action items and CI preflight
+
+(defun aswg-test/pr* (num &rest kw)
+  "Like `aswg-test/pr' but KW plist keys (other than :repo :bucket :action) are set on the PR."
+  (let ((pr (aswg-test/pr num :repo (plist-get kw :repo) :bucket (plist-get kw :bucket)
+                          :action (plist-get kw :action)))
+        (rest kw))
+    (while rest
+      (unless (memq (car rest) '(:repo :bucket :action))
+        (setq pr (plist-put pr (car rest) (cadr rest))))
+      (setq rest (cddr rest)))
+    pr))
+
+(ert-deftest aswg-test/no-notes-heading-created ()
+  (aswg-test/with-file f nil
+    (agent-shell-workflow-github-pr-sync (list (aswg-test/pr 7)) f)
+    (should-not (string-match-p "Notes and In-Flight" (aswg-test/slurp f)))))
+
+(ert-deftest aswg-test/one-action-per-activity ()
+  (aswg-test/with-file f nil
+    (agent-shell-workflow-github-pr-sync
+     (list (aswg-test/pr* 7 :bucket 'fix-ci :approvals 0 :threads-open 2
+                          :changes-requested 1 :merge-state "DIRTY" :base "main"
+                          :failing '(("Tests" . "https://ci/1") ("koalaty" . "https://ci/2"))
+                          :draft t))
+     f)
+    (let ((s (aswg-test/slurp f)))
+      (dolist (h '("fix failing tests: Tests" "raise koalaty rating"
+                   "fix merge conflicts with main" "respond to 2 open review threads"
+                   "address changes requested by 1 reviewer" "find 1 more review"
+                   "mark ready for review"))
+        (should (string-match-p (format "^\\*\\*\\* TODO %s$" (regexp-quote h)) s)))
+      (should (string-match-p "- Failing: \\[\\[https://ci/1\\]\\[Tests\\]\\]" s))
+      (should (string-match-p "- Prompt: fix-ci workflow, repo o/r" s))
+      ;; Action items carry no PR property, so they are never mistaken for PR tasks.
+      (should (= 1 (aswg-test/count s "^:PR: ")))
+      (should (= 7 (aswg-test/count s "^:ACTION: "))))))
+
+(ert-deftest aswg-test/resolved-actions-close-and-reopen ()
+  (aswg-test/with-file f nil
+    (let ((bad (aswg-test/pr* 7 :threads-open 1 :approvals 1 :required 1))
+          (good (aswg-test/pr* 7 :approvals 1 :required 1)))
+      (agent-shell-workflow-github-pr-sync (list bad) f)
+      (should (string-match-p "^\\*\\*\\* TODO respond to 1 open review thread$" (aswg-test/slurp f)))
+      (agent-shell-workflow-github-pr-sync (list good) f)
+      (should (string-match-p "^\\*\\*\\* DONE respond to 1 open review thread$" (aswg-test/slurp f)))
+      (agent-shell-workflow-github-pr-sync (list bad) f)
+      (let ((s (aswg-test/slurp f)))
+        (should (string-match-p "^\\*\\*\\* TODO respond to 1 open review thread$" s))
+        (should (= 1 (aswg-test/count s "^\\*\\*\\* .*respond to"))))
+      (agent-shell-workflow-github-pr-sync (list (aswg-test/pr 99)) f)
+      (should (string-match-p "^\\*\\*\\* DONE respond to" (aswg-test/slurp f))))))
+
+(ert-deftest aswg-test/actions-do-not-break-sibling-tasks ()
+  (aswg-test/with-file f nil
+    (let ((prs (list (aswg-test/pr* 1 :threads-open 1) (aswg-test/pr* 2 :threads-open 3))))
+      (agent-shell-workflow-github-pr-sync prs f)
+      (agent-shell-workflow-github-pr-sync prs f)
+      (let ((s (aswg-test/slurp f)))
+        (should (string-match-p "^\\*\\* TODO 2: " s))
+        (should (= 2 (aswg-test/count s "^\\*\\*\\* TODO respond to")))
+        (should (= 2 (aswg-test/count s "^:REPO: ")))))))
+
+(ert-deftest aswg-test/ci-fingerprint-change-marks-stale ()
+  (aswg-test/with-file f nil
+    (let ((agent-shell-workflow-pr-status-ci-preflight nil))
+      (agent-shell-workflow-github-pr-sync
+       (list (aswg-test/pr* 7 :failing '(("Tests" . "https://ci/1")))) f)
+      ;; Pretend logs were fetched for the current failure.
+      (let ((fp (agent-shell-workflow-github--ci-fingerprint '(("Tests" . "https://ci/1")))))
+        (agent-shell-workflow-github--edit-file
+         f (lambda ()
+             (goto-char (point-min)) (re-search-forward "^:ACTION: fix-ci")
+             (org-entry-put nil "LOGS_FETCHED" "[2026-11-12 Thu 10:00]")
+             (org-entry-put nil "LOGS_FINGERPRINT" fp))))
+      (agent-shell-workflow-github-pr-sync
+       (list (aswg-test/pr* 7 :failing '(("Tests" . "https://ci/1")))) f)
+      (should-not (string-match-p ":STALE:" (aswg-test/slurp f)))
+      (agent-shell-workflow-github-pr-sync
+       (list (aswg-test/pr* 7 :failing '(("Tests" . "https://ci/2")))) f)
+      (should (string-match-p ":STALE: +t" (aswg-test/slurp f)))
+      (should (string-match-p "\\[\\[https://ci/2\\]\\[Tests\\]\\]" (aswg-test/slurp f))))))
+
+(defconst aswg-test/run-url "https://github.com/o/r/actions/runs/555/job/9")
+
+(ert-deftest aswg-test/preflight-uses-fix-ci-workflow-and-clears-stale ()
+  (aswg-test/with-file f nil
+    (let* ((calls nil)
+           (agent-shell-workflow-pr-status-ci-preflight '(("o/r" :dir "/tmp/aswg-checkout")))
+           (agent-shell-workflow-github--preflight-procs (make-hash-table :test #'equal))
+           (pr (aswg-test/pr* 7 :branch "feat" :failing `(("Tests" . ,aswg-test/run-url)))))
+      (cl-letf (((symbol-function 'agent-shell-workflow-library--fix-ci-pre-op)
+                 (lambda (ctx &optional callback)
+                   (push ctx calls)
+                   (funcall callback
+                            (list :ci-dir ".agent/fix-ci/run-555"
+                                  :ci-index-file ".agent/fix-ci/run-555/ci-triage-index.md")))))
+        (agent-shell-workflow-github-pr-sync (list pr) f))
+      (let ((args (plist-get (car calls) :args)))
+        (should (equal (plist-get args :repo) "o/r"))
+        (should (equal (plist-get args :run-id) 555))
+        (should (equal (plist-get args :root) "/tmp/aswg-checkout")))
+      (should (= 0 (hash-table-count agent-shell-workflow-github--preflight-procs)))
+      (let ((s (aswg-test/slurp f)))
+        (should (string-match-p ":RUN_ID: +555" s))
+        (should (string-match-p ":LOGS_FETCHED: +\\[" s))
+        (should (string-match-p "^- Logs: \\[\\[file:/tmp/aswg-checkout/.agent/fix-ci/run-555" s))
+        (should (string-match-p "^- Prompt: fix-ci workflow, repo o/r, run 555" s))
+        (should-not (string-match-p ":STALE:" s)))
+      ;; Unchanged failure: no second fetch.
+      (cl-letf (((symbol-function 'agent-shell-workflow-library--fix-ci-pre-op)
+                 (lambda (&rest _) (ert-fail "refetched"))))
+        (agent-shell-workflow-github-pr-sync (list pr) f)))))
+
+(ert-deftest aswg-test/preflight-refetches-when-stale ()
+  (aswg-test/with-file f nil
+    (let* ((n 0)
+           (agent-shell-workflow-pr-status-ci-preflight '(("o/r" :dir "/tmp/aswg-checkout")))
+           (agent-shell-workflow-github--preflight-procs (make-hash-table :test #'equal)))
+      (cl-letf (((symbol-function 'agent-shell-workflow-library--fix-ci-pre-op)
+                 (lambda (_ctx &optional callback)
+                   (cl-incf n)
+                   (funcall callback (list :ci-dir "d" :ci-index-file "i")))))
+        (agent-shell-workflow-github-pr-sync
+         (list (aswg-test/pr* 7 :failing `(("Tests" . ,aswg-test/run-url)))) f)
+        (agent-shell-workflow-github-pr-sync
+         (list (aswg-test/pr* 7 :failing '(("Tests" . "https://github.com/o/r/actions/runs/777/job/1"))))
+         f))
+      (should (= n 2))
+      (let ((s (aswg-test/slurp f)))
+        (should (string-match-p ":RUN_ID: +777" s))
+        (should-not (string-match-p ":STALE:" s))))))
+
+(ert-deftest aswg-test/preflight-failure-recorded ()
+  (aswg-test/with-file f nil
+    (let ((agent-shell-workflow-pr-status-ci-preflight '(("o/r" :dir "/tmp/aswg-checkout")))
+          (agent-shell-workflow-github--preflight-procs (make-hash-table :test #'equal)))
+      (cl-letf (((symbol-function 'agent-shell-workflow-library--fix-ci-pre-op)
+                 (lambda (&rest _) (error "gh exploded"))))
+        (agent-shell-workflow-github-pr-sync
+         (list (aswg-test/pr* 7 :failing `(("Tests" . ,aswg-test/run-url)))) f))
+      (should (= 0 (hash-table-count agent-shell-workflow-github--preflight-procs)))
+      (let ((s (aswg-test/slurp f)))
+        (should (string-match-p ":PREFLIGHT_ERROR: gh exploded" s))
+        (should-not (string-match-p ":LOGS_FETCHED:" s))))))
+
+(ert-deftest aswg-test/preflight-skipped-without-run-id ()
+  (aswg-test/with-file f nil
+    (let ((agent-shell-workflow-pr-status-ci-preflight '(("o/r" :dir "/tmp/aswg-checkout"))))
+      (cl-letf (((symbol-function 'agent-shell-workflow-library--fix-ci-pre-op)
+                 (lambda (&rest _) (ert-fail "should not run"))))
+        (agent-shell-workflow-github-pr-sync
+         (list (aswg-test/pr* 7 :failing '(("Tests" . "https://ci/1")))) f)))))
