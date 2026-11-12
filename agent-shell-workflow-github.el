@@ -654,7 +654,8 @@ Control characters (including newlines) collapse to single spaces."
      (replace-regexp-in-string "[ \t]+:[[:alnum:]_@#%:]+:\\'" "" text))))
 
 (defun agent-shell-workflow-github--body-line (value)
-  "Return VALUE as a safe Org list item line (no trailing newline), or nil if empty."
+  "Return VALUE as a safe Org list item line, or nil if empty.
+The line has no trailing newline."
   (let ((l (agent-shell-workflow-github--line value)))
     (unless (string-empty-p l) (concat "- " l))))
 
