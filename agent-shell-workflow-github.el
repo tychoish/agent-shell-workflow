@@ -74,21 +74,70 @@
                 (t (format "%dd ago" (/ diff 86400)))))
       "n/a")))
 
-(defun agent-shell-workflow-library--resolve-repo-slug (repo)
+(defun agent-shell-workflow-library--owner-repo-from-url (url)
+  "Extract \"OWNER/REPO\" string from a git remote URL."
+  (when (stringp url)
+    (let ((clean (replace-regexp-in-string "\\.git\\'" "" (string-trim url))))
+      (cond
+       ((string-match "github\\.com[:/]\\([^/]+\\)/\\([^/]+\\)\\'" clean)
+        (format "%s/%s" (match-string 1 clean) (match-string 2 clean)))
+       ((string-match "\\`\\([^/]+\\)/\\([^/]+\\)\\'" clean)
+        (format "%s/%s" (match-string 1 clean) (match-string 2 clean)))))))
+
+(defun agent-shell-workflow-library--resolve-repo-slug (&optional repo)
   "Resolve REPO name or path to an OWNER/NAME GitHub repository slug string."
-  (if (and (stringp repo) (string-match-p "/" repo))
-      repo
-    (or (ignore-errors
-          (let ((slug (string-trim (shell-command-to-string "gh repo view --json nameWithOwner --jq .nameWithOwner"))))
-            (unless (or (string-empty-p slug) (string-match-p "^error" slug))
-              slug)))
-        (ignore-errors
-          (and (fboundp 'magit-dash-gh--repo-info)
-               (when-let* ((info (magit-dash-gh--repo-info))
-                           (o (plist-get info :owner))
-                           (r (plist-get info :repo)))
-                 (format "%s/%s" o r))))
-        repo)))
+  (let* ((dir (cond ((and (stringp repo) (file-directory-p repo))
+                     (file-name-as-directory (expand-file-name repo)))
+                    (t default-directory)))
+         (default-directory dir)
+         (cur-repo-name (file-name-nondirectory (directory-file-name default-directory)))
+         (matching-dir-p (or (null repo)
+                             (and (stringp repo)
+                                  (or (file-directory-p repo)
+                                      (equal repo cur-repo-name))))))
+    (cond
+     ;; Valid OWNER/NAME slug directly provided (and not a local path)
+     ((and (stringp repo)
+           (not (file-directory-p repo))
+           (string-match-p "\\`[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+\\'" repo))
+      repo)
+     ;; Git URL directly provided
+     ((and (stringp repo)
+           (agent-shell-workflow-library--owner-repo-from-url repo)))
+     ;; Registered magit-dash repo by name if available
+     ((and (stringp repo) (boundp 'magit-dash-repo-list)
+           (when-let* ((r (seq-find (lambda (it)
+                                      (equal (magit-dash-repo-name it) repo))
+                                    magit-dash-repo-list))
+                       (raw (or (and (fboundp 'magit-dash-repo-repo) (magit-dash-repo-repo r))
+                                (and (fboundp 'magit-dash-repo-clone-url) (magit-dash-repo-clone-url r))
+                                (and (fboundp 'magit-dash-repo-upstream-repo) (magit-dash-repo-upstream-repo r))))
+                       (slug (agent-shell-workflow-library--owner-repo-from-url raw)))
+             slug)))
+     ;; Local git remotes: origin or pushdefault (primary for current directory / matching repo)
+     ((and matching-dir-p
+           (let ((slug (agent-shell-workflow-library--owner-repo-from-url
+                        (or (ignore-errors (magit-get "remote" "origin" "url"))
+                            (ignore-errors (magit-get "remote" "pushdefault" "url"))))))
+             (and slug (not (string-empty-p slug)) slug))))
+     ;; gh repo view fallback
+     ((ignore-errors
+        (let ((slug (string-trim (shell-command-to-string "gh repo view --json nameWithOwner --jq .nameWithOwner"))))
+          (unless (or (string-empty-p slug) (string-match-p "^error" slug))
+            slug))))
+     ;; magit-dash repo-info if loaded
+     ((ignore-errors
+        (and (fboundp 'magit-dash-gh--repo-info)
+             (when-let* ((info (magit-dash-gh--repo-info))
+                         (o (plist-get info :owner))
+                         (r (plist-get info :repo)))
+               (format "%s/%s" o r)))))
+     ;; Upstream remote as last resort
+     ((and matching-dir-p
+           (let ((slug (agent-shell-workflow-library--owner-repo-from-url
+                        (ignore-errors (magit-get "remote" "upstream" "url")))))
+             (and slug (not (string-empty-p slug)) slug))))
+     (t repo))))
 
 (defun agent-shell-workflow-library--fetch-runs (repo &optional limit)
   "Fetch recent GitHub Actions run records for REPO as a list of alists.
@@ -111,51 +160,74 @@ Optional LIMIT sets maximum runs to fetch (defaults to 20)."
 
 (defun agent-shell-workflow-library--resolve-ci-run (repo &optional target-branch)
   "Return a run-id for REPO and TARGET-BRANCH.
+If a run matching the local HEAD commit is failing, return its run-id.
 If the latest run on TARGET-BRANCH is failing, return its run-id
 automatically.  Otherwise, prompt the user with an ACR picker showing
 recent runs."
   (let* ((branch (or target-branch (agent-shell-workflow-library--current-branch)))
+         (head-sha (ignore-errors
+                     (let ((sha (agent-shell-workflow-library--git-output "rev-parse" "HEAD")))
+                       (unless (string-empty-p sha) sha))))
          (runs (agent-shell-workflow-library--fetch-runs repo 20))
+         (sha-run (when head-sha
+                    (seq-find (lambda (r)
+                                (let ((r-sha (map-elt r 'headSha)))
+                                  (and (stringp r-sha)
+                                       (or (string-prefix-p r-sha head-sha)
+                                           (string-prefix-p head-sha r-sha)))))
+                              runs)))
+         (sha-conclusion (and sha-run (or (map-elt sha-run 'conclusion) (map-elt sha-run 'status))))
+         (sha-failing-p (and sha-run
+                             (member sha-conclusion '("failure" "cancelled" "timed_out" "action_required"))))
          (branch-runs (seq-filter (lambda (r) (equal (map-elt r 'headBranch) branch)) runs))
          (target-runs (or branch-runs runs))
          (latest (car target-runs))
          (latest-conclusion (and latest (or (map-elt latest 'conclusion) (map-elt latest 'status))))
          (latest-failing-p (and latest
                                 (member latest-conclusion '("failure" "cancelled" "timed_out" "action_required")))))
-    (if latest-failing-p
-        (map-elt latest 'databaseId)
-      (if (null target-runs)
-          (user-error "No CI runs found for %s" repo)
-        (let* ((items (mapcar
-                       (lambda (r)
-                         (let* ((id (map-elt r 'databaseId))
-                                (title (map-elt r 'displayTitle))
-                                (sha (map-elt r 'headSha))
-                                (short-sha (if (and (stringp sha) (>= (length sha) 7))
-                                               (substring sha 0 7)
-                                             (or sha "")))
-                                (b (map-elt r 'headBranch))
-                                (status (map-elt r 'status))
-                                (conclusion (or (map-elt r 'conclusion) status))
-                                (dur (agent-shell-workflow-library--format-duration
-                                      (map-elt r 'startedAt) (map-elt r 'updatedAt)))
-                                (ago (agent-shell-workflow-library--format-time-ago
-                                      (or (map-elt r 'updatedAt) (map-elt r 'createdAt))))
-                                (cand (format "#%s %s (%s) [%s]" id title short-sha b))
-                                (ann (format "%s | %s | %s" conclusion dur ago)))
-                           (list cand id ann)))
-                       target-runs))
-               (table (mapcar (lambda (item) (cons (nth 0 item) (nth 2 item))) items))
-               (selected (if (fboundp 'annotated-completing-read)
-                             (annotated-completing-read table
-                                                        :prompt "Select CI Run: "
-                                                        :require-match t
-                                                        :history 'agent-shell-workflow-ci-run-history)
-                           (completing-read "Select CI Run: " table nil t)))
-               (match (assoc selected items)))
-          (if match
-              (nth 1 match)
-            (user-error "No CI run selected")))))))
+    (cond
+     (sha-failing-p
+      (map-elt sha-run 'databaseId))
+     (latest-failing-p
+      (map-elt latest 'databaseId))
+     ((null target-runs)
+      (user-error "No CI runs found for %s" repo))
+     (t
+      (let* ((items (mapcar
+                     (lambda (r)
+                       (let* ((id (map-elt r 'databaseId))
+                              (title (map-elt r 'displayTitle))
+                              (sha (map-elt r 'headSha))
+                              (short-sha (if (and (stringp sha) (>= (length sha) 7))
+                                             (substring sha 0 7)
+                                           (or sha "")))
+                              (b (map-elt r 'headBranch))
+                              (status (map-elt r 'status))
+                              (conclusion (or (map-elt r 'conclusion) status))
+                              (dur (agent-shell-workflow-library--format-duration
+                                    (map-elt r 'startedAt) (map-elt r 'updatedAt)))
+                              (ago (agent-shell-workflow-library--format-time-ago
+                                    (or (map-elt r 'updatedAt) (map-elt r 'createdAt))))
+                              (is-head (and head-sha sha
+                                            (or (string-prefix-p sha head-sha)
+                                                (string-prefix-p head-sha sha))))
+                              (cand (format "#%s %s (%s) [%s]%s"
+                                            id title short-sha b
+                                            (if is-head " [HEAD]" "")))
+                              (ann (format "%s | %s | %s" conclusion dur ago)))
+                         (list cand id ann)))
+                     target-runs))
+             (table (mapcar (lambda (item) (cons (nth 0 item) (nth 2 item))) items))
+             (selected (if (fboundp 'annotated-completing-read)
+                           (annotated-completing-read table
+                                                      :prompt "Select CI Run: "
+                                                      :require-match t
+                                                      :history 'agent-shell-workflow-ci-run-history)
+                         (completing-read "Select CI Run: " table nil t)))
+             (match (assoc selected items)))
+        (if match
+            (nth 1 match)
+          (user-error "No CI run selected")))))))
 
 ;; Artifact directories and review comment formatting
 (defvar agent-shell-workflow-library-max-branch-length 30
@@ -323,15 +395,22 @@ or attempts.  ARGS may carry :root, the checkout to use instead of the
 project root of `default-directory'.  When CALLBACK is given, executes
 asynchronously."
   (let* ((args (plist-get ctx :args))
+         (root (if-let* ((r (plist-get args :root)))
+                   (file-name-as-directory (expand-file-name r))
+                 (agent-shell-workflow-library--project-root)))
+         (default-directory (or root default-directory))
          (raw-repo (or (plist-get args :repo)
                        (ignore-errors
                          (and (fboundp 'magit-dash--repo-at-point)
                               (when-let* ((r (magit-dash--repo-at-point)))
-                                (magit-dash-repo-name r))))
-                       (ignore-errors
-                         (let ((slug (string-trim (shell-command-to-string "gh repo view --json nameWithOwner --jq .nameWithOwner"))))
-                           (unless (or (string-empty-p slug) (string-match-p "^error" slug))
-                             slug)))
+                                (or (and (fboundp 'magit-dash-ci--repo-slug)
+                                         (magit-dash-ci--repo-slug r))
+                                    (and (fboundp 'magit-dash-repo-repo)
+                                         (magit-dash-repo-repo r))
+                                    (and (fboundp 'magit-dash-repo-clone-url)
+                                         (magit-dash-repo-clone-url r))
+                                    (magit-dash-repo-name r)))))
+                       (agent-shell-workflow-library--resolve-repo-slug)
                        (user-error "No repository specified for fix-ci")))
          (repo-slug (agent-shell-workflow-library--resolve-repo-slug raw-repo))
          (target-branch (or (plist-get args :branch)
@@ -445,15 +524,22 @@ under <project-root>/.agent/pr-comments/ so the agent can inspect them
 as files without colliding across PRs or review attempts.
 When CALLBACK is given, executes asynchronously."
   (let* ((args (plist-get ctx :args))
+         (root (if-let* ((r (plist-get args :root)))
+                   (file-name-as-directory (expand-file-name r))
+                 (agent-shell-workflow-library--project-root)))
+         (default-directory (or root default-directory))
          (raw-repo (or (plist-get args :repo)
                        (ignore-errors
                          (and (fboundp 'magit-dash--repo-at-point)
                               (when-let* ((r (magit-dash--repo-at-point)))
-                                (magit-dash-repo-name r))))
-                       (ignore-errors
-                         (let ((slug (string-trim (shell-command-to-string "gh repo view --json nameWithOwner --jq .nameWithOwner"))))
-                           (unless (or (string-empty-p slug) (string-match-p "^error" slug))
-                             slug)))))
+                                (or (and (fboundp 'magit-dash-ci--repo-slug)
+                                         (magit-dash-ci--repo-slug r))
+                                    (and (fboundp 'magit-dash-repo-repo)
+                                         (magit-dash-repo-repo r))
+                                    (and (fboundp 'magit-dash-repo-clone-url)
+                                         (magit-dash-repo-clone-url r))
+                                    (magit-dash-repo-name r)))))
+                       (agent-shell-workflow-library--resolve-repo-slug)))
          (repo-slug (when raw-repo (agent-shell-workflow-library--resolve-repo-slug raw-repo)))
          (pr-arg (plist-get args :pr-number))
          (pr-number (or (and pr-arg (if (numberp pr-arg) pr-arg (string-to-number (format "%s" pr-arg))))

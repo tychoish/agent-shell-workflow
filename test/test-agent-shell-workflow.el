@@ -590,6 +590,17 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
               ((symbol-function 'annotated-completing-read) (lambda (&rest _) (error "should not prompt"))))
       (should (= 34348785571 (agent-shell-workflow-library--resolve-ci-run "acme/x" "main"))))))
 
+(ert-deftest agent-shell-workflow/library-resolve-ci-run-prefers-head-commit-failure ()
+  "Auto-selects the failing run corresponding to the local HEAD commit even if a newer run exists on branch."
+  (let ((runs '(((databaseId . 999) (displayTitle . "newer run") (status . "completed") (conclusion . "success") (headBranch . "main") (headSha . "sha-newer"))
+                ((databaseId . 888) (displayTitle . "local commit run") (status . "completed") (conclusion . "failure") (headBranch . "main") (headSha . "sha-head-12345")))))
+    (cl-letf (((symbol-function 'agent-shell-workflow-library--fetch-runs) (lambda (&rest _) runs))
+              ((symbol-function 'agent-shell-workflow-library--current-branch) (lambda () "main"))
+              ((symbol-function 'agent-shell-workflow-library--git-output)
+               (lambda (&rest args) (if (equal args '("rev-parse" "HEAD")) "sha-head-12345" "")))
+              ((symbol-function 'annotated-completing-read) (lambda (&rest _) (error "should not prompt"))))
+      (should (= 888 (agent-shell-workflow-library--resolve-ci-run "acme/x" "main"))))))
+
 (ert-deftest agent-shell-workflow/library-resolve-ci-run-uses-acr-picker-when-not-failing ()
   "Presents an ACR picker when the latest run is not failing."
   (let ((runs '(((databaseId . 111) (displayTitle . "feat: test") (status . "completed") (conclusion . "success") (headBranch . "main") (headSha . "abc1234567") (startedAt . "2026-09-09T10:00:00Z") (updatedAt . "2026-09-09T10:02:00Z") (createdAt . "2026-09-09T10:00:00Z"))
@@ -1208,6 +1219,24 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 
 ;;; ─────────────────────────────────────────────────────────────
 ;;; Additional Coverage: Library Repo Slug Resolution and File Writing
+
+(ert-deftest agent-shell-workflow/library-owner-repo-from-url-test ()
+  "Tests parsing owner/repo slugs from various git remote URL formats."
+  (should (equal "owner/repo" (agent-shell-workflow-library--owner-repo-from-url "git@github.com:owner/repo.git")))
+  (should (equal "owner/repo" (agent-shell-workflow-library--owner-repo-from-url "https://github.com/owner/repo.git")))
+  (should (equal "owner/repo" (agent-shell-workflow-library--owner-repo-from-url "https://github.com/owner/repo")))
+  (should (equal "owner/repo" (agent-shell-workflow-library--owner-repo-from-url "owner/repo"))))
+
+(ert-deftest agent-shell-workflow/library-resolve-repo-slug-prefers-origin-remote ()
+  "Local git remote origin URL takes precedence over gh repo view."
+  (cl-letf (((symbol-function 'magit-get)
+             (lambda (&rest args)
+               (cond ((equal args '("remote" "origin" "url"))
+                      "git@github.com:myfork/myproject.git")
+                     (t nil))))
+            ((symbol-function 'shell-command-to-string)
+             (lambda (_) "upstream/myproject\n")))
+    (should (equal (agent-shell-workflow-library--resolve-repo-slug) "myfork/myproject"))))
 
 (ert-deftest agent-shell-workflow/library-resolve-repo-slug-test ()
   "agent-shell-workflow-library--resolve-repo-slug handles slashed names, gh cli, and magit-dash."
