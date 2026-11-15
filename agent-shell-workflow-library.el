@@ -100,9 +100,13 @@ Recent history:
 
 (defun agent-shell-workflow-library--create-commit-pre-op (ctx &optional callback)
   "Gather git status, diff against HEAD, and recent log history for CTX.
+Signals a `user-error' if there are no changes to commit.
 Uses Magit to gather state."
   (let* ((finish
           (lambda (status diff log)
+            (when (and (or (null status) (string-empty-p (string-trim status)) (equal status "(clean)"))
+                       (or (null diff) (string-empty-p (string-trim diff)) (equal diff "(no diff)")))
+              (user-error "No diff to commit: working tree is clean"))
             (let ((updated-ctx (copy-sequence ctx)))
               (setq updated-ctx (plist-put updated-ctx :git-status (if (string-empty-p status) "(clean)" status)))
               (setq updated-ctx (plist-put updated-ctx :git-diff (if (string-empty-p diff) "(no diff)" diff)))

@@ -774,6 +774,22 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
       (should (string-match-p "conventional commit" text))
       (should (string-match-p "Co-authored-by" text)))))
 
+(ert-deftest agent-shell-workflow/library-create-commit-pre-op-errors-when-clean ()
+  "create-commit pre-op signals user-error when diff and status are empty."
+  (cl-letf (((symbol-function 'agent-shell-workflow-library--git-output)
+             (lambda (&rest _) "")))
+    (should-error (agent-shell-workflow-library--create-commit-pre-op nil)
+                  :type 'user-error)))
+
+(ert-deftest agent-shell-workflow/library-create-commit-pre-op-allows-untracked ()
+  "create-commit pre-op succeeds when diff is empty but untracked files exist."
+  (cl-letf (((symbol-function 'agent-shell-workflow-library--git-output)
+             (lambda (&rest args)
+               (if (equal (car args) "status") "?? new-file.el\n" ""))))
+    (let ((ctx (agent-shell-workflow-library--create-commit-pre-op nil)))
+      (should (string-match-p "new-file\\.el" (plist-get ctx :git-status)))
+      (should (equal (plist-get ctx :git-diff) "(no diff)")))))
+
 ;;; ─────────────────────────────────────────────────────────────
 ;;; ACR menu
 
