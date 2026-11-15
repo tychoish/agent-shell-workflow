@@ -359,7 +359,10 @@ Called on turn completion; see `agent-shell-workflow-exec-post'.")
    nil
    :documentation
    "Non-nil to execute context-clearing slash command before dispatching prompt.
-Requires a clear operation defined for the target shell type/agent."))
+Requires a clear operation defined for the target shell type/agent.")
+  (variants
+   nil
+   :documentation "List of variant definitions for this workflow."))
 
 (defvar agent-shell-workflow-registry (make-hash-table :test #'eq)
   "Hash table of symbol id to `agent-shell-workflow-spec'.
@@ -377,31 +380,64 @@ Populate via `register-agent-shell-workflow'.")
   (require 'agent-shell-workflow-library nil t)
   (map-values agent-shell-workflow-registry))
 
-(cl-defun agent-shell-workflow-register (&key id doc category args pre-op template submit target post-op clear clear-before)
+(cl-defun agent-shell-workflow-register (&key id doc category args pre-op template submit target post-op clear clear-before variants)
   "Register a workflow spec built from ID, DOC, CATEGORY, ARGS, PRE-OP,
-TEMPLATE, SUBMIT, TARGET, POST-OP, and CLEAR (or CLEAR-BEFORE).
+TEMPLATE, SUBMIT, TARGET, POST-OP, CLEAR (or CLEAR-BEFORE), and VARIANTS.
 Re-registering an existing ID replaces the entry."
   (unless id
     (error "Agent-shell-workflow: `:id' is required"))
   (unless template
     (error "Agent-shell-workflow %s: `:template' is required" id))
-  (puthash id
-           (agent-shell-workflow-spec--make
-            :id id :doc doc :category (or category "General") :args args
-            :pre-op pre-op :template template :submit submit
-            :target (or target :ask) :post-op post-op
-            :clear (or clear clear-before))
-           agent-shell-workflow-registry))
+  (let ((spec (agent-shell-workflow-spec--make
+               :id id :doc doc :category (or category "General") :args args
+               :pre-op pre-op :template template :submit submit
+               :target (or target :ask) :post-op post-op
+               :clear (or clear clear-before)
+               :variants variants)))
+    (setf (map-elt agent-shell-workflow-registry id) spec)
+    (when variants
+      (dolist (var-spec variants)
+        (let* ((var-id (or (plist-get (cdr var-spec) :id)
+                           (intern (format "%s-%s" id (car var-spec)))))
+               (var-doc (or (plist-get (cdr var-spec) :doc)
+                            (format "%s (%s)" (or doc (symbol-name id)) (car var-spec))))
+               (var-tmpl (or (plist-get (cdr var-spec) :template)
+                             template))
+               (replaces (plist-get (cdr var-spec) :template-replace)))
+          (when replaces
+            (dolist (pair (if (consp (car-safe replaces)) replaces (list replaces)))
+              (setq var-tmpl (replace-regexp-in-string
+                              (regexp-quote (car pair))
+                              (cdr pair)
+                              var-tmpl t t))))
+          (agent-shell-workflow-register
+           :id var-id
+           :doc var-doc
+           :category (or (plist-get (cdr var-spec) :category) category)
+           :args (or (plist-get (cdr var-spec) :args) args)
+           :pre-op (or (plist-get (cdr var-spec) :pre-op) pre-op)
+           :template var-tmpl
+           :submit (if (plist-member (cdr var-spec) :submit)
+                       (plist-get (cdr var-spec) :submit)
+                     submit)
+           :target (or (plist-get (cdr var-spec) :target) target)
+           :post-op (or (plist-get (cdr var-spec) :post-op) post-op)
+           :clear (if (plist-member (cdr var-spec) :clear)
+                      (plist-get (cdr var-spec) :clear)
+                    (or clear clear-before))))))
+    spec))
 
 (defmacro register-agent-shell-workflow (id &rest keys)
   "Define and register a prompt workflow named ID.
 KEYS is a plist accepting the same keys as `agent-shell-workflow-register'
-\(:doc :category :args :pre-op :template :submit :target :post-op :clear :clear-before).
-:args is data (an arg-spec list), not code, and is quoted automatically."
+\(:doc :category :args :pre-op :template :submit :target :post-op :clear :clear-before :variants).
+:args and :variants are data, not code, and are quoted automatically."
   (declare (indent 1))
-  (let ((keys (if (plist-member keys :args)
-                  (plist-put (copy-sequence keys) :args (list 'quote (plist-get keys :args)))
-                keys)))
+  (let ((keys (copy-sequence keys)))
+    (when (plist-member keys :args)
+      (setq keys (plist-put keys :args (list 'quote (plist-get keys :args)))))
+    (when (plist-member keys :variants)
+      (setq keys (plist-put keys :variants (list 'quote (plist-get keys :variants)))))
     `(agent-shell-workflow-register :id ',id ,@keys)))
 
 ;; Argument collection

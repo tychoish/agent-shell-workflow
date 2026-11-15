@@ -150,21 +150,13 @@ Uses Magit to gather state."
 - Include a short body when the motivation is not self-explanatory.
 - Include a `Co-authored-by:` trailer identifying the AI assistant."
   :submit t
-  :target :session-reuse)
-
-(register-agent-shell-workflow create-commit-series
-  :doc "Organize uncommitted changes into a logical series of conventional commits"
-  :category "Git"
-  :args ((instructions :prompt "Additional instructions (optional): " :optional t))
-  :template "Inspect the uncommitted changes and create a logical series of commits.
-Group related changes, preserve existing work, and commit all changes.
-Use conventional commit style: `type(scope): imperative subject` (scope optional).
-Include a short body when the motivation is not self-explanatory and a
-`Co-authored-by:` trailer identifying the AI assistant in each commit.
-
-{{args.instructions}}"
-  :submit t
-  :target :session-reuse)
+  :target :session-reuse
+  :variants ((series
+              :id create-commit-series
+              :doc "Organize uncommitted changes into a logical series of conventional commits"
+              :template-replace
+              (("Create one git commit containing all uncommitted changes:"
+                . "Create a logical series of commits (or a single commit if changes are cohesive; inspect the changes and decide if a series or single commit is appropriate) containing all uncommitted changes:")))))
 
 (provide 'agent-shell-workflow-library)
 ;;; agent-shell-workflow-library.el ends here
