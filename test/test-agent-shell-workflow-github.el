@@ -149,12 +149,12 @@ User note line.
   `(let ((agent-shell-workflow-github--pr-status-fingerprint nil)
          (committed 0))
      ;; Load the real library first so the pre-op's `require' cannot clobber mocks.
-     (require 'magit-dash-gh-pr nil t)
-     (cl-letf (((symbol-function 'magit-dash-gh-pr-status-collect-all) ,collect)
-               ((symbol-function 'magit-dash-gh-pr-attach-tracking) #'identity)
-               ((symbol-function 'magit-dash-gh-pr-commit-tracking)
+     (require 'magit-dash-pr nil t)
+     (cl-letf (((symbol-function 'magit-dash-pr-status-collect-all) ,collect)
+               ((symbol-function 'magit-dash-pr-attach-tracking) #'identity)
+               ((symbol-function 'magit-dash-pr-commit-tracking)
                 (lambda (prs) (cl-incf committed) prs))
-               ((symbol-function 'magit-dash-gh-pr-tracking-fingerprint)
+               ((symbol-function 'magit-dash-pr-tracking-fingerprint)
                 (lambda (prs) (format "%S" (mapcar (lambda (p) (plist-get p :bucket)) prs)))))
        ,@body)))
 
@@ -317,7 +317,7 @@ User note line.
 
 ;;; Review-fix regression tests
 
-(defvar magit-dash-gh-pr-status-max-prs)
+(defvar magit-dash-pr-status-max-prs)
 
 (defun aswg-test/states (f)
   "Return ((PR . STATE) ...) for entries of file F."
@@ -328,10 +328,10 @@ User note line.
 
 (ert-deftest aswg-test/truncated-list-does-not-close ()
   (aswg-test/with-file f aswg-test/fixture
-    (let ((magit-dash-gh-pr-status-max-prs 1))
+    (let ((magit-dash-pr-status-max-prs 1))
       (agent-shell-workflow-github-pr-sync (list (aswg-test/pr 1)) f)
       (should (string-match-p "^\\*\\* TODO 2:" (aswg-test/slurp f))))
-    (let ((magit-dash-gh-pr-status-max-prs 2))
+    (let ((magit-dash-pr-status-max-prs 2))
       (agent-shell-workflow-github-pr-sync (list (aswg-test/pr 1)) f)
       (should (string-match-p "^\\*\\* DONE 2:" (aswg-test/slurp f))))))
 

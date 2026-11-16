@@ -693,12 +693,12 @@ Do NOT read all raw comment data into context at once. Review comments in `{{pr-
 (require 'subr-x)
 (require 'orgx nil t)
 
-(declare-function magit-dash-gh-pr-status-collect-all "magit-dash-gh-pr" (&optional dir))
-(declare-function magit-dash-gh-pr-attach-tracking "magit-dash-gh-pr" (pr))
-(declare-function magit-dash-gh-pr-commit-tracking "magit-dash-gh-pr" (prs))
-(declare-function magit-dash-gh-pr-tracking-fingerprint "magit-dash-gh-pr" (prs))
+(declare-function magit-dash-pr-status-collect-all "magit-dash-pr" (&optional dir))
+(declare-function magit-dash-pr-attach-tracking "magit-dash-pr" (pr))
+(declare-function magit-dash-pr-commit-tracking "magit-dash-pr" (prs))
+(declare-function magit-dash-pr-tracking-fingerprint "magit-dash-pr" (prs))
 (defvar org-directory)
-(defvar magit-dash-gh-pr-status-max-prs)
+(defvar magit-dash-pr-status-max-prs)
 
 (defcustom agent-shell-workflow-pr-status-file
   (expand-file-name "pr-review-status.org"
@@ -1210,7 +1210,7 @@ A task in a done state is reopened since PR is present (open)."
 An empty or truncated (>= max-prs) list is never trusted."
   (and prs
        (< (length prs)
-          (or (bound-and-true-p magit-dash-gh-pr-status-max-prs) 50))))
+          (or (bound-and-true-p magit-dash-pr-status-max-prs) 50))))
 
 (defun agent-shell-workflow-github--sync-buffer (prs)
   "Apply PRS to the current Org buffer."
@@ -1275,14 +1275,14 @@ has unsaved changes.  Return FILE."
 (defun agent-shell-workflow-github-pr-sync (prs &optional file)
   "Non-destructively sync the PR status Org FILE with PRS.
 PRS are PR plists carrying a `:tracking' plist (see
-`magit-dash-gh-pr-attach-tracking').  FILE defaults to
+`magit-dash-pr-attach-tracking').  FILE defaults to
 `agent-shell-workflow-pr-status-file'.  Only the Summary body is
 rewritten; existing task entries are matched by their REPO and PR
 properties and get STEP/LAST_SEEN (and heading on step change)
 updated, plus one action item child per outstanding activity (see
 `agent-shell-workflow-github--pr-actions').  PRs no longer open are
 marked DONE, with their actions, only when PRS is non-empty and below
-`magit-dash-gh-pr-status-max-prs' (an empty or truncated list is not
+`magit-dash-pr-status-max-prs' (an empty or truncated list is not
 trusted).  CI log preflights requested by new or stale fix-ci actions
 are started once FILE is written.  A symlinked FILE stays a symlink.
 Signals an error when a buffer visiting FILE has unsaved changes.
@@ -1324,7 +1324,7 @@ Return FILE."
   "Commit the PR tracking and fingerprint staged in CTX by the pre-op.
 Runs from `:after-handoff' once the turn has been handed off."
   (when-let* ((prs-cell (plist-member ctx :pr-status-pending-prs)))
-    (magit-dash-gh-pr-commit-tracking (cadr prs-cell))
+    (magit-dash-pr-commit-tracking (cadr prs-cell))
     (setq agent-shell-workflow-github--pr-status-fingerprint
           (plist-get ctx :pr-status-pending-fingerprint)
           agent-shell-workflow-github--pr-status-last-count
@@ -1336,21 +1336,21 @@ Skips the turn (via `agent-shell-workflow-skip') when collection fails,
 returns nothing after a previously non-empty sync, or the PR
 fingerprint is unchanged since the last sync.  Tracking and the
 fingerprint are only staged in CTX; `:after-handoff' commits them."
-  (require 'magit-dash-gh-pr nil t)
+  (require 'magit-dash-pr nil t)
   (let* ((collected
           (condition-case err
               (progn
-                (unless (fboundp 'magit-dash-gh-pr-status-collect-all)
+                (unless (fboundp 'magit-dash-pr-status-collect-all)
                   (error "magit-dash PR tracking is not available"))
-                (prog1 (magit-dash-gh-pr-status-collect-all)
+                (prog1 (magit-dash-pr-status-collect-all)
                   (setq agent-shell-workflow-github--pr-status-failures 0)))
             (error
              (let ((reason (format "PR collection failed (%s); status file left untouched"
                                    (error-message-string err))))
                (agent-shell-workflow-github--note-collection-failure reason)
                (agent-shell-workflow-skip reason)))))
-         (prs (mapcar #'magit-dash-gh-pr-attach-tracking collected))
-         (fingerprint (magit-dash-gh-pr-tracking-fingerprint prs)))
+         (prs (mapcar #'magit-dash-pr-attach-tracking collected))
+         (fingerprint (magit-dash-pr-tracking-fingerprint prs)))
     (when (and (null prs)
                agent-shell-workflow-github--pr-status-fingerprint
                (> agent-shell-workflow-github--pr-status-last-count 0))
