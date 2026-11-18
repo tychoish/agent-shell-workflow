@@ -27,7 +27,7 @@
 ;; The registry is elastic and often site/config-specific, so the
 ;; interactive surface is a single `annotated-completing-read' picker
 ;; (`agent-shell-workflow-select') rather than a bespoke menu per
-;; workflow.  Every registered workflow, including `pr-status-sync',
+;; workflow.  Every registered workflow, including `fix-ci',
 ;; appears in it.
 
 ;;; Code:
