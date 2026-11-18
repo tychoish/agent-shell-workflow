@@ -5,7 +5,7 @@
 ;; Keywords: tools, agent-shell
 ;; Version: 0.1.0
 ;; URL: https://github.com/tychoish/agent-shell-workflow
-;; Package-Requires: ((emacs "29.1") (transient "0.4") (annotated-completing-read "0.1"))
+;; Package-Requires: ((emacs "29.1") (annotated-completing-read "0.1"))
 
 ;; This file is not part of GNU Emacs
 
@@ -26,14 +26,13 @@
 
 ;; The registry is elastic and often site/config-specific, so the
 ;; interactive surface is a single `annotated-completing-read' picker
-;; (`agent-shell-workflow-select') rather than a bespoke transient menu
-;; per workflow.  `agent-shell-workflow-dispatch-menu' wires exactly one
-;; entry point into `agent-shell-menu-dispatch' that calls the picker.
+;; (`agent-shell-workflow-select') rather than a bespoke menu per
+;; workflow.  Every registered workflow, including `pr-status-sync',
+;; appears in it.
 
 ;;; Code:
 
 (require 'cl-lib)
-(require 'transient)
 (require 'annotated-completing-read)
 (require 'agent-shell-workflow)
 (eval-when-compile (require 'agent-shell-workflow))
@@ -68,12 +67,6 @@ CATEGORY non-nil, only workflows in that category are offered."
                     :require-match t
                     :history 'agent-shell-workflow-select)))
     (agent-shell-workflow-dispatch (agent-shell-workflow-spec-id selected))))
-
-;;;###autoload (autoload 'agent-shell-workflow-dispatch-menu "agent-shell-workflow-menu" nil t)
-(transient-define-prefix agent-shell-workflow-dispatch-menu ()
-  "Single entry point into the `agent-shell-workflow' ACR picker."
-  ["Workflows"
-   ("w" "Select workflow…" agent-shell-workflow-select)])
 
 (provide 'agent-shell-workflow-menu)
 

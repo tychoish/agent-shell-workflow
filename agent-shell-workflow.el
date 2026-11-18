@@ -5,7 +5,7 @@
 ;; Keywords: tools, agent-shell
 ;; Version: 0.1.0
 ;; URL: https://github.com/tychoish/agent-shell-workflow
-;; Package-Requires: ((emacs "29.1") (agent-shell "0.1") (transient "0.4") (annotated-completing-read "0.1") (magit "3.3"))
+;; Package-Requires: ((emacs "29.1") (agent-shell "0.1") (annotated-completing-read "0.1") (magit "3.3"))
 
 ;; This file is not part of GNU Emacs
 
@@ -1188,7 +1188,6 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
 (agent-shell-workflow--setup-queue-integration)
 
 (autoload 'agent-shell-workflow-select "agent-shell-workflow-menu" nil t)
-(autoload 'agent-shell-workflow-dispatch-menu "agent-shell-workflow-menu" nil t)
 
 (provide 'agent-shell-workflow)
 

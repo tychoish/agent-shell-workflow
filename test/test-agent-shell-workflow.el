@@ -817,15 +817,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
    (register-agent-shell-workflow other-cat :category "Testing" :template "hi")
    (should (= 1 (length (agent-shell-workflow--candidates "CI/CD"))))))
 
-(ert-deftest agent-shell-workflow/dispatch-menu-key-integrity ()
-  "No key in agent-shell-workflow-dispatch-menu conflicts or duplicates."
-  (let ((keys (transient-test/collect-keys 'agent-shell-workflow-dispatch-menu)))
-    (should (null (transient-test/key-prefix-conflicts keys)))
-    (should (null (transient-test/duplicate-keys keys)))))
-
-(ert-deftest agent-shell-workflow/dispatch-menu-suffix-registered ()
-  "agent-shell-workflow-dispatch-menu is a transient prefix wrapping the ACR picker."
-  (should (get 'agent-shell-workflow-dispatch-menu 'transient--layout))
+(ert-deftest agent-shell-workflow/select-is-interactive ()
   (should (commandp 'agent-shell-workflow-select)))
 
 (ert-deftest agent-shell-workflow/create-shell-binds-default-directory ()

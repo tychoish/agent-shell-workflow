@@ -1420,12 +1420,6 @@ session is interrupted; `session' uses the workflow's own target."
      (message "pr-status-sync timer: %s" (error-message-string err)) nil)))
 
 ;;;###autoload
-(defun agent-shell-workflow-pr-status-run-now ()
-  "Dispatch `pr-status-sync' once, now."
-  (interactive)
-  (agent-shell-workflow-pr-status--dispatch))
-
-;;;###autoload
 (defun agent-shell-workflow-pr-status-timer-stop ()
   "Stop the periodic `pr-status-sync' timer.  Safe when not running."
   (interactive)

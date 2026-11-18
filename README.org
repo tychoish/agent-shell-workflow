@@ -13,7 +13,7 @@ interactive selection menus.
 
 - *Workflow Templates*: Configurable variable substitutions with regex extraction.
 - *Workflow Library*: Discoverable library of reusable workflow definitions (~agent-shell-workflow-library~).
-- *Interactive Menus*: Fast transient and completing-read selection menus (~agent-shell-workflow-menu~).
+- *Interactive Menus*: Completing-read workflow picker (~agent-shell-workflow-menu~).
 - *Pluggable Dispatch*: Extensible target buffer resolution via ~agent-shell-workflow-dispatch-target-functions~ hook.
 - *Zero Queue Coupling*: Works independently or alongside ~agent-shell-queue~.
 
