@@ -2740,6 +2740,267 @@ and prompt is enqueued for target shell."
          (agent-shell-workflow-dispatch 'test-no-debounce :context-dir "/tmp/test-dir")
          (should (= call-count 2)))))))
 
+;; Tests for workflow default behavior (shell-reuse, new-shell-providers, buffer-display)
+
+(ert-deftest agent-shell-workflow/spec-fields-registered ()
+  "Workflow registration records shell-reuse, new-shell-providers, and buffer-display."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-defaults-wf
+     :template "hi"
+     :target :session-new
+     :shell-reuse always
+     :new-shell-providers ((antigravity :model "gemini-2.5-pro"))
+     :buffer-display :foreground)
+   (let ((spec (agent-shell-workflow-get 'test-defaults-wf)))
+     (should spec)
+     (should (eq (agent-shell-workflow-spec-target spec) :session-new))
+     (should (eq (agent-shell-workflow-spec-shell-reuse spec) 'always))
+     (should (equal (agent-shell-workflow-spec-new-shell-providers spec)
+                    '((antigravity :model "gemini-2.5-pro"))))
+     (should (eq (agent-shell-workflow-spec-buffer-display spec) :foreground)))))
+
+(ert-deftest agent-shell-workflow/session-reuse-always-no-prompt ()
+  "Target :session-reuse-always reuses existing buffer without y-or-n-p."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-always-reuse
+     :template "hi"
+     :target :session-reuse-always
+     :submit t)
+   (let* ((buf (generate-new-buffer "asw-test-always-reuse"))
+          y-or-n-p-called
+          new-shell-called
+          dispatched-buf)
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell-workflow--project-buffers)
+                    (lambda (_dir) (list buf)))
+                   ((symbol-function 'y-or-n-p)
+                    (lambda (&rest _) (setq y-or-n-p-called t) t))
+                   ((symbol-function 'agent-shell-new-shell)
+                    (lambda (&rest _) (setq new-shell-called t) nil))
+                   ((symbol-function 'agent-shell-insert)
+                    (lambda (&rest keys)
+                      (setq dispatched-buf (plist-get keys :shell-buffer))
+                      '((:end . 100)))))
+           (agent-shell-workflow-dispatch 'test-always-reuse)
+           (should-not y-or-n-p-called)
+           (should-not new-shell-called)
+           (should (eq dispatched-buf buf)))
+       (kill-buffer buf)))))
+
+(ert-deftest agent-shell-workflow/shell-reuse-always-creates-when-none ()
+  "When shell-reuse is always and no shells exist, creates one without prompting."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-reuse-fallback
+     :template "hi"
+     :target :session-reuse
+     :shell-reuse always
+     :submit t)
+   (let* ((created-buf (generate-new-buffer "asw-test-created"))
+          y-or-n-p-called
+          dispatched-buf)
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell-workflow--project-buffers)
+                    (lambda (_dir) nil))
+                   ((symbol-function 'y-or-n-p)
+                    (lambda (&rest _) (setq y-or-n-p-called t) t))
+                   ((symbol-function 'agent-shell-workflow--create-shell)
+                    (lambda (&rest _) created-buf))
+                   ((symbol-function 'agent-shell-insert)
+                    (lambda (&rest keys)
+                      (setq dispatched-buf (plist-get keys :shell-buffer))
+                      '((:end . 100)))))
+           (agent-shell-workflow-dispatch 'test-reuse-fallback)
+           (should-not y-or-n-p-called)
+           (should (eq dispatched-buf created-buf)))
+       (kill-buffer created-buf)))))
+
+(ert-deftest agent-shell-workflow/session-new-always-creates-shell ()
+  "Target :session-new creates a new shell even when matching buffers exist."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-always-new
+     :template "hi"
+     :target :session-new
+     :new-shell-providers (antigravity)
+     :submit t)
+   (let* ((existing-buf (generate-new-buffer "asw-existing"))
+          (new-buf (generate-new-buffer "asw-brand-new"))
+          created-called
+          dispatched-buf)
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell-workflow--project-buffers)
+                    (lambda (_dir) (list existing-buf)))
+                   ((symbol-function 'agent-shell-workflow--create-shell)
+                    (lambda (&rest _)
+                      (setq created-called t)
+                      new-buf))
+                   ((symbol-function 'agent-shell-insert)
+                    (lambda (&rest keys)
+                      (setq dispatched-buf (plist-get keys :shell-buffer))
+                      '((:end . 100)))))
+           (agent-shell-workflow-dispatch 'test-always-new)
+           (should created-called)
+           (should (eq dispatched-buf new-buf)))
+       (kill-buffer existing-buf)
+       (kill-buffer new-buf)))))
+
+(ert-deftest agent-shell-workflow/single-provider-no-prompt-with-model ()
+  "A single new-shell-provider specifies the default model and avoids select-config prompt."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-model-wf
+     :template "hi"
+     :target :session-new
+     :new-shell-providers ((antigravity :model "gemini-2.5-pro"))
+     :submit t)
+   (let* ((shell-buf (generate-new-buffer "asw-prov-buf"))
+          select-config-called
+          passed-config)
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell-select-config)
+                    (lambda (&rest _) (setq select-config-called t) nil))
+                   ((symbol-function 'agent-shell--start)
+                    (lambda (&rest keys)
+                      (setq passed-config (plist-get keys :config))
+                      shell-buf))
+                   ((symbol-function 'agent-shell-insert) #'ignore))
+           (agent-shell-workflow-dispatch 'test-model-wf)
+           (should-not select-config-called)
+           (should passed-config)
+           (should (equal (funcall (map-elt passed-config :default-model-id)) "gemini-2.5-pro"))
+           (let ((opts-fn (map-elt passed-config :default-config-options)))
+             (when opts-fn
+               (should (equal (cdr (assoc "model" (funcall opts-fn))) "gemini-2.5-pro")))))
+       (kill-buffer shell-buf)))))
+
+(ert-deftest agent-shell-workflow/multiple-providers-prompts-choice ()
+  "Multiple new-shell-providers prompts via completing-read and applies chosen model."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-multi-prov
+     :template "hi"
+     :target :session-new
+     :new-shell-providers ((antigravity :model "flash-v1")
+                           (claude-code :model "sonnet-v2"))
+     :submit t)
+   (let* ((shell-buf (generate-new-buffer "asw-multi-buf"))
+          completing-prompt
+          completing-table
+          passed-config)
+     (unwind-protect
+         (cl-letf (((symbol-function 'completing-read)
+                    (lambda (prompt table &rest _)
+                      (setq completing-prompt prompt
+                            completing-table table)
+                      ;; Pick the second choice
+                      (cadr table)))
+                   ((symbol-function 'agent-shell--start)
+                    (lambda (&rest keys)
+                      (setq passed-config (plist-get keys :config))
+                      shell-buf))
+                   ((symbol-function 'agent-shell-insert) #'ignore))
+           (agent-shell-workflow-dispatch 'test-multi-prov)
+           (should (string-match-p "Select agent" completing-prompt))
+           (should (= (length completing-table) 2))
+           (should (equal (funcall (map-elt passed-config :default-model-id)) "sonnet-v2")))
+       (kill-buffer shell-buf)))))
+
+(ert-deftest agent-shell-workflow/buffer-display-foreground ()
+  "buffer-display :foreground pops to buffer."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-fg-wf
+     :template "hi"
+     :target :session-new
+     :new-shell-providers (antigravity)
+     :buffer-display :foreground
+     :submit t)
+   (let* ((shell-buf (generate-new-buffer "asw-fg-buf"))
+          popped-buf)
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell--start)
+                    (lambda (&rest _) shell-buf))
+                   ((symbol-function 'pop-to-buffer)
+                    (lambda (buf &rest _) (setq popped-buf buf)))
+                   ((symbol-function 'display-buffer)
+                    (lambda (&rest _) (ert-fail "display-buffer should not be called")))
+                   ((symbol-function 'agent-shell-insert) #'ignore))
+           (let ((noninteractive nil))
+             (agent-shell-workflow-dispatch 'test-fg-wf)
+             (should (eq popped-buf shell-buf))))
+       (kill-buffer shell-buf)))))
+
+(ert-deftest agent-shell-workflow/buffer-display-background ()
+  "buffer-display :background does not call display-buffer or pop-to-buffer."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-bg-wf
+     :template "hi"
+     :target :session-new
+     :new-shell-providers (antigravity)
+     :buffer-display :background
+     :submit t)
+   (let* ((shell-buf (generate-new-buffer "asw-bg-buf")))
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell--start)
+                    (lambda (&rest _) shell-buf))
+                   ((symbol-function 'pop-to-buffer)
+                    (lambda (&rest _) (ert-fail "pop-to-buffer should not be called")))
+                   ((symbol-function 'display-buffer)
+                    (lambda (&rest _) (ert-fail "display-buffer should not be called")))
+                   ((symbol-function 'agent-shell-insert) #'ignore))
+           (let ((noninteractive nil))
+             (agent-shell-workflow-dispatch 'test-bg-wf)))
+       (kill-buffer shell-buf)))))
+
+(ert-deftest agent-shell-workflow/variant-inherits-and-overrides-defaults ()
+  "Workflow variants inherit or override shell-reuse, providers, and display."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-variant-parent
+     :template "hi"
+     :target :session-new
+     :shell-reuse always
+     :new-shell-providers ((antigravity :model "base-model"))
+     :buffer-display :foreground
+     :variants ((var-one :template "one")
+                (var-two :template "two"
+                         :buffer-display :background
+                         :new-shell-providers ((claude-code :model "custom-model")))))
+   (let ((v1 (agent-shell-workflow-get 'test-variant-parent-var-one))
+         (v2 (agent-shell-workflow-get 'test-variant-parent-var-two)))
+     (should v1)
+     (should (eq (agent-shell-workflow-spec-shell-reuse v1) 'always))
+     (should (equal (agent-shell-workflow-spec-new-shell-providers v1)
+                    '((antigravity :model "base-model"))))
+     (should (eq (agent-shell-workflow-spec-buffer-display v1) :foreground))
+
+     (should v2)
+     (should (eq (agent-shell-workflow-spec-shell-reuse v2) 'always))
+     (should (equal (agent-shell-workflow-spec-new-shell-providers v2)
+                    '((claude-code :model "custom-model"))))
+     (should (eq (agent-shell-workflow-spec-buffer-display v2) :background)))))
+
+(ert-deftest agent-shell-workflow/quoted-symbols-accepted ()
+  "Arguments to :target, :buffer-display, and :shell-reuse can be quoted symbols."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-quoted-flags
+     :template "hi"
+     :target 'session-reuse-always
+     :buffer-display 'foreground
+     :shell-reuse 'always)
+   (let ((spec (agent-shell-workflow-get 'test-quoted-flags)))
+     (should (eq (agent-shell-workflow-spec-target spec) :session-reuse-always))
+     (should (eq (agent-shell-workflow-spec-buffer-display spec) :foreground))
+     (should (eq (agent-shell-workflow-spec-shell-reuse spec) 'always)))))
+
+(ert-deftest agent-shell-workflow/bare-symbols-in-macro ()
+  "Bare unquoted symbols in register-agent-shell-workflow are quoted and normalized."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-bare-flags
+     :template "hi"
+     :target session-new
+     :buffer-display background
+     :shell-reuse always)
+   (let ((spec (agent-shell-workflow-get 'test-bare-flags)))
+     (should (eq (agent-shell-workflow-spec-target spec) :session-new))
+     (should (eq (agent-shell-workflow-spec-buffer-display spec) :background))
+     (should (eq (agent-shell-workflow-spec-shell-reuse spec) 'always)))))
+
 (provide 'test-agent-shell-workflow)
 
 ;;; test-agent-shell-workflow.el ends here

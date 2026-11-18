@@ -349,7 +349,24 @@ See `agent-shell-workflow-exec-pre'.")
    :documentation "Non-nil to submit the rendered prompt immediately on insertion.")
   (target
    nil
-   :documentation "One of `:session-reuse', `:session-new', `:queue', `:ask'.")
+   :documentation "One of `:session-reuse', `:session-reuse-always', `:session-new', `:queue', `:ask'.")
+  (shell-reuse
+   nil
+   :documentation
+   "Policy for reusing existing shells: \\='always (reuse without prompt, spawn new if none),
+\\='prompt (prompt user if shells exist), \\='new (always spawn new), or nil.")
+  (new-shell-providers
+   nil
+   :documentation
+   "List of provider specs to use when creating a new shell.
+Each element can be a provider ID symbol/string, a config function,
+or a list/plist specifying overrides, e.g. \\='((antigravity :model \"gemini-2.5-pro\")).")
+  (buffer-display
+   nil
+   :documentation
+   "How to display the shell buffer: `:foreground' (display and focus via `pop-to-buffer'),
+`:background' (do not display window or focus), `:display' (display via `display-buffer'),
+or nil (defaults to `:display').")
   (post-op
    nil
    :documentation
@@ -380,20 +397,70 @@ Populate via `register-agent-shell-workflow'.")
   (require 'agent-shell-workflow-library nil t)
   (map-values agent-shell-workflow-registry))
 
-(cl-defun agent-shell-workflow-register (&key id doc category args pre-op template submit target post-op clear clear-before variants)
+(defun agent-shell-workflow--normalize-target (target)
+  "Normalize TARGET (keyword or quoted symbol) to canonical target symbol."
+  (cond
+   ((or (null target) (bufferp target) (stringp target))
+    target)
+   ((symbolp target)
+    (let ((name (string-remove-prefix ":" (symbol-name target))))
+      (cond
+       ((equal name "ask") :ask)
+       ((equal name "session-reuse") :session-reuse)
+       ((member name '("session-reuse-always" "always-reuse" "session-reuse-or-new" "reuse-always"))
+        :session-reuse-always)
+       ((member name '("session-new" "new")) :session-new)
+       ((equal name "queue") :queue)
+       ((keywordp target) target)
+       (t (intern (format ":%s" name))))))
+   (t target)))
+
+(defun agent-shell-workflow--normalize-display (display)
+  "Normalize DISPLAY (keyword, quoted symbol, or string) to canonical display keyword."
+  (if (null display)
+      :display
+    (let ((sym (if (symbolp display)
+                   (intern (format ":%s" (string-remove-prefix ":" (symbol-name display))))
+                 (intern (format ":%s" (string-remove-prefix ":" (format "%s" display)))))))
+      (pcase sym
+        (:background :background)
+        (:foreground :foreground)
+        (_ :display)))))
+
+(defun agent-shell-workflow--normalize-shell-reuse (policy)
+  "Normalize shell reuse POLICY (keyword or symbol) to \\='always, \\='prompt, \\='new, or nil."
+  (when policy
+    (let ((name (string-remove-prefix ":" (format "%s" policy))))
+      (cond
+       ((member name '("always" "t")) 'always)
+       ((equal name "new") 'new)
+       ((equal name "prompt") 'prompt)
+       (t (intern name))))))
+
+(cl-defun agent-shell-workflow-register (&key id doc category args pre-op template submit target post-op clear clear-before variants shell-reuse new-shell-providers providers buffer-display display)
   "Register a workflow spec built from ID, DOC, CATEGORY, ARGS, PRE-OP,
 TEMPLATE, SUBMIT, TARGET, POST-OP, CLEAR (or CLEAR-BEFORE), and VARIANTS.
+SHELL-REUSE specifies reuse behavior (\\='always, \\='prompt, \\='new).
+NEW-SHELL-PROVIDERS (or PROVIDERS) specifies preferred/allowed shell providers.
+BUFFER-DISPLAY (or DISPLAY) specifies `:foreground', `:background', or `:display'.
 Re-registering an existing ID replaces the entry."
   (unless id
     (error "Agent-shell-workflow: `:id' is required"))
   (unless template
     (error "Agent-shell-workflow %s: `:template' is required" id))
-  (let ((spec (agent-shell-workflow-spec--make
-               :id id :doc doc :category (or category "General") :args args
-               :pre-op pre-op :template template :submit submit
-               :target (or target :ask) :post-op post-op
-               :clear (or clear clear-before)
-               :variants variants)))
+  (let* ((effective-providers (or new-shell-providers providers))
+         (effective-display (agent-shell-workflow--normalize-display (or buffer-display display)))
+         (effective-target (agent-shell-workflow--normalize-target (or target :ask)))
+         (effective-shell-reuse (agent-shell-workflow--normalize-shell-reuse shell-reuse))
+         (spec (agent-shell-workflow-spec--make
+                :id id :doc doc :category (or category "General") :args args
+                :pre-op pre-op :template template :submit submit
+                :target effective-target :post-op post-op
+                :clear (or clear clear-before)
+                :variants variants
+                :shell-reuse effective-shell-reuse
+                :new-shell-providers effective-providers
+                :buffer-display effective-display)))
     (setf (map-elt agent-shell-workflow-registry id) spec)
     (when variants
       (dolist (var-spec variants)
@@ -420,24 +487,55 @@ Re-registering an existing ID replaces the entry."
            :submit (if (plist-member (cdr var-spec) :submit)
                        (plist-get (cdr var-spec) :submit)
                      submit)
-           :target (or (plist-get (cdr var-spec) :target) target)
+           :target (agent-shell-workflow--normalize-target (or (plist-get (cdr var-spec) :target) target))
            :post-op (or (plist-get (cdr var-spec) :post-op) post-op)
            :clear (if (plist-member (cdr var-spec) :clear)
                       (plist-get (cdr var-spec) :clear)
-                    (or clear clear-before))))))
+                    (or clear clear-before))
+           :shell-reuse (agent-shell-workflow--normalize-shell-reuse
+                         (or (plist-get (cdr var-spec) :shell-reuse) shell-reuse))
+           :new-shell-providers (or (plist-get (cdr var-spec) :new-shell-providers)
+                                    (plist-get (cdr var-spec) :providers)
+                                    effective-providers)
+           :buffer-display (agent-shell-workflow--normalize-display
+                            (or (plist-get (cdr var-spec) :buffer-display)
+                                (plist-get (cdr var-spec) :display)
+                                effective-display))))))
     spec))
 
 (defmacro register-agent-shell-workflow (id &rest keys)
   "Define and register a prompt workflow named ID.
 KEYS is a plist accepting the same keys as `agent-shell-workflow-register'
-\(:doc :category :args :pre-op :template :submit :target :post-op :clear :clear-before :variants).
-:args and :variants are data, not code, and are quoted automatically."
+\(:doc :category :args :pre-op :template :submit :target :post-op :clear :clear-before :variants
+ :shell-reuse :new-shell-providers :providers :buffer-display :display).
+:args, :variants, :target, :shell-reuse, :buffer-display, and :new-shell-providers
+accept quoted or bare symbols and are quoted automatically."
   (declare (indent 1))
   (let ((keys (copy-sequence keys)))
     (when (plist-member keys :args)
       (setq keys (plist-put keys :args (list 'quote (plist-get keys :args)))))
     (when (plist-member keys :variants)
       (setq keys (plist-put keys :variants (list 'quote (plist-get keys :variants)))))
+    (when (and (plist-member keys :target)
+               (symbolp (plist-get keys :target))
+               (not (keywordp (plist-get keys :target))))
+      (setq keys (plist-put keys :target (list 'quote (plist-get keys :target)))))
+    (when (and (plist-member keys :buffer-display)
+               (symbolp (plist-get keys :buffer-display))
+               (not (keywordp (plist-get keys :buffer-display))))
+      (setq keys (plist-put keys :buffer-display (list 'quote (plist-get keys :buffer-display)))))
+    (when (and (plist-member keys :display)
+               (symbolp (plist-get keys :display))
+               (not (keywordp (plist-get keys :display))))
+      (setq keys (plist-put keys :display (list 'quote (plist-get keys :display)))))
+    (when (and (plist-member keys :shell-reuse)
+               (symbolp (plist-get keys :shell-reuse))
+               (not (keywordp (plist-get keys :shell-reuse))))
+      (setq keys (plist-put keys :shell-reuse (list 'quote (plist-get keys :shell-reuse)))))
+    (when (plist-member keys :new-shell-providers)
+      (setq keys (plist-put keys :new-shell-providers (list 'quote (plist-get keys :new-shell-providers)))))
+    (when (plist-member keys :providers)
+      (setq keys (plist-put keys :providers (list 'quote (plist-get keys :providers)))))
     `(agent-shell-workflow-register :id ',id ,@keys)))
 
 ;; Argument collection
@@ -583,11 +681,12 @@ Handles `:drop-context', `:restart', `:close', and `(:chain ID ARGS)'.
 ;; Dispatch routing
 (defun agent-shell-workflow--resolve-target (target)
   "Resolve TARGET keyword `:ask' via `completing-read' into a concrete target."
-  (if (eq target :ask)
-      (intern (completing-read "Dispatch to: "
-                               '(":session-reuse" ":session-new" ":queue")
-                               nil t))
-    target))
+  (let ((norm (agent-shell-workflow--normalize-target target)))
+    (if (eq norm :ask)
+        (intern (completing-read "Dispatch to: "
+                                 '(":session-reuse" ":session-new" ":queue")
+                                 nil t))
+      norm)))
 
 (defun agent-shell-workflow--canonicalize-dir (dir)
   "Return canonical representation of DIR with trailing slash."
@@ -621,10 +720,130 @@ or where either directory is within the other."
                             (string-prefix-p canon-dir buf-dir))))))
                 (agent-shell-buffers))))
 
-(defun agent-shell-workflow--create-shell (&optional dir config)
+(defun agent-shell-workflow--normalize-provider-spec (item)
+  "Normalize provider specification ITEM to (ID . PLIST-OPTIONS).
+ITEM may be:
+- a symbol or string naming a provider ID, e.g. \\='antigravity
+- a list like (ID :model \"...\" :mode \"...\")
+- a plist like (:provider ID :model \"...\" :mode \"...\")
+- or an agent config alist."
+  (cond
+   ((and (listp item) (assq :identifier item))
+    (cons (cdr (assq :identifier item)) (list :config item)))
+   ((and (listp item) (keywordp (car item)))
+    (let ((id (or (plist-get item :provider)
+                  (plist-get item :identifier)
+                  (plist-get item :name)))
+          (opts (copy-sequence item)))
+      (setq opts (plist-put opts :provider nil))
+      (setq opts (plist-put opts :identifier nil))
+      (setq opts (plist-put opts :name nil))
+      (cons id opts)))
+   ((and (consp item) (cdr item) (keywordp (cadr item)))
+    (cons (car item) (cdr item)))
+   (t
+    (cons item nil))))
+
+(defun agent-shell-workflow--apply-provider-overrides (config opts)
+  "Apply options in OPTS (such as :model and :mode) to agent CONFIG."
+  (let ((model (or (plist-get opts :model) (plist-get opts :default-model-id)))
+        (mode (or (plist-get opts :mode) (plist-get opts :default-session-mode-id)))
+        (cfg (copy-alist config)))
+    (when model
+      (let ((model-str (format "%s" model)))
+        (map-put! cfg :default-model-id (lambda () model-str))
+        (let ((orig-fn (map-elt cfg :default-config-options)))
+          (map-put! cfg :default-config-options
+                    (lambda ()
+                      (let ((existing (if orig-fn (funcall orig-fn) nil)))
+                        (cons (cons "model" model-str)
+                              (seq-remove (lambda (pair) (equal (car pair) "model")) existing))))))))
+    (when mode
+      (let ((mode-str (format "%s" mode)))
+        (map-put! cfg :default-session-mode-id (lambda () mode-str))
+        (let ((orig-fn (map-elt cfg :default-config-options)))
+          (map-put! cfg :default-config-options
+                    (lambda ()
+                      (let ((existing (if orig-fn (funcall orig-fn) nil)))
+                        (cons (cons "mode" mode-str)
+                              (seq-remove (lambda (pair) (equal (car pair) "mode")) existing))))))))
+    cfg))
+
+(defun agent-shell-workflow--resolve-single-provider (item)
+  "Resolve provider spec ITEM into an agent-shell config alist with overrides."
+  (let* ((norm (agent-shell-workflow--normalize-provider-spec item))
+         (id (car norm))
+         (opts (cdr norm))
+         (direct-cfg (plist-get opts :config)))
+    (if direct-cfg
+        (agent-shell-workflow--apply-provider-overrides direct-cfg opts)
+      (let* ((configs (if (fboundp 'agent-shell--resolved-agent-configs)
+                          (agent-shell--resolved-agent-configs)
+                        nil))
+             (id-str (format "%s" id))
+             (base (or (and (fboundp id) (funcall id))
+                       (seq-find (lambda (c)
+                                   (or (equal (format "%s" (map-elt c :identifier)) id-str)
+                                       (string-equal-ignore-case (or (map-elt c :mode-line-name) "") id-str)
+                                       (string-equal-ignore-case (or (map-elt c :buffer-name) "") id-str)))
+                                 configs)
+                       (if (fboundp 'agent-shell-make-agent-config)
+                           (agent-shell-make-agent-config :identifier (intern id-str)
+                                                          :buffer-name (capitalize id-str))
+                         `((:identifier . ,(intern id-str))
+                           (:buffer-name . ,(capitalize id-str))))))
+             (cfg (copy-alist base)))
+        (agent-shell-workflow--apply-provider-overrides cfg opts)))))
+
+(defun agent-shell-workflow--resolve-provider-config (providers)
+  "Resolve PROVIDERS list into a single selected agent config alist.
+When PROVIDERS has 1 item, returns its resolved config without prompting.
+When PROVIDERS has multiple items, prompts user via `completing-read'."
+  (when providers
+    (let ((list (if (listp providers) providers (list providers))))
+      (if (= (length list) 1)
+          (agent-shell-workflow--resolve-single-provider (car list))
+        (let* ((candidates
+                (mapcar (lambda (item)
+                          (let* ((norm (agent-shell-workflow--normalize-provider-spec item))
+                                 (id (car norm))
+                                 (opts (cdr norm))
+                                 (model (plist-get opts :model))
+                                 (label (if model
+                                            (format "%s (model: %s)" id model)
+                                          (format "%s" id))))
+                            (cons label item)))
+                        list))
+               (choice (completing-read "Select agent for workflow: "
+                                        (mapcar #'car candidates)
+                                        nil t nil nil (caar candidates)))
+               (selected (cdr (assoc choice candidates))))
+          (agent-shell-workflow--resolve-single-provider selected))))))
+
+(defun agent-shell-workflow--match-buffer-provider (buffers providers)
+  "Return the first buffer in BUFFERS that matches one of the PROVIDERS."
+  (when (and buffers providers)
+    (let ((wanted (mapcar (lambda (p)
+                            (let ((id (car (agent-shell-workflow--normalize-provider-spec p))))
+                              (and id (format "%s" id))))
+                          providers)))
+      (seq-find
+       (lambda (buf)
+         (when (buffer-live-p buf)
+           (with-current-buffer buf
+             (let ((id (or (and (boundp 'agent-shell--state)
+                                (map-nested-elt agent-shell--state '(:agent-config :identifier)))
+                           (and (boundp 'shell-maker--config)
+                                (map-elt shell-maker--config :identifier)))))
+               (and id (member (format "%s" id) wanted))))))
+       buffers))))
+
+(defun agent-shell-workflow--create-shell (&optional dir config display)
   "Create and return a new `agent-shell' buffer in DIR with CONFIG.
 When CONFIG is nil, prompts for agent selection via `agent-shell-select-config'
-if available, or falls back to `agent-shell-new-shell'."
+if available, or falls back to `agent-shell-new-shell'.
+DISPLAY controls buffer display: `:foreground' (focus via `pop-to-buffer'),
+`:background' (no display or focus), or `:display' (via `display-buffer')."
   (let* ((canon-dir (agent-shell-workflow--canonicalize-dir (or dir default-directory)))
          (before-bufs (agent-shell-buffers)))
     (let ((default-directory canon-dir))
@@ -662,27 +881,61 @@ if available, or falls back to `agent-shell-new-shell'."
             (with-current-buffer buf
               (setq-local agent-shell-workflow--new-shell t))
             (unless noninteractive
-              (display-buffer buf)))
+              (pcase (agent-shell-workflow--normalize-display display)
+                (:background nil)
+                (:foreground (pop-to-buffer buf))
+                (_ (display-buffer buf)))))
           buf)))))
+
+(defun agent-shell-workflow--call-create-shell (dir &optional config display)
+  "Invoke `agent-shell-workflow--create-shell' respecting mocked arities."
+  (cond
+   ((or config display)
+    (condition-case nil
+        (agent-shell-workflow--create-shell dir config display)
+      (wrong-number-of-arguments
+       (condition-case nil
+           (agent-shell-workflow--create-shell dir config)
+         (wrong-number-of-arguments
+          (agent-shell-workflow--create-shell dir))))))
+   (t
+    (agent-shell-workflow--create-shell dir))))
 
 (defun agent-shell-workflow--session-buffer (target &optional dir spec)
   "Return a live `agent-shell' buffer for TARGET in DIR, creating or prompting.
-When TARGET is `:session-new', always create a new shell buffer.
-When matching open buffers exist for DIR (default `default-directory'), prompt
-the user whether to reuse an existing shell buffer or create a new one.
-When no matching open buffers exist, prompt the user whether to create one.
+When TARGET is `:session-new' or `:new', always create a new shell buffer.
+When TARGET is `:session-reuse-always' (or SPEC has shell-reuse set to always),
+reuse an existing project buffer without prompting; if none exist, create one.
+Otherwise, prompt the user whether to reuse an existing buffer or create one.
 If declined, signals `user-error'."
-  (let ((effective-dir (or dir default-directory)))
-    (if (eq target :session-new)
-        (agent-shell-workflow--create-shell effective-dir)
+  (let* ((effective-dir (or dir default-directory))
+         (norm-target (agent-shell-workflow--normalize-target target))
+         (reuse-policy (agent-shell-workflow--normalize-shell-reuse
+                        (and spec (agent-shell-workflow-spec-shell-reuse spec))))
+         (providers (and spec (agent-shell-workflow-spec-new-shell-providers spec)))
+         (display (agent-shell-workflow--normalize-display
+                   (and spec (agent-shell-workflow-spec-buffer-display spec))))
+         (always-reuse (or (eq norm-target :session-reuse-always)
+                           (eq reuse-policy 'always))))
+    (if (eq norm-target :session-new)
+        (let ((cfg (and providers (agent-shell-workflow--resolve-provider-config providers))))
+          (agent-shell-workflow--call-create-shell effective-dir cfg display))
       (let* ((buffers (agent-shell-workflow--project-buffers effective-dir))
              (dir-name (file-name-nondirectory (directory-file-name (expand-file-name effective-dir))))
              (reused-buf nil)
              (res-buf nil))
         (cond
+         (always-reuse
+          (if buffers
+              (setq reused-buf (or (agent-shell-workflow--match-buffer-provider buffers providers)
+                                   (car buffers))
+                    res-buf reused-buf)
+            (let ((cfg (and providers (agent-shell-workflow--resolve-provider-config providers))))
+              (setq res-buf (agent-shell-workflow--call-create-shell effective-dir cfg display)))))
          ((null buffers)
           (if (y-or-n-p (format "No agent-shell open for %s. Create one? " dir-name))
-              (setq res-buf (agent-shell-workflow--create-shell effective-dir))
+              (let ((cfg (and providers (agent-shell-workflow--resolve-provider-config providers))))
+                (setq res-buf (agent-shell-workflow--call-create-shell effective-dir cfg display)))
             (user-error "Aborted: no agent-shell available for %s" dir-name)))
          ((= (length buffers) 1)
           (let ((buf (car buffers)))
@@ -691,7 +944,8 @@ If declined, signals `user-error'."
                 (setq reused-buf buf
                       res-buf buf)
               (if (y-or-n-p (format "Create a new agent-shell for %s? " dir-name))
-                  (setq res-buf (agent-shell-workflow--create-shell effective-dir))
+                  (let ((cfg (and providers (agent-shell-workflow--resolve-provider-config providers))))
+                    (setq res-buf (agent-shell-workflow--call-create-shell effective-dir cfg display)))
                 (user-error "Aborted: cancelled shell selection")))))
          (t
           (let* ((new-option "[New agent-shell]")
@@ -699,7 +953,8 @@ If declined, signals `user-error'."
                  (choice (completing-read (format "Select agent-shell for %s: " dir-name)
                                           choices nil t)))
             (if (string-equal choice new-option)
-                (setq res-buf (agent-shell-workflow--create-shell effective-dir))
+                (let ((cfg (and providers (agent-shell-workflow--resolve-provider-config providers))))
+                  (setq res-buf (agent-shell-workflow--call-create-shell effective-dir cfg display)))
               (setq reused-buf (get-buffer choice)
                     res-buf reused-buf)))))
         (when (and (buffer-live-p reused-buf)
@@ -964,12 +1219,18 @@ or `ask').  Returns the plist returned by `agent-shell-insert'."
                          ((memq submit '(:ask ask))
                           (y-or-n-p "Submit rendered prompt? "))
                          (t submit)))
-         (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx)))
+         (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx))
+         (display (agent-shell-workflow--normalize-display
+                   (or (plist-get ctx :buffer-display)
+                       (and spec (agent-shell-workflow-spec-buffer-display spec))))))
     (when (buffer-live-p shell-buffer)
       (with-current-buffer shell-buffer
         (setq-local agent-shell-workflow--new-shell nil))
       (unless noninteractive
-        (display-buffer shell-buffer))
+        (pcase display
+          (:background nil)
+          (:foreground (pop-to-buffer shell-buffer))
+          (_ (display-buffer shell-buffer))))
       (message "Submitting prompt for workflow `%s' to `%s'..."
                (agent-shell-workflow-spec-id spec)
                (buffer-name shell-buffer)))
@@ -994,14 +1255,19 @@ or extracts buffer substring directly."
           (buffer-substring-no-properties (max (point-min) start) (point-max)))))))
 
 ;;;###autoload
-(cl-defun agent-shell-workflow-dispatch (id &key args target submit (context-dir default-directory) &allow-other-keys)
+(cl-defun agent-shell-workflow-dispatch (id &key args target submit (context-dir default-directory)
+                                            shell-reuse new-shell-providers providers
+                                            buffer-display display &allow-other-keys)
   "Instantiate the workflow ID and dispatch it.
 ARGS is a plist supplying template values; missing required args
 are read interactively.
 TARGET overrides the spec's declared target (`:session-reuse',
-`:session-new', `:queue', `:ask').
+`:session-reuse-always', `:session-new', `:queue', `:ask').
 SUBMIT non-nil forces prompt submission regardless of spec default.
-CONTEXT-DIR sets `default-directory' for pre-op execution."
+CONTEXT-DIR sets `default-directory' for pre-op execution.
+SHELL-REUSE overrides reuse behavior (\\='always, \\='prompt, \\='new).
+NEW-SHELL-PROVIDERS (or PROVIDERS) overrides shell providers when spawning.
+BUFFER-DISPLAY (or DISPLAY) overrides `:foreground', `:background', or `:display'."
   (let* ((spec (or (agent-shell-workflow-get id)
                    (error "Agent-shell-workflow: no workflow registered with id `%s'" id)))
          (dir (or context-dir default-directory))
@@ -1018,8 +1284,20 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
           nil)
       (when agent-shell-workflow-debounce-interval
         (puthash debounce-key now agent-shell-workflow--in-flight-dispatches))
-      (let* ((initial-target (agent-shell-workflow--resolve-target
-                              (or target (agent-shell-workflow-spec-target spec))))
+      (let* ((raw-target (agent-shell-workflow--normalize-target
+                          (or target (agent-shell-workflow-spec-target spec))))
+             (effective-display
+              (agent-shell-workflow--normalize-display
+               (or buffer-display display
+                   (and spec (agent-shell-workflow-spec-buffer-display spec)))))
+             (effective-shell-reuse
+              (agent-shell-workflow--normalize-shell-reuse
+               (or shell-reuse
+                   (and spec (agent-shell-workflow-spec-shell-reuse spec)))))
+             (effective-providers
+              (or new-shell-providers providers
+                  (and spec (agent-shell-workflow-spec-new-shell-providers spec))))
+             (initial-target (agent-shell-workflow--resolve-target raw-target))
              (effective-submit (if (null submit)
                                    (agent-shell-workflow-spec-submit spec)
                                  submit))
@@ -1028,108 +1306,145 @@ CONTEXT-DIR sets `default-directory' for pre-op execution."
              (resolved-target initial-target)
              busy-action)
         ;; 1. Resolve target shell and upfront busy handling before preflight
-    (let ((cur-target initial-target)
-          (done nil))
-      (while (not done)
-        (cond
-         ((eq cur-target :session-reuse)
-          (let* ((buffers (agent-shell-workflow--project-buffers dir))
-                 (dir-name (file-name-nondirectory (directory-file-name dir))))
+        (let ((cur-target initial-target)
+              (done nil))
+          (while (not done)
             (cond
-             ((null buffers)
-              (if (y-or-n-p (format "No agent-shell open for %s. Create one? " dir-name))
-                  (progn
-                    (setq cur-target :session-new)
-                    (when (and (fboundp 'agent-shell-select-config) (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode)))
-                      (setq chosen-config (agent-shell-select-config :prompt "Start agent for workflow: "))))
-                (user-error "Aborted: no agent-shell available for %s" dir-name)))
-             ((= (length buffers) 1)
-              (let ((buf (car buffers)))
-                (if (y-or-n-p (format "Reuse open agent-shell %s for %s? "
-                                      (buffer-name buf) dir-name))
-                    (setq cur-target buf)
-                  (if (y-or-n-p (format "Create a new agent-shell for %s? " dir-name))
-                      (progn
-                        (setq cur-target :session-new)
-                        (when (and (fboundp 'agent-shell-select-config) (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode)))
-                          (setq chosen-config (agent-shell-select-config :prompt "Start agent for workflow: "))))
-                    (user-error "Aborted: cancelled shell selection")))))
+             ((or (memq cur-target '(:session-reuse-always :always-reuse :session-reuse-or-new :reuse-always))
+                  (and (memq cur-target '(:session-reuse :reuse))
+                       (memq effective-shell-reuse '(always :always t))))
+              (let* ((buffers (agent-shell-workflow--project-buffers dir)))
+                (if buffers
+                    (setq cur-target (or (agent-shell-workflow--match-buffer-provider buffers effective-providers)
+                                         (car buffers)))
+                  (setq cur-target :session-new))))
+             ((memq cur-target '(:session-reuse :reuse))
+              (if (memq effective-shell-reuse '(new :new))
+                  (setq cur-target :session-new)
+                (let* ((buffers (agent-shell-workflow--project-buffers dir))
+                       (dir-name (file-name-nondirectory (directory-file-name dir))))
+                  (cond
+                   ((null buffers)
+                    (if (y-or-n-p (format "No agent-shell open for %s. Create one? " dir-name))
+                        (progn
+                          (setq cur-target :session-new)
+                          (setq chosen-config
+                                (if effective-providers
+                                    (agent-shell-workflow--resolve-provider-config effective-providers)
+                                  (when (and (fboundp 'agent-shell-select-config)
+                                             (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode)))
+                                    (agent-shell-select-config :prompt "Start agent for workflow: ")))))
+                      (user-error "Aborted: no agent-shell available for %s" dir-name)))
+                   ((= (length buffers) 1)
+                    (let ((buf (car buffers)))
+                      (if (y-or-n-p (format "Reuse open agent-shell %s for %s? "
+                                            (buffer-name buf) dir-name))
+                          (setq cur-target buf)
+                        (if (y-or-n-p (format "Create a new agent-shell for %s? " dir-name))
+                            (progn
+                              (setq cur-target :session-new)
+                              (setq chosen-config
+                                    (if effective-providers
+                                        (agent-shell-workflow--resolve-provider-config effective-providers)
+                                      (when (and (fboundp 'agent-shell-select-config)
+                                                 (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode)))
+                                        (agent-shell-select-config :prompt "Start agent for workflow: ")))))
+                          (user-error "Aborted: cancelled shell selection")))))
+                   (t
+                    (let* ((new-option "[New agent-shell]")
+                           (choices (cons new-option (mapcar #'buffer-name buffers)))
+                           (choice (completing-read (format "Select agent-shell for %s: " dir-name)
+                                                    choices nil t nil nil
+                                                    (buffer-name (car buffers)))))
+                      (if (string-equal choice new-option)
+                          (progn
+                            (setq cur-target :session-new)
+                            (setq chosen-config
+                                  (if effective-providers
+                                      (agent-shell-workflow--resolve-provider-config effective-providers)
+                                    (when (fboundp 'agent-shell-select-config)
+                                      (agent-shell-select-config :prompt "Start agent for workflow: ")))))
+                        (setq cur-target (get-buffer choice)))))))))
+             ((memq cur-target '(:session-new :new))
+              (when (null chosen-config)
+                (setq chosen-config
+                      (if effective-providers
+                          (agent-shell-workflow--resolve-provider-config effective-providers)
+                        (when (and (fboundp 'agent-shell-select-config)
+                                   (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode)))
+                          (agent-shell-select-config :prompt "Start agent for workflow: ")))))
+              (setq done t))
+             ((or (bufferp cur-target) (stringp cur-target))
+              (let ((b (if (stringp cur-target) (get-buffer cur-target) cur-target)))
+                (if (and effective-submit (bufferp b) (buffer-live-p b))
+                    (let ((b-action (agent-shell-workflow--resolve-busy-action-upfront b effective-submit)))
+                      (if (eq b-action 'select)
+                          (progn
+                            (setq cur-target :session-new)
+                            (when (null chosen-config)
+                              (setq chosen-config
+                                    (if effective-providers
+                                        (agent-shell-workflow--resolve-provider-config effective-providers)
+                                      (when (and (fboundp 'agent-shell-select-config)
+                                                 (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode)))
+                                        (agent-shell-select-config :prompt "Start agent for workflow: "))))))
+                        (setq shell-buffer b
+                              busy-action b-action
+                              done t)))
+                  (setq shell-buffer b
+                        done t))))
              (t
-              (let* ((new-option "[New agent-shell]")
-                     (choices (cons new-option (mapcar #'buffer-name buffers)))
-                     (choice (completing-read (format "Select agent-shell for %s: " dir-name)
-                                              choices nil t nil nil
-                                              (buffer-name (car buffers)))))
-                (if (string-equal choice new-option)
-                    (progn
-                      (setq cur-target :session-new)
-                      (when (fboundp 'agent-shell-select-config)
-                        (setq chosen-config (agent-shell-select-config :prompt "Start agent for workflow: "))))
-                  (setq cur-target (get-buffer choice))))))))
-         ((eq cur-target :session-new)
-          (when (and (null chosen-config) (fboundp 'agent-shell-select-config) (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode)))
-            (setq chosen-config (agent-shell-select-config :prompt "Start agent for workflow: ")))
-          (setq done t))
-         ((or (bufferp cur-target) (stringp cur-target))
-          (let ((b (if (stringp cur-target) (get-buffer cur-target) cur-target)))
-            (if (and effective-submit (bufferp b) (buffer-live-p b))
-                (let ((b-action (agent-shell-workflow--resolve-busy-action-upfront b effective-submit)))
-                  (if (eq b-action 'select)
-                      (progn
-                        (setq cur-target :session-new)
-                        (when (and (fboundp 'agent-shell-select-config) (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-mode)))
-                          (setq chosen-config (agent-shell-select-config :prompt "Start agent for workflow: "))))
-                    (setq shell-buffer b
-                          busy-action b-action
-                          done t)))
-              (setq shell-buffer b
-                    done t))))
-         (t
-          (setq done t))))
-      (setq resolved-target cur-target))
+              (setq done t))))
+          (setq resolved-target cur-target))
 
-    ;; 2. Additional preflight clarifications and argument collection
-    (let ((collected-args (agent-shell-workflow--collect-args spec args)))
-      ;; 3. Create the shell buffer now if needed
-      (if (eq resolved-target :session-new)
-          (progn
-            (setq shell-buffer (agent-shell-workflow--create-shell dir chosen-config)
-                  resolved-target shell-buffer)
-            (when (buffer-live-p shell-buffer)
-              (unless noninteractive
-                (display-buffer shell-buffer))
-              (message "Created agent-shell `%s' for workflow `%s'"
-                       (buffer-name shell-buffer) id)))
-        (when (and (buffer-live-p shell-buffer)
-                   (not (eq busy-action 'queue))
-                   (agent-shell-workflow-spec-clear spec)
-                   (not (agent-shell-workflow--fresh-shell-p shell-buffer)))
-          (agent-shell-workflow--maybe-clear-reused-buffer shell-buffer spec)))
+        ;; 2. Additional preflight clarifications and argument collection
+        (let ((collected-args (agent-shell-workflow--collect-args spec args)))
+          ;; 3. Create the shell buffer now if needed
+          (if (eq resolved-target :session-new)
+              (progn
+                (setq shell-buffer (agent-shell-workflow--call-create-shell dir chosen-config effective-display)
+                      resolved-target shell-buffer)
+                (when (buffer-live-p shell-buffer)
+                  (unless noninteractive
+                    (pcase effective-display
+                      (:background nil)
+                      (:foreground (pop-to-buffer shell-buffer))
+                      (_ (display-buffer shell-buffer))))
+                  (message "Created agent-shell `%s' for workflow `%s'"
+                           (buffer-name shell-buffer) id)))
+            (when (and (buffer-live-p shell-buffer)
+                       (not (eq busy-action 'queue))
+                       (agent-shell-workflow-spec-clear spec)
+                       (not (agent-shell-workflow--fresh-shell-p shell-buffer)))
+              (agent-shell-workflow--maybe-clear-reused-buffer shell-buffer spec)))
 
-      ;; 4. Non-blocking preflight execution
-      (message "Running preflight for workflow `%s'..." id)
-      (let ((initial-ctx (list :args collected-args
-                               :target resolved-target
-                               :shell-buffer shell-buffer
-                               :submit effective-submit
-                               :busy-action busy-action
-                               :context-dir dir)))
-        (let ((default-directory dir))
-          (agent-shell-workflow-exec-pre
-           spec initial-ctx
-           (lambda (updated-ctx)
-             (let* ((merged-ctx (let ((c (copy-sequence initial-ctx))
-                                      (rem updated-ctx))
-                                  (while rem
-                                    (setq c (plist-put c (car rem) (cadr rem)))
-                                    (setq rem (cddr rem)))
-                                  c))
-                    (effective-dir (or (plist-get merged-ctx :context-dir) dir))
-                    (default-directory effective-dir)
-                    (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) merged-ctx))
-                    (ctx-with-rendered (plist-put merged-ctx :rendered rendered)))
-               ;; 5. Insert rendered prompt & submit
-               (agent-shell-workflow--dispatch-rendered spec ctx-with-rendered resolved-target effective-submit effective-dir)))))))))))
+          ;; 4. Non-blocking preflight execution
+          (message "Running preflight for workflow `%s'..." id)
+          (let ((initial-ctx (list :args collected-args
+                                   :target resolved-target
+                                   :shell-buffer shell-buffer
+                                   :submit effective-submit
+                                   :busy-action busy-action
+                                   :context-dir dir
+                                   :buffer-display effective-display
+                                   :shell-reuse effective-shell-reuse
+                                   :new-shell-providers effective-providers)))
+            (let ((default-directory dir))
+              (agent-shell-workflow-exec-pre
+               spec initial-ctx
+               (lambda (updated-ctx)
+                 (let* ((merged-ctx (let ((c (copy-sequence initial-ctx))
+                                          (rem updated-ctx))
+                                      (while rem
+                                        (setq c (plist-put c (car rem) (cadr rem)))
+                                        (setq rem (cddr rem)))
+                                      c))
+                        (effective-dir (or (plist-get merged-ctx :context-dir) dir))
+                        (default-directory effective-dir)
+                        (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) merged-ctx))
+                        (ctx-with-rendered (plist-put merged-ctx :rendered rendered)))
+                   ;; 5. Insert rendered prompt & submit
+                   (agent-shell-workflow--dispatch-rendered spec ctx-with-rendered resolved-target effective-submit effective-dir)))))))))))
 
 ;; Integration with agent-shell-queue
 
