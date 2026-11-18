@@ -349,24 +349,30 @@ See `agent-shell-workflow-exec-pre'.")
    :documentation "Non-nil to submit the rendered prompt immediately on insertion.")
   (target
    nil
-   :documentation "One of `:session-reuse', `:session-reuse-always', `:session-new', `:queue', `:ask'.")
+   :documentation
+   "One of `:session-reuse', `:session-reuse-always', `:session-new',
+`:queue', `:ask'.")
   (shell-reuse
    nil
    :documentation
-   "Policy for reusing existing shells: \\='always (reuse without prompt, spawn new if none),
-\\='prompt (prompt user if shells exist), \\='new (always spawn new), or nil.")
+   "Policy for reusing existing shells.
+One of \\='always (reuse without prompt, spawn new if none),
+\\='prompt (prompt user if shells exist), \\='new (always spawn new),
+or nil.")
   (new-shell-providers
    nil
    :documentation
    "List of provider specs to use when creating a new shell.
 Each element can be a provider ID symbol/string, a config function,
-or a list/plist specifying overrides, e.g. \\='((antigravity :model \"gemini-2.5-pro\")).")
+or a list/plist specifying overrides,
+e.g. \\='((antigravity :model \"gemini-2.5-pro\")).")
   (buffer-display
    nil
    :documentation
-   "How to display the shell buffer: `:foreground' (display and focus via `pop-to-buffer'),
-`:background' (do not display window or focus), `:display' (display via `display-buffer'),
-or nil (defaults to `:display').")
+   "How to display the shell buffer.
+One of `:foreground' (display and focus via `pop-to-buffer'),
+`:background' (do not display window or focus),
+`:display' (display via `display-buffer'), or nil (defaults to `:display').")
   (post-op
    nil
    :documentation
@@ -416,7 +422,8 @@ Populate via `register-agent-shell-workflow'.")
    (t target)))
 
 (defun agent-shell-workflow--normalize-display (display)
-  "Normalize DISPLAY (keyword, quoted symbol, or string) to canonical display keyword."
+  "Normalize DISPLAY to canonical display keyword.
+DISPLAY can be a keyword, quoted symbol, or string."
   (if (null display)
       :display
     (let ((sym (if (symbolp display)
@@ -428,7 +435,8 @@ Populate via `register-agent-shell-workflow'.")
         (_ :display)))))
 
 (defun agent-shell-workflow--normalize-shell-reuse (policy)
-  "Normalize shell reuse POLICY (keyword or symbol) to \\='always, \\='prompt, \\='new, or nil."
+  "Normalize shell reuse POLICY to \\='always, \\='prompt, \\='new, or nil.
+POLICY can be a keyword or symbol."
   (when policy
     (let ((name (string-remove-prefix ":" (format "%s" policy))))
       (cond
@@ -442,7 +450,8 @@ Populate via `register-agent-shell-workflow'.")
 TEMPLATE, SUBMIT, TARGET, POST-OP, CLEAR (or CLEAR-BEFORE), and VARIANTS.
 SHELL-REUSE specifies reuse behavior (\\='always, \\='prompt, \\='new).
 NEW-SHELL-PROVIDERS (or PROVIDERS) specifies preferred/allowed shell providers.
-BUFFER-DISPLAY (or DISPLAY) specifies `:foreground', `:background', or `:display'.
+BUFFER-DISPLAY (or DISPLAY) specifies `:foreground', `:background',
+or `:display'.
 Re-registering an existing ID replaces the entry."
   (unless id
     (error "Agent-shell-workflow: `:id' is required"))
@@ -506,10 +515,12 @@ Re-registering an existing ID replaces the entry."
 (defmacro register-agent-shell-workflow (id &rest keys)
   "Define and register a prompt workflow named ID.
 KEYS is a plist accepting the same keys as `agent-shell-workflow-register'
-\(:doc :category :args :pre-op :template :submit :target :post-op :clear :clear-before :variants
- :shell-reuse :new-shell-providers :providers :buffer-display :display).
-:args, :variants, :target, :shell-reuse, :buffer-display, and :new-shell-providers
-accept quoted or bare symbols and are quoted automatically."
+\(:doc :category :args :pre-op :template :submit :target :post-op
+ :clear :clear-before :variants :shell-reuse :new-shell-providers
+ :providers :buffer-display :display).
+:args, :variants, :target, :shell-reuse, :buffer-display, and
+:new-shell-providers accept quoted or bare symbols and are quoted
+automatically."
   (declare (indent 1))
   (let ((keys (copy-sequence keys)))
     (when (plist-member keys :args)
@@ -1267,7 +1278,8 @@ SUBMIT non-nil forces prompt submission regardless of spec default.
 CONTEXT-DIR sets `default-directory' for pre-op execution.
 SHELL-REUSE overrides reuse behavior (\\='always, \\='prompt, \\='new).
 NEW-SHELL-PROVIDERS (or PROVIDERS) overrides shell providers when spawning.
-BUFFER-DISPLAY (or DISPLAY) overrides `:foreground', `:background', or `:display'."
+BUFFER-DISPLAY (or DISPLAY) overrides `:foreground', `:background',
+or `:display'."
   (let* ((spec (or (agent-shell-workflow-get id)
                    (error "Agent-shell-workflow: no workflow registered with id `%s'" id)))
          (dir (or context-dir default-directory))
