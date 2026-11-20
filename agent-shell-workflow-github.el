@@ -513,6 +513,7 @@ Do NOT read the entire log file into context. Inspect the logs as files using se
 4. Implement targeted fix and verify with narrow tests."
   :submit t
   :target :session-reuse
+  :buffer-display :background
   :clear t)
 
 ;; PR review comment remediation

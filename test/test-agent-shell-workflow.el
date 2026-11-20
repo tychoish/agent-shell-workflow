@@ -3213,6 +3213,148 @@ and prompt is enqueued for target shell."
         (should (string-match-p "tool2" (plist-get res :group-report)))
         (should (string-match-p "M file.el" (plist-get res :group-report)))))))
 
+;;; ─────────────────────────────────────────────────────────────
+;;; Display configuration
+
+(ert-deftest agent-shell-workflow/normalize-display-aliases ()
+  "Display aliases map to canonical keywords; actions pass through."
+  (should (null (agent-shell-workflow--normalize-display nil)))
+  (should (eq (agent-shell-workflow--normalize-display 'focus) :foreground))
+  (should (eq (agent-shell-workflow--normalize-display 'show) :display))
+  (should (eq (agent-shell-workflow--normalize-display 'bury) :background))
+  (should (eq (agent-shell-workflow--normalize-display :background) :background))
+  (should (equal (agent-shell-workflow--normalize-display '((display-buffer-pop-up-window)))
+                 '((display-buffer-pop-up-window))))
+  (should (eq (agent-shell-workflow--normalize-display #'ignore) #'ignore))
+  ;; Unknown names are ignored so the next candidate or the default applies.
+  (should (null (agent-shell-workflow--normalize-display :foregroud)))
+  (let ((agent-shell-workflow-default-display :background))
+    (should (eq (agent-shell-workflow--resolve-display 'foo nil) :background))))
+
+(ert-deftest agent-shell-workflow/show-buffer-dispatches-by-mode ()
+  "show-buffer selects, shows, or buries the buffer according to DISPLAY."
+  (let ((buf (generate-new-buffer "asw-mode-buf")) calls)
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer) (lambda (b &rest _) (push (list 'pop b) calls)))
+                  ((symbol-function 'display-buffer) (lambda (b &rest _) (push (list 'show b) calls)))
+                  ((symbol-function 'bury-buffer) (lambda (b) (push (list 'bury b) calls))))
+          (agent-shell-workflow--show-buffer buf :foreground)
+          (agent-shell-workflow--show-buffer buf :display)
+          (agent-shell-workflow--show-buffer buf :background)
+          (should (equal (nreverse calls) (list (list 'pop buf) (list 'show buf) (list 'bury buf)))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/default-display-applies-when-unspecified ()
+  "An unspecified spec display falls back to `agent-shell-workflow-default-display'."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-default-wf
+     :template "hi" :target :session-new :new-shell-providers (antigravity) :submit t)
+   (should (null (agent-shell-workflow-spec-buffer-display
+                  (agent-shell-workflow-get 'test-default-wf))))
+   (let ((shell-buf (generate-new-buffer "asw-default-buf"))
+         (agent-shell-workflow-default-display :background))
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell--start) (lambda (&rest _) shell-buf))
+                   ((symbol-function 'pop-to-buffer)
+                    (lambda (&rest _) (ert-fail "pop-to-buffer should not be called")))
+                   ((symbol-function 'display-buffer)
+                    (lambda (&rest _) (ert-fail "display-buffer should not be called")))
+                   ((symbol-function 'agent-shell-insert) #'ignore))
+           (let ((noninteractive nil))
+             (agent-shell-workflow-dispatch 'test-default-wf)))
+       (kill-buffer shell-buf)))))
+
+(ert-deftest agent-shell-workflow/dispatch-display-overrides-spec ()
+  "A :display argument to dispatch beats the spec's display."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-override-wf
+     :template "hi" :target :session-new :new-shell-providers (antigravity)
+     :buffer-display :foreground :submit t)
+   (let ((shell-buf (generate-new-buffer "asw-override-buf")))
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell--start) (lambda (&rest _) shell-buf))
+                   ((symbol-function 'pop-to-buffer)
+                    (lambda (&rest _) (ert-fail "pop-to-buffer should not be called")))
+                   ((symbol-function 'display-buffer)
+                    (lambda (&rest _) (ert-fail "display-buffer should not be called")))
+                   ((symbol-function 'agent-shell-insert) #'ignore))
+           (let ((noninteractive nil))
+             (agent-shell-workflow-dispatch 'test-override-wf :display 'bury)))
+       (kill-buffer shell-buf)))))
+
+(ert-deftest agent-shell-workflow/display-action-alist-passed-to-display-buffer ()
+  "A display-buffer action alist is handed to `display-buffer' verbatim."
+  (let ((buf (generate-new-buffer "asw-action-buf"))
+        (action '((display-buffer-pop-up-window)))
+        seen)
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-buffer)
+                   (lambda (b &optional a &rest _) (setq seen (list b a)))))
+          (agent-shell-workflow--show-buffer buf action)
+          (should (equal seen (list buf action))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/display-function-called-with-buffer ()
+  "A display function is called with the buffer."
+  (let ((buf (generate-new-buffer "asw-fn-buf")) seen)
+    (unwind-protect
+        (progn
+          (agent-shell-workflow--show-buffer buf (lambda (b) (setq seen b)))
+          (should (eq seen buf)))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/announce-messages-and-alerts ()
+  "Announce always messages; alerts only when notify is set and `alert' exists."
+  (let (msgs alerts)
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest a) (push (apply #'format fmt a) msgs)))
+              ((symbol-function 'alert)
+               (lambda (text &rest _) (push text alerts))))
+      (let ((agent-shell-workflow-notify nil))
+        (agent-shell-workflow--announce 'fix-ci "/tmp/repo/")
+        (should (seq-some (lambda (m) (string-match-p "fix-ci.*dispatched.*repo" m)) msgs))
+        (should (null alerts)))
+      (let ((agent-shell-workflow-notify t))
+        (agent-shell-workflow--announce 'fix-ci "/tmp/repo/")
+        (should (= (length alerts) 1))))))
+
+(ert-deftest agent-shell-workflow/announce-notify-without-alert-is-visible ()
+  "With notify set but `alert' unbound, the skip is reported."
+  (let (msgs)
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest a) (push (apply #'format fmt a) msgs)))
+              ((symbol-function 'alert) nil))
+      (let ((agent-shell-workflow-notify t))
+        (agent-shell-workflow--announce 'fix-ci "/tmp/repo/")
+        (should (seq-some (lambda (m) (string-match-p "alert.*skipped" m)) msgs))))))
+
+(ert-deftest agent-shell-workflow/dispatch-group-shows-only-first-repo ()
+  "Group dispatch shows at most one shell; others are backgrounded."
+  (asw-test/isolate
+   (let (calls)
+     (cl-letf (((symbol-function 'agent-shell-workflow-dispatch)
+                (lambda (_id &rest keys) (push (plist-get keys :display) calls) t)))
+       (agent-shell-workflow-dispatch-group 'x '("/tmp/a" "/tmp/b" "/tmp/c")
+                                            :display :foreground)
+       (should (equal (nreverse calls) '(:display :background :background)))))))
+
+(ert-deftest agent-shell-workflow/dispatch-group-background-stays-background ()
+  "A background group display is applied to every repo."
+  (asw-test/isolate
+   (let (calls)
+     (cl-letf (((symbol-function 'agent-shell-workflow-dispatch)
+                (lambda (_id &rest keys) (push (plist-get keys :display) calls) t)))
+       (agent-shell-workflow-dispatch-group 'x '("/tmp/a" "/tmp/b") :display 'bury)
+       (should (equal calls '(:background :background)))))))
+
+(ert-deftest agent-shell-workflow/fire-and-forget-workflows-are-background ()
+  "fix-ci registers with a background display."
+  (require 'agent-shell-workflow-github)
+  (should (eq (agent-shell-workflow-spec-buffer-display
+               (agent-shell-workflow-get 'fix-ci))
+              :background)))
+
+
 (provide 'test-agent-shell-workflow)
 
 ;;; test-agent-shell-workflow.el ends here

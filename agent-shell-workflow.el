@@ -106,6 +106,26 @@ Directories are expanded to absolute paths upon registration and resolution."
   :type '(alist :key-type symbol :value-type (repeat directory))
   :group 'agent-shell-workflow)
 
+(defcustom agent-shell-workflow-default-display :display
+  "Default display behavior for a dispatched workflow's shell buffer.
+Used when neither the dispatch call nor the workflow spec specifies one.
+One of `:foreground' (alias `focus'; show and select), `:display' (alias
+`show'; show without selecting), `:background' (alias `bury'; do not
+display, bury a newly created shell), a `display-buffer' action alist, or
+a function called with the buffer."
+  :type '(choice (const :tag "Show and select" :foreground)
+                 (const :tag "Show without selecting" :display)
+                 (const :tag "Do not display" :background)
+                 (sexp :tag "Action alist or function"))
+  :group 'agent-shell-workflow)
+
+(defcustom agent-shell-workflow-notify nil
+  "When non-nil, also send an `alert' notification when a workflow is dispatched.
+The echo-area message is always shown.  If `alert' is not available the
+notification is skipped and the skip is reported in the echo area."
+  :type 'boolean
+  :group 'agent-shell-workflow)
+
 (defvar agent-shell-workflow--in-flight-dispatches (make-hash-table :test 'equal)
   "Hash table tracking active or recently dispatched workflows.
 Keys are composite identifiers `(id dir)', values are dispatch timestamps.")
@@ -379,8 +399,10 @@ e.g. \\='((antigravity :model \"gemini-2.5-pro\")).")
    :documentation
    "How to display the shell buffer.
 One of `:foreground' (display and focus via `pop-to-buffer'),
-`:background' (do not display window or focus),
-`:display' (display via `display-buffer'), or nil (defaults to `:display').")
+`:background' (do not display window or focus; bury new shells),
+`:display' (display via `display-buffer' without selecting), a
+`display-buffer' action alist, a function called with the buffer, or nil
+\(use `agent-shell-workflow-default-display').")
   (post-op
    nil
    :documentation
@@ -430,17 +452,60 @@ Populate via `register-agent-shell-workflow'.")
    (t target)))
 
 (defun agent-shell-workflow--normalize-display (display)
-  "Normalize DISPLAY to canonical display keyword.
-DISPLAY can be a keyword, quoted symbol, or string."
-  (if (null display)
-      :display
-    (let ((sym (if (symbolp display)
-                   (intern (format ":%s" (string-remove-prefix ":" (symbol-name display))))
-                 (intern (format ":%s" (string-remove-prefix ":" (format "%s" display)))))))
-      (pcase sym
-        (:background :background)
-        (:foreground :foreground)
-        (_ :display)))))
+  "Normalize DISPLAY to a canonical display value, or nil when unspecified.
+Keywords, symbols and strings map to `:foreground' (focus), `:display'
+(show) or `:background' (bury, background).  A function or a
+`display-buffer' action alist (a cons) passes through.  Unknown names
+yield nil so the next candidate or the default applies."
+  (cond
+   ((null display) nil)
+   ((functionp display) display)
+   ((consp display) display)
+   (t
+    (pcase (string-remove-prefix ":" (format "%s" display))
+      ((or "foreground" "focus") :foreground)
+      ((or "display" "show") :display)
+      ((or "background" "bury") :background)
+      (_ nil)))))
+
+(defun agent-shell-workflow--resolve-display (&rest candidates)
+  "Return the first non-nil of CANDIDATES, normalized.
+Falls back to `agent-shell-workflow-default-display', then `:display'."
+  (or (seq-some #'agent-shell-workflow--normalize-display candidates)
+      (agent-shell-workflow--normalize-display agent-shell-workflow-default-display)
+      :display))
+
+(defun agent-shell-workflow--show-buffer (buffer display)
+  "Present BUFFER according to the normalized DISPLAY value.
+`:foreground' selects it, `:display' shows it without selecting,
+`:background' buries it, an action alist is passed to `display-buffer',
+and a function is called with BUFFER."
+  (cond
+   ((eq display :background)
+    (bury-buffer buffer))
+   ((eq display :foreground)
+    (pop-to-buffer buffer))
+   ((consp display)
+    (display-buffer buffer display))
+   ((functionp display)
+    (funcall display buffer))
+   (t
+    (display-buffer buffer))))
+
+(declare-function alert "alert")
+
+(defun agent-shell-workflow--announce (id dir)
+  "Report that workflow ID was dispatched for DIR.
+Always messages the echo area; when `agent-shell-workflow-notify' is
+non-nil also sends an `alert', or reports that the alert was skipped."
+  (let ((text (format "Workflow `%s' dispatched to %s" id
+                      (file-name-nondirectory
+                       (directory-file-name (expand-file-name (or dir default-directory)))))))
+    (message "%s" text)
+    (when agent-shell-workflow-notify
+      (if (fboundp 'alert)
+          (alert text :title "agent-shell-workflow")
+        (message "agent-shell-workflow: alert unavailable; notification skipped")))))
 
 (defun agent-shell-workflow--normalize-shell-reuse (policy)
   "Normalize shell reuse POLICY to \\='always, \\='prompt, \\='new, or nil.
@@ -936,8 +1001,7 @@ When PROVIDERS has multiple items, prompts user via `completing-read'."
   "Create and return a new `agent-shell' buffer in DIR with CONFIG.
 When CONFIG is nil, prompts for agent selection via `agent-shell-select-config'
 if available, or falls back to `agent-shell-new-shell'.
-DISPLAY controls buffer display: `:foreground' (focus via `pop-to-buffer'),
-`:background' (no display or focus), or `:display' (via `display-buffer')."
+DISPLAY controls buffer display; see `agent-shell-workflow--show-buffer'."
   (let* ((canon-dir (agent-shell-workflow--canonicalize-dir (or dir default-directory)))
          (before-bufs (agent-shell-buffers)))
     (let ((default-directory canon-dir))
@@ -975,10 +1039,8 @@ DISPLAY controls buffer display: `:foreground' (focus via `pop-to-buffer'),
             (with-current-buffer buf
               (setq-local agent-shell-workflow--new-shell t))
             (unless noninteractive
-              (pcase (agent-shell-workflow--normalize-display display)
-                (:background nil)
-                (:foreground (pop-to-buffer buf))
-                (_ (display-buffer buf)))))
+              (agent-shell-workflow--show-buffer
+               buf (agent-shell-workflow--resolve-display display))))
           buf)))))
 
 (defun agent-shell-workflow--call-create-shell (dir &optional config display)
@@ -1314,20 +1376,17 @@ or `ask').  Returns the plist returned by `agent-shell-insert'."
                           (y-or-n-p "Submit rendered prompt? "))
                          (t submit)))
          (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx))
-         (display (agent-shell-workflow--normalize-display
-                   (or (plist-get ctx :buffer-display)
-                       (and spec (agent-shell-workflow-spec-buffer-display spec))))))
+         (display (agent-shell-workflow--resolve-display
+                   (plist-get ctx :buffer-display)
+                   (and spec (agent-shell-workflow-spec-buffer-display spec)))))
     (when (buffer-live-p shell-buffer)
       (with-current-buffer shell-buffer
         (setq-local agent-shell-workflow--new-shell nil))
       (unless noninteractive
-        (pcase display
-          (:background nil)
-          (:foreground (pop-to-buffer shell-buffer))
-          (_ (display-buffer shell-buffer))))
-      (message "Submitting prompt for workflow `%s' to `%s'..."
-               (agent-shell-workflow-spec-id spec)
-               (buffer-name shell-buffer)))
+        (agent-shell-workflow--show-buffer shell-buffer display))
+      (agent-shell-workflow--announce
+       (agent-shell-workflow-spec-id spec)
+       (or (plist-get ctx :context-dir) default-directory)))
     (agent-shell-insert :text rendered
                         :shell-buffer shell-buffer
                         :submit actual-submit)))
@@ -1361,8 +1420,10 @@ SUBMIT non-nil forces prompt submission regardless of spec default.
 CONTEXT-DIR sets `default-directory' for pre-op execution.
 SHELL-REUSE overrides reuse behavior (\\='always, \\='prompt, \\='new).
 NEW-SHELL-PROVIDERS (or PROVIDERS) overrides shell providers when spawning.
-BUFFER-DISPLAY (or DISPLAY) overrides `:foreground', `:background',
-or `:display'."
+BUFFER-DISPLAY (or DISPLAY; BUFFER-DISPLAY wins) overrides the spec's
+display.  See `agent-shell-workflow--normalize-display' for the accepted
+values: `:foreground'/`focus', `:display'/`show', `:background'/`bury',
+a `display-buffer' action alist, or a function."
   (let* ((spec (or (agent-shell-workflow-get id)
                    (error "Agent-shell-workflow: no workflow registered with id `%s'" id)))
          (dir (or context-dir default-directory))
@@ -1382,9 +1443,9 @@ or `:display'."
       (let* ((raw-target (agent-shell-workflow--normalize-target
                           (or target (agent-shell-workflow-spec-target spec))))
              (effective-display
-              (agent-shell-workflow--normalize-display
-               (or buffer-display display
-                   (and spec (agent-shell-workflow-spec-buffer-display spec)))))
+              (agent-shell-workflow--resolve-display
+               buffer-display display
+               (and spec (agent-shell-workflow-spec-buffer-display spec))))
              (effective-shell-reuse
               (agent-shell-workflow--normalize-shell-reuse
                (or shell-reuse
@@ -1501,10 +1562,7 @@ or `:display'."
                       resolved-target shell-buffer)
                 (when (buffer-live-p shell-buffer)
                   (unless noninteractive
-                    (pcase effective-display
-                      (:background nil)
-                      (:foreground (pop-to-buffer shell-buffer))
-                      (_ (display-buffer shell-buffer))))
+                    (agent-shell-workflow--show-buffer shell-buffer effective-display))
                   (message "Created agent-shell `%s' for workflow `%s'"
                            (buffer-name shell-buffer) id)))
             (when (and (buffer-live-p shell-buffer)
@@ -1576,13 +1634,32 @@ GROUP is a symbol in `agent-shell-workflow-repo-groups' or a list
 of repository directories.
 KEYS are passed to `agent-shell-workflow-dispatch' for each
 repository, overriding `:context-dir' with each repository directory.
+Only the first repository's shell is displayed (a `:foreground' display is
+downgraded to `:display' so focus is not stolen); the rest are backgrounded
+so a large group does not pop one window per repository.
 Returns an alist mapping each repository directory to its dispatch result."
   (let* ((repos (agent-shell-workflow-resolve-repo-group group))
+         (spec (agent-shell-workflow-get id))
+         (group-display
+          (agent-shell-workflow--resolve-display
+           (plist-get keys :buffer-display)
+           (plist-get keys :display)
+           (and spec (agent-shell-workflow-spec-buffer-display spec))))
+         (shown nil)
          results)
     (dolist (dir repos (nreverse results))
-      (let* ((dir-keys (copy-sequence keys))
-             (effective-keys (plist-put dir-keys :context-dir dir))
+      (let* ((repo-display (cond
+                            ((eq group-display :background) :background)
+                            (shown :background)
+                            ((eq group-display :foreground) :display)
+                            (t group-display)))
+             (dir-keys (copy-sequence keys))
+             (effective-keys (thread-first dir-keys
+                               (plist-put :context-dir dir)
+                               (plist-put :display repo-display)
+                               (plist-put :buffer-display repo-display)))
              (res (apply #'agent-shell-workflow-dispatch id effective-keys)))
+        (setq shown (or shown (not (eq repo-display :background))))
         (push (cons dir res) results)))))
 
 ;; Integration with agent-shell-queue

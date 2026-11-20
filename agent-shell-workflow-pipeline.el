@@ -240,6 +240,7 @@ Select action:"
 Perform all edits in this isolated worktree. Ensure all tests and syntax checks pass. Do not commit or push."
   :submit t
   :target :session-reuse
+  :buffer-display :background
   :post-op #'agent-shell-workflow-library--pipeline-run-post-op)
 
 (register-agent-shell-workflow executor-pipeline-verify

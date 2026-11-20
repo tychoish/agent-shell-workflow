@@ -34,6 +34,30 @@ interactive selection menus.
 (agent-shell-workflow-select)
 #+END_SRC
 
+* Display behavior
+
+Each workflow controls how its shell buffer is presented, via =:display= (or
+=:buffer-display=) in =register-agent-shell-workflow= or as a keyword to
+=agent-shell-workflow-dispatch= (the dispatch argument wins; =:buffer-display= wins over =:display= when
+both are given).  An unrecognized value is ignored.  When neither is given, ~agent-shell-workflow-default-display~ applies.
+
+| Value                         | Alias    | Behavior                                      |
+|-------------------------------+----------+-----------------------------------------------|
+| =:foreground=                 | =focus=  | show and select the shell                     |
+| =:display=                    | =show=   | show without selecting                        |
+| =:background=                 | =bury=   | do not display; bury a newly created shell    |
+| =display-buffer= action alist |          | passed to =display-buffer=                    |
+| function                      |          | called with the shell buffer                  |
+
+A =Workflow `ID' dispatched to DIR= message is shown in the echo area
+when the prompt is delivered to a shell.  In the =register-agent-shell-workflow=
+macro, quote an action alist (=:display '((display-buffer-pop-up-window))=).  Set ~agent-shell-workflow-notify~ to also send an =alert=
+notification (skipped, with a message, when =alert= is unavailable).
+
+=fix-ci= and =executor-pipeline-run= default to =:background=.
+~agent-shell-workflow-dispatch-group~ shows at most the first repository's
+shell (=:foreground= is downgraded to =:display=) and backgrounds the rest.
+
 * License
 
 GPL-3.0-or-later
