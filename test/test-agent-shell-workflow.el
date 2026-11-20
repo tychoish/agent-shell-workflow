@@ -3116,7 +3116,7 @@ and prompt is enqueued for target shell."
      (agent-shell-workflow-register-repo-group 'group-a '("/tmp/repo-a" "/tmp/repo-b"))
      (cl-letf (((symbol-function 'agent-shell-workflow-dispatch)
                 (lambda (_id &rest keys)
-                  (let ((dir (plist-get keys :dir)))
+                  (let ((dir (plist-get keys :context-dir)))
                     (push dir dispatched-dirs)
                     (format "result-for-%s" (file-name-nondirectory dir))))))
        (let ((results (agent-shell-workflow-dispatch-group 'test-group-wf 'group-a)))
@@ -3125,6 +3125,32 @@ and prompt is enqueued for target shell."
          (should (member (expand-file-name "/tmp/repo-b") dispatched-dirs))
          (should (equal (cdr (assoc (expand-file-name "/tmp/repo-a") results)) "result-for-repo-a"))
          (should (equal (cdr (assoc (expand-file-name "/tmp/repo-b") results)) "result-for-repo-b")))))))
+
+(ert-deftest agent-shell-workflow/dispatch-group-real-dispatch-sets-context-dir ()
+  "Through the real `dispatch', each repository is the context dir seen by the pre-op."
+  (asw-test/isolate
+   (let* ((dir-a (file-name-as-directory (make-temp-file "asw-repo-a" t)))
+          (dir-b (file-name-as-directory (make-temp-file "asw-repo-b" t)))
+          (shell-buf (generate-new-buffer "asw-group-real-buf"))
+          seen)
+     (unwind-protect
+         (progn
+           (register-agent-shell-workflow test-group-real
+             :template "hi" :target :session-new :new-shell-providers (antigravity)
+             :buffer-display :background :submit t
+             :pre-op (lambda (ctx)
+                       (push (list (plist-get ctx :context-dir) default-directory) seen)
+                       ctx))
+           (cl-letf (((symbol-function 'agent-shell--start) (lambda (&rest _) shell-buf))
+                     ((symbol-function 'agent-shell-insert) #'ignore))
+             (agent-shell-workflow-dispatch-group 'test-group-real (list dir-a dir-b)))
+           (should (equal (seq-map (lambda (e) (file-truename (car e))) (reverse seen))
+                          (list (file-truename dir-a) (file-truename dir-b))))
+           (should (equal (seq-map (lambda (e) (file-truename (cadr e))) (reverse seen))
+                          (list (file-truename dir-a) (file-truename dir-b)))))
+       (kill-buffer shell-buf)
+       (delete-directory dir-a t)
+       (delete-directory dir-b t)))))
 
 (ert-deftest agent-shell-workflow/select-group-prompts-and-dispatches ()
   "agent-shell-workflow-select-group prompts for group and workflow, then dispatches."

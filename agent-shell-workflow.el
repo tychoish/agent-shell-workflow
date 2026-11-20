@@ -1575,13 +1575,13 @@ Signals `user-error' if GROUP cannot be resolved."
 GROUP is a symbol in `agent-shell-workflow-repo-groups' or a list
 of repository directories.
 KEYS are passed to `agent-shell-workflow-dispatch' for each
-repository, overriding `:dir' with each repository directory.
+repository, overriding `:context-dir' with each repository directory.
 Returns an alist mapping each repository directory to its dispatch result."
   (let* ((repos (agent-shell-workflow-resolve-repo-group group))
          results)
     (dolist (dir repos (nreverse results))
       (let* ((dir-keys (copy-sequence keys))
-             (effective-keys (plist-put dir-keys :dir dir))
+             (effective-keys (plist-put dir-keys :context-dir dir))
              (res (apply #'agent-shell-workflow-dispatch id effective-keys)))
         (push (cons dir res) results)))))
 
