@@ -45,6 +45,7 @@
 (require 'seq)
 (require 'subr-x)
 (require 'agent-shell)
+(require 'annotated-completing-read)
 (require 'magit-process)
 
 (declare-function agent-shell-queue-enqueue-clear "agent-shell-queue")
@@ -690,14 +691,6 @@ Handles `:drop-context', `:restart', `:close', and `(:chain ID ARGS)'.
     (_ nil)))
 
 ;; Dispatch routing
-(defun agent-shell-workflow--resolve-target (target)
-  "Resolve TARGET keyword `:ask' via `completing-read' into a concrete target."
-  (let ((norm (agent-shell-workflow--normalize-target target)))
-    (if (eq norm :ask)
-        (intern (completing-read "Dispatch to: "
-                                 '(":session-reuse" ":session-new" ":queue")
-                                 nil t))
-      norm)))
 
 (defun agent-shell-workflow--canonicalize-dir (dir)
   "Return canonical representation of DIR with trailing slash."
@@ -730,6 +723,87 @@ or where either directory is within the other."
                             (string-prefix-p buf-dir canon-dir)
                             (string-prefix-p canon-dir buf-dir))))))
                 (agent-shell-buffers))))
+
+(cl-defun agent-shell-workflow--target-candidates (&optional dir (include-queue (or (bound-and-true-p agent-shell-workflow-dispatch-target-functions)
+                                                                                   (fboundp 'agent-shell-queue-enqueue))
+                                                                               include-queue-p))
+  "Return candidate alist for selecting a dispatch target via ACR.
+DIR is the target directory (defaults to `default-directory').
+When INCLUDE-QUEUE is non-nil (or omitted when queue integration is
+active), an enqueue target option is included.
+
+Each entry is of the form:
+  (CANDIDATE-STRING ANNOTATION . TARGET)
+Where TARGET is `:session-new', a live shell buffer, or `:queue'."
+  (let* ((effective-dir (agent-shell-workflow--canonicalize-dir (or dir default-directory)))
+         (dir-name (file-name-nondirectory (directory-file-name effective-dir)))
+         (project-buffers (agent-shell-workflow--project-buffers effective-dir))
+         (all-buffers (if (fboundp 'agent-shell-buffers) (agent-shell-buffers) nil))
+         (other-buffers (seq-remove (lambda (b) (memq b project-buffers)) all-buffers))
+         (queue-available (if include-queue-p
+                              include-queue
+                            (or (bound-and-true-p agent-shell-workflow-dispatch-target-functions)
+                                (fboundp 'agent-shell-queue-enqueue))))
+         candidates)
+    ;; 1. New shell in this directory
+    (push (cons (format "New agent-shell in %s" dir-name)
+                (cons "[new shell]" :session-new))
+          candidates)
+    ;; 2. Open shells matching the repository
+    (dolist (buf project-buffers)
+      (when (buffer-live-p buf)
+        (push (cons (buffer-name buf)
+                    (cons (format "[%s (project)]" dir-name) buf))
+              candidates)))
+    ;; 3. Other open agent shells
+    (dolist (buf other-buffers)
+      (when (buffer-live-p buf)
+        (let* ((buf-dir (with-current-buffer buf default-directory))
+               (buf-dir-short (file-name-nondirectory (directory-file-name (expand-file-name buf-dir)))))
+          (push (cons (buffer-name buf)
+                      (cons (format "[open: %s]" buf-dir-short) buf))
+                candidates))))
+    ;; 4. Queue target (when available)
+    (when queue-available
+      (push (cons "Enqueue in task queue"
+                  (cons "[queue]" :queue))
+            candidates))
+    (nreverse candidates)))
+
+(defun agent-shell-workflow--pick-dispatch-target (&optional dir prompt)
+  "Prompt the user to select a dispatch target via `annotated-completing-read'.
+Offers creating a new shell in DIR, any open shell, and task queue when available."
+  (let* ((effective-dir (agent-shell-workflow--canonicalize-dir (or dir default-directory)))
+         (candidates (agent-shell-workflow--target-candidates effective-dir))
+         (prompt-str (or prompt
+                         (format "Dispatch workflow to [%s]: "
+                                 (file-name-nondirectory (directory-file-name effective-dir)))))
+         (choice (annotated-completing-read
+                  candidates
+                  :prompt prompt-str
+                  :category 'agent-shell-target
+                  :require-match t
+                  :history 'agent-shell-workflow-target-history)))
+    (cond
+     ((bufferp choice) choice)
+     ((memq choice '(:session-new :queue :session-reuse)) choice)
+     ((stringp choice)
+      (cond
+       ((get-buffer choice) (get-buffer choice))
+       ((string-prefix-p ":" choice) (intern choice))
+       ((string-match-p "\\`\\[?new" (downcase choice)) :session-new)
+       ((string-match-p "queue" (downcase choice)) :queue)
+       (t choice)))
+     (t choice))))
+
+(defun agent-shell-workflow--resolve-target (target &optional dir)
+  "Resolve TARGET into a concrete target.
+When TARGET is `:ask', prompt the user via `agent-shell-workflow--pick-dispatch-target'.
+Otherwise return TARGET normalized."
+  (let ((norm (agent-shell-workflow--normalize-target target)))
+    (if (eq norm :ask)
+        (agent-shell-workflow--pick-dispatch-target dir)
+      norm)))
 
 (defun agent-shell-workflow--normalize-provider-spec (item)
   "Normalize provider specification ITEM to (ID . PLIST-OPTIONS).
@@ -979,9 +1053,9 @@ When SUBMIT is non-nil, submit the prompt immediately.
 Once the turn has been handed off without error (inserted, queued or
 deferred), the function named by CTX's `:after-handoff' (a symbol, so
 it survives queue serialization) is called with CTX."
-  (let* ((target (agent-shell-workflow--resolve-target (or target (agent-shell-workflow-spec-target spec))))
+  (let* ((effective-dir (or dir (plist-get ctx :context-dir) default-directory))
+         (target (agent-shell-workflow--resolve-target (or target (agent-shell-workflow-spec-target spec)) effective-dir))
          (submit (if (null submit) (agent-shell-workflow-spec-submit spec) submit))
-         (effective-dir (or dir (plist-get ctx :context-dir) default-directory))
          (result
     (cond
      ((run-hook-with-args-until-success 'agent-shell-workflow-dispatch-target-functions

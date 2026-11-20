@@ -3001,6 +3001,97 @@ and prompt is enqueued for target shell."
      (should (eq (agent-shell-workflow-spec-buffer-display spec) :background))
      (should (eq (agent-shell-workflow-spec-shell-reuse spec) 'always)))))
 
+;;; ─────────────────────────────────────────────────────────────────────────────
+;;; Flattened dispatch options (ACR) & Repository Groups
+
+(ert-deftest agent-shell-workflow/target-candidates-includes-new-project-other-and-queue ()
+  "Target candidates alist includes new shell, project shells, other shells, and queue."
+  (let ((proj-buf (generate-new-buffer "*agent: proj*"))
+        (other-buf (generate-new-buffer "*agent: other*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-buffers)
+                   (lambda () (list proj-buf other-buf)))
+                  ((symbol-function 'agent-shell-workflow--project-buffers)
+                   (lambda (_dir) (list proj-buf))))
+          (let ((candidates (agent-shell-workflow--target-candidates "/mock/repo" t)))
+            ;; Contains new shell
+            (should (seq-some (lambda (c) (eq (cddr c) :session-new)) candidates))
+            ;; Contains project buffer
+            (should (seq-some (lambda (c) (eq (cddr c) proj-buf)) candidates))
+            ;; Contains other open buffer
+            (should (seq-some (lambda (c) (eq (cddr c) other-buf)) candidates))
+            ;; Contains queue
+            (should (seq-some (lambda (c) (eq (cddr c) :queue)) candidates))))
+      (kill-buffer proj-buf)
+      (kill-buffer other-buf))))
+
+(ert-deftest agent-shell-workflow/target-candidates-respects-include-queue-nil ()
+  "Target candidates excludes queue when INCLUDE-QUEUE is nil."
+  (cl-letf (((symbol-function 'agent-shell-buffers) (lambda () nil))
+            ((symbol-function 'agent-shell-workflow--project-buffers) (lambda (_) nil)))
+    (let ((candidates (agent-shell-workflow--target-candidates "/mock/repo" nil)))
+      (should-not (seq-some (lambda (c) (eq (cddr c) :queue)) candidates)))))
+
+(ert-deftest agent-shell-workflow/pick-dispatch-target-returns-concrete-target ()
+  "Pick dispatch target invokes annotated-completing-read and returns target."
+  (let ((buf (generate-new-buffer "*test-target-buf*")))
+    (unwind-protect
+        (progn
+          ;; Returns buffer
+          (cl-letf (((symbol-function 'annotated-completing-read)
+                     (lambda (&rest _) buf)))
+            (should (eq (agent-shell-workflow--pick-dispatch-target "/mock/dir") buf)))
+          ;; Returns :session-new
+          (cl-letf (((symbol-function 'annotated-completing-read)
+                     (lambda (&rest _) :session-new)))
+            (should (eq (agent-shell-workflow--pick-dispatch-target "/mock/dir") :session-new)))
+          ;; Returns :queue
+          (cl-letf (((symbol-function 'annotated-completing-read)
+                     (lambda (&rest _) :queue)))
+            (should (eq (agent-shell-workflow--pick-dispatch-target "/mock/dir") :queue))))
+      (kill-buffer buf))))
+
+(ert-deftest agent-shell-workflow/dispatch-ask-dispatches-to-selected-other-shell ()
+  "Dispatching with target :ask allows dispatching to an open shell from another project."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-ask-other
+     :template "Hello ask: {{args.task}}"
+     :target :ask
+     :submit t)
+   (let ((other-buf (generate-new-buffer "*agent: other-repo*"))
+         delivered-buf)
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell-workflow--pick-dispatch-target)
+                    (lambda (&optional _dir _prompt) other-buf))
+                   ((symbol-function 'agent-shell-insert)
+                    (lambda (&rest keys)
+                      (setq delivered-buf (plist-get keys :shell-buffer))
+                      (list :shell-buffer delivered-buf :start 1 :end 1))))
+           (agent-shell-workflow-dispatch 'test-ask-other :args '(:task "check"))
+           (should (eq delivered-buf other-buf)))
+       (kill-buffer other-buf)))))
+
+(ert-deftest agent-shell-workflow/select-menu-prefix-forces-ask ()
+  "agent-shell-workflow-select with prefix argument forces :target :ask."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-menu-prefix
+     :template "Menu task"
+     :target :session-reuse
+     :submit t)
+   (let ((spec (agent-shell-workflow-get 'test-menu-prefix))
+         dispatched-target)
+     (cl-letf (((symbol-function 'annotated-completing-read)
+                (lambda (&rest _) spec))
+               ((symbol-function 'agent-shell-workflow-dispatch)
+                (lambda (id &rest keys)
+                  (setq dispatched-target (plist-get keys :target)))))
+       ;; Without prefix: no explicit :target :ask passed
+       (agent-shell-workflow-select nil nil)
+       (should-not dispatched-target)
+       ;; With prefix: passes :target :ask
+       (agent-shell-workflow-select nil '(4))
+       (should (eq dispatched-target :ask))))))
+
 (provide 'test-agent-shell-workflow)
 
 ;;; test-agent-shell-workflow.el ends here

@@ -45,11 +45,13 @@
       specs)))
 
 ;;;###autoload
-(defun agent-shell-workflow-select (&optional category)
+(defun agent-shell-workflow-select (&optional category arg)
   "Pick a registered workflow via `annotated-completing-read' and dispatch it.
 Candidates are annotated with their category and one-line doc.  With
-CATEGORY non-nil, only workflows in that category are offered."
-  (interactive)
+CATEGORY non-nil, only workflows in that category are offered.
+When ARG is non-nil (or invoked with `C-u'), prompt for dispatch target
+via ACR (choosing any open shell, a new shell in repo, or the queue)."
+  (interactive (list nil current-prefix-arg))
   (let* ((specs (or (agent-shell-workflow--candidates category)
                     (user-error "No workflows registered")))
          (table (seq-map
@@ -66,7 +68,9 @@ CATEGORY non-nil, only workflows in that category are offered."
                     :category 'agent-shell-workflow
                     :require-match t
                     :history 'agent-shell-workflow-select)))
-    (agent-shell-workflow-dispatch (agent-shell-workflow-spec-id selected))))
+    (if arg
+        (agent-shell-workflow-dispatch (agent-shell-workflow-spec-id selected) :target :ask)
+      (agent-shell-workflow-dispatch (agent-shell-workflow-spec-id selected)))))
 
 (provide 'agent-shell-workflow-menu)
 
