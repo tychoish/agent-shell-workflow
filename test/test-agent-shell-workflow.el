@@ -198,6 +198,119 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
                                   (lambda (ctx) (setq result ctx)))
      (should (equal (plist-get result :extra) "async")))))
 
+(ert-deftest agent-shell-workflow/exec-pre-skip-sync-ends-turn-silently ()
+  "A synchronous pre-op that signals skip never reaches the callback."
+  (asw-test/isolate
+   (register-agent-shell-workflow skip-sync
+     :pre-op (lambda (_ctx) (agent-shell-workflow-skip "nothing new"))
+     :template "x")
+   (let (called msgs)
+     (cl-letf (((symbol-function 'message)
+                (lambda (fmt &rest a) (push (apply #'format fmt a) msgs))))
+       (agent-shell-workflow-exec-pre (agent-shell-workflow-get 'skip-sync) nil
+                                      (lambda (_) (setq called t))))
+     (should-not called)
+     (should (seq-some (lambda (m) (string-match-p "skipped: nothing new" m)) msgs)))))
+
+(ert-deftest agent-shell-workflow/exec-pre-skip-async-and-default-reason ()
+  "An asynchronous pre-op can skip too; the reason defaults to \"nothing to do\"."
+  (asw-test/isolate
+   (register-agent-shell-workflow skip-async
+     :pre-op (lambda (_ctx _callback) (agent-shell-workflow-skip))
+     :template "x")
+   (let (called msgs)
+     (cl-letf (((symbol-function 'message)
+                (lambda (fmt &rest a) (push (apply #'format fmt a) msgs))))
+       (agent-shell-workflow-exec-pre (agent-shell-workflow-get 'skip-async) nil
+                                      (lambda (_) (setq called t))))
+     (should-not called)
+     (should (seq-some (lambda (m) (string-match-p "skipped: nothing to do" m)) msgs)))))
+
+(ert-deftest agent-shell-workflow/exec-pre-callback-errors-are-not-skips ()
+  "An error in the callback of a synchronous pre-op propagates instead of being swallowed."
+  (asw-test/isolate
+   (register-agent-shell-workflow cb-error
+     :pre-op (lambda (ctx) ctx)
+     :template "x")
+   (should-error (agent-shell-workflow-exec-pre (agent-shell-workflow-get 'cb-error) nil
+                                                (lambda (_) (error "downstream boom")))
+                 :type 'error)
+   ;; A skip signalled by the callback is likewise not absorbed by the pre-op guard.
+   (should-error (agent-shell-workflow-exec-pre
+                  (agent-shell-workflow-get 'cb-error) nil
+                  (lambda (_) (agent-shell-workflow-skip "from callback")))
+                 :type 'agent-shell-workflow-skip)))
+
+(defmacro asw-test/with-dispatch-rendered-stubbed (delivery &rest body)
+  "Run BODY with `--dispatch-rendered' delivery replaced by function DELIVERY."
+  (declare (indent 1))
+  `(let ((agent-shell-workflow-dispatch-target-functions nil))
+     (cl-letf (((symbol-function 'agent-shell-workflow--dispatch-to-buffer) ,delivery))
+       ,@body)))
+
+(defvar asw-test--handoff-calls nil
+  "Recorded `:after-handoff' invocations.")
+
+(defun asw-test--record-handoff (ctx)
+  "Record CTX as an :after-handoff call."
+  (push ctx asw-test--handoff-calls))
+
+(defun asw-test--failing-handoff (_ctx)
+  "Signal an error from :after-handoff."
+  (error "handoff exploded"))
+
+(ert-deftest agent-shell-workflow/after-handoff-runs-once-after-delivery ()
+  "`:after-handoff' is called with ctx after a successful hand-off."
+  (asw-test/isolate
+   (register-agent-shell-workflow handoff-ok :template "x" :target :session-reuse)
+   (let ((asw-test--handoff-calls nil)
+         (order nil)
+         (spec (agent-shell-workflow-get 'handoff-ok))
+         (ctx (list :shell-buffer (current-buffer)
+                    :after-handoff #'asw-test--record-handoff)))
+     (asw-test/with-dispatch-rendered-stubbed (lambda (&rest _) (push 'delivered order) 'done)
+       (should (eq 'done (agent-shell-workflow--dispatch-rendered spec ctx nil nil "/tmp/x"))))
+     (should (= 1 (length asw-test--handoff-calls)))
+     (should (eq (plist-get (car asw-test--handoff-calls) :after-handoff)
+                 #'asw-test--record-handoff))
+     (should (equal order '(delivered))))))
+
+(ert-deftest agent-shell-workflow/after-handoff-skipped-when-delivery-fails ()
+  "A delivery error propagates and `:after-handoff' never runs."
+  (asw-test/isolate
+   (register-agent-shell-workflow handoff-fail :template "x" :target :session-reuse)
+   (let ((asw-test--handoff-calls nil)
+         (spec (agent-shell-workflow-get 'handoff-fail))
+         (ctx (list :shell-buffer (current-buffer)
+                    :after-handoff #'asw-test--record-handoff)))
+     (asw-test/with-dispatch-rendered-stubbed (lambda (&rest _) (error "no shell"))
+       (should-error (agent-shell-workflow--dispatch-rendered spec ctx nil nil "/tmp/x")))
+     (should-not asw-test--handoff-calls))))
+
+(ert-deftest agent-shell-workflow/after-handoff-error-is-reported-not-raised ()
+  "A failing `:after-handoff' is reported via `message' and the result is kept."
+  (asw-test/isolate
+   (register-agent-shell-workflow handoff-boom :template "x" :target :session-reuse)
+   (let ((spec (agent-shell-workflow-get 'handoff-boom))
+         (ctx (list :shell-buffer (current-buffer)
+                    :after-handoff #'asw-test--failing-handoff))
+         msgs)
+     (cl-letf (((symbol-function 'message)
+                (lambda (fmt &rest a) (push (apply #'format fmt a) msgs))))
+       (asw-test/with-dispatch-rendered-stubbed (lambda (&rest _) 'kept)
+         (should (eq 'kept (agent-shell-workflow--dispatch-rendered spec ctx nil nil "/tmp/x")))))
+     (should (seq-some (lambda (m) (string-match-p "after-handoff failed: handoff exploded" m))
+                       msgs)))))
+
+(ert-deftest agent-shell-workflow/after-handoff-non-function-is-ignored ()
+  "A non-function `:after-handoff' value is ignored."
+  (asw-test/isolate
+   (register-agent-shell-workflow handoff-bad :template "x" :target :session-reuse)
+   (let ((spec (agent-shell-workflow-get 'handoff-bad))
+         (ctx (list :shell-buffer (current-buffer) :after-handoff "not-a-function")))
+     (asw-test/with-dispatch-rendered-stubbed (lambda (&rest _) 'ok)
+       (should (eq 'ok (agent-shell-workflow--dispatch-rendered spec ctx nil nil "/tmp/x")))))))
+
 (ert-deftest agent-shell-workflow/exec-post-defaults-to-done ()
   "With no post-op, exec-post returns :done."
   (asw-test/isolate
