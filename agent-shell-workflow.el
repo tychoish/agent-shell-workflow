@@ -486,10 +486,10 @@ and a function is called with BUFFER."
     (bury-buffer buffer))
    ((eq display :foreground)
     (pop-to-buffer buffer))
-   ((consp display)
-    (display-buffer buffer display))
    ((functionp display)
     (funcall display buffer))
+   ((consp display)
+    (display-buffer buffer display))
    (t
     (display-buffer buffer))))
 

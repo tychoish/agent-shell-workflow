@@ -3438,6 +3438,16 @@ and prompt is enqueued for target shell."
           (should (eq seen buf)))
       (kill-buffer buf))))
 
+(ert-deftest agent-shell-workflow/display-list-function-called-with-buffer ()
+  "A list-represented function is called rather than treated as an action."
+  (let ((buf (generate-new-buffer "asw-list-fn-buf"))
+        (display '(lambda (buffer) buffer)))
+    (unwind-protect
+        (progn
+          (should (consp display))
+          (should (eq (agent-shell-workflow--show-buffer buf display) buf)))
+      (kill-buffer buf))))
+
 (ert-deftest agent-shell-workflow/announce-messages-and-alerts ()
   "Announce always messages; alerts only when notify is set and `alert' exists."
   (let (msgs alerts)
