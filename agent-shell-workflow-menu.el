@@ -76,10 +76,11 @@ via ACR (choosing any open shell, a new shell in repo, or the queue)."
 
 ;;;###autoload
 (defun agent-shell-workflow-select-group (&optional group category)
-  "Select a repository GROUP and a workflow, then dispatch across all repositories in GROUP.
-When GROUP is nil, prompt the user via `annotated-completing-read' to select a
-group from `agent-shell-workflow-repo-groups'.
-Then prompt for a workflow via `annotated-completing-read' (optionally filtered by CATEGORY).
+  "Select repository GROUP and workflow, then dispatch to all repos in GROUP.
+When GROUP is nil, prompt the user via `annotated-completing-read' to select
+a group from `agent-shell-workflow-repo-groups'.
+Then prompt for a workflow via `annotated-completing-read' (optionally
+filtered by CATEGORY).
 Dispatches the selected workflow to each repository in the group."
   (interactive)
   (unless agent-shell-workflow-repo-groups

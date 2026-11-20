@@ -779,7 +779,8 @@ Where TARGET is `:session-new', a live shell buffer, or `:queue'."
 
 (defun agent-shell-workflow--pick-dispatch-target (&optional dir prompt)
   "Prompt the user to select a dispatch target via `annotated-completing-read'.
-Offers creating a new shell in DIR, any open shell, and task queue when available."
+Offers creating a new shell in DIR, any open shell, and task queue
+when available."
   (let* ((effective-dir (agent-shell-workflow--canonicalize-dir (or dir default-directory)))
          (candidates (agent-shell-workflow--target-candidates effective-dir))
          (prompt-str (or prompt
@@ -805,7 +806,8 @@ Offers creating a new shell in DIR, any open shell, and task queue when availabl
 
 (defun agent-shell-workflow--resolve-target (target &optional dir)
   "Resolve TARGET into a concrete target.
-When TARGET is `:ask', prompt the user via `agent-shell-workflow--pick-dispatch-target'.
+When TARGET is `:ask', prompt the user via
+`agent-shell-workflow--pick-dispatch-target'.
 Otherwise return TARGET normalized."
   (let ((norm (agent-shell-workflow--normalize-target target)))
     (if (eq norm :ask)
@@ -1570,9 +1572,10 @@ Signals `user-error' if GROUP cannot be resolved."
 
 (cl-defun agent-shell-workflow-dispatch-group (id group &rest keys)
   "Dispatch workflow ID across all repositories in GROUP.
-GROUP is a symbol in `agent-shell-workflow-repo-groups' or a list of repository directories.
-KEYS are passed to `agent-shell-workflow-dispatch' for each repository, overriding
-`:dir' with each repository directory.
+GROUP is a symbol in `agent-shell-workflow-repo-groups' or a list
+of repository directories.
+KEYS are passed to `agent-shell-workflow-dispatch' for each
+repository, overriding `:dir' with each repository directory.
 Returns an alist mapping each repository directory to its dispatch result."
   (let* ((repos (agent-shell-workflow-resolve-repo-group group))
          results)
