@@ -128,7 +128,8 @@ notification is skipped and the skip is reported in the echo area."
 
 (defvar agent-shell-workflow--in-flight-dispatches (make-hash-table :test 'equal)
   "Hash table tracking active or recently dispatched workflows.
-Keys are composite identifiers `(id dir)', values are dispatch timestamps.")
+Keys are composite identifiers `(id dir repos)' where REPOS is the sorted
+list of canonical repository directories; values are dispatch timestamps.")
 
 (defvar-local agent-shell-workflow--pending-clear nil
   "Non-nil when a context clearing command is pending in this shell buffer.")
@@ -666,11 +667,14 @@ Reads any missing required keys not found in PROVIDED."
 ;; Template rendering
 
 (defun agent-shell-workflow--stringify (value)
-  "Return a display string for VALUE, a template substitution result."
+  "Return a display string for VALUE, a template substitution result.
+A list of strings (such as `:repos') renders one element per line."
   (cond
    ((stringp value) value)
    ((null value) "")
    ((symbolp value) (symbol-name value))
+   ((and (consp value) (seq-every-p #'stringp value))
+    (string-join value "\n"))
    (t (format "%s" value))))
 
 (defun agent-shell-workflow-render (template ctx)
@@ -1408,7 +1412,7 @@ or extracts buffer substring directly."
           (buffer-substring-no-properties (max (point-min) start) (point-max)))))))
 
 ;;;###autoload
-(cl-defun agent-shell-workflow-dispatch (id &key args target submit (context-dir default-directory)
+(cl-defun agent-shell-workflow-dispatch (id &key args target submit context-dir repos
                                             shell-reuse new-shell-providers providers
                                             buffer-display display &allow-other-keys)
   "Instantiate the workflow ID and dispatch it.
@@ -1417,7 +1421,14 @@ are read interactively.
 TARGET overrides the spec's declared target (`:session-reuse',
 `:session-reuse-always', `:session-new', `:queue', `:ask').
 SUBMIT non-nil forces prompt submission regardless of spec default.
-CONTEXT-DIR sets `default-directory' for pre-op execution.
+CONTEXT-DIR sets `default-directory' for pre-op execution and names the
+shell's working directory; it defaults to the first of REPOS, then to
+`default-directory'.
+REPOS is a list of repository directories the workflow works across at
+once.  The canonical list is available to pre-ops and templates as
+`:repos' (`{{repos}}' renders one directory per line); when REPOS is nil it
+is the single context directory.  Dispatches are debounced per context
+directory and set of repositories.
 SHELL-REUSE overrides reuse behavior (\\='always, \\='prompt, \\='new).
 NEW-SHELL-PROVIDERS (or PROVIDERS) overrides shell providers when spawning.
 BUFFER-DISPLAY (or DISPLAY; BUFFER-DISPLAY wins) overrides the spec's
@@ -1426,9 +1437,10 @@ values: `:foreground'/`focus', `:display'/`show', `:background'/`bury',
 a `display-buffer' action alist, or a function."
   (let* ((spec (or (agent-shell-workflow-get id)
                    (error "Agent-shell-workflow: no workflow registered with id `%s'" id)))
-         (dir (or context-dir default-directory))
+         (dir (or context-dir (car repos) default-directory))
          (canon-dir (agent-shell-workflow--canonicalize-dir dir))
-         (debounce-key (list id canon-dir))
+         (canon-repos (seq-map #'agent-shell-workflow--canonicalize-dir (or repos (list dir))))
+         (debounce-key (list id canon-dir (sort (copy-sequence canon-repos) #'string<)))
          (now (float-time))
          (last-time (gethash debounce-key agent-shell-workflow--in-flight-dispatches)))
     (if (and agent-shell-workflow-debounce-interval
@@ -1579,6 +1591,7 @@ a `display-buffer' action alist, or a function."
                                    :submit effective-submit
                                    :busy-action busy-action
                                    :context-dir dir
+                                   :repos canon-repos
                                    :buffer-display effective-display
                                    :shell-reuse effective-shell-reuse
                                    :new-shell-providers effective-providers)))
@@ -1629,16 +1642,25 @@ Signals `user-error' if GROUP cannot be resolved."
     (user-error "Unknown or invalid repository group: %S" group))))
 
 (cl-defun agent-shell-workflow-dispatch-group (id group &rest keys)
-  "Dispatch workflow ID across all repositories in GROUP.
+  "Dispatch workflow ID across the repositories in GROUP.
 GROUP is a symbol in `agent-shell-workflow-repo-groups' or a list
 of repository directories.
-KEYS are passed to `agent-shell-workflow-dispatch' for each
-repository, overriding `:context-dir' with each repository directory.
-Only the first repository's shell is displayed (a `:foreground' display is
-downgraded to `:display' so focus is not stolen); the rest are backgrounded
-so a large group does not pop one window per repository.
-Returns an alist mapping each repository directory to its dispatch result."
+KEYS are passed to `agent-shell-workflow-dispatch'.  By default the
+workflow is dispatched once per repository (iterate mode), overriding
+`:context-dir' with each repository directory.  Only the first
+repository's shell is displayed (a `:foreground' display is downgraded to
+`:display' so focus is not stolen); the rest are backgrounded so a large
+group does not pop one window per repository.
+With the key `:together' non-nil, the workflow is dispatched once with
+every repository in `:repos' (the first is the context directory), for
+tasks that must see all repositories at the same time; the display is
+used as given.
+Returns an alist mapping each dispatched directory to its dispatch
+result: one entry per repository, or a single entry for the first
+repository in `:together' mode."
   (let* ((repos (agent-shell-workflow-resolve-repo-group group))
+         (together (plist-get keys :together))
+         (keys (map-delete (copy-sequence keys) :together))
          (spec (agent-shell-workflow-get id))
          (group-display
           (agent-shell-workflow--resolve-display
@@ -1647,20 +1669,23 @@ Returns an alist mapping each repository directory to its dispatch result."
            (and spec (agent-shell-workflow-spec-buffer-display spec))))
          (shown nil)
          results)
-    (dolist (dir repos (nreverse results))
-      (let* ((repo-display (cond
-                            ((eq group-display :background) :background)
-                            (shown :background)
-                            ((eq group-display :foreground) :display)
-                            (t group-display)))
-             (dir-keys (copy-sequence keys))
-             (effective-keys (thread-first dir-keys
-                               (plist-put :context-dir dir)
-                               (plist-put :display repo-display)
-                               (plist-put :buffer-display repo-display)))
-             (res (apply #'agent-shell-workflow-dispatch id effective-keys)))
-        (setq shown (or shown (not (eq repo-display :background))))
-        (push (cons dir res) results)))))
+    (if together
+        (list (cons (car repos)
+                    (apply #'agent-shell-workflow-dispatch id
+                           (plist-put (copy-sequence keys) :repos repos))))
+      (dolist (dir repos (nreverse results))
+        (let* ((repo-display (cond
+                              ((eq group-display :background) :background)
+                              (shown :background)
+                              ((eq group-display :foreground) :display)
+                              (t group-display)))
+               (effective-keys (thread-first (copy-sequence keys)
+                                 (plist-put :context-dir dir)
+                                 (plist-put :display repo-display)
+                                 (plist-put :buffer-display repo-display)))
+               (res (apply #'agent-shell-workflow-dispatch id effective-keys)))
+          (setq shown (or shown (not (eq repo-display :background))))
+          (push (cons dir res) results))))))
 
 ;; Integration with agent-shell-queue
 

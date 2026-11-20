@@ -3214,6 +3214,141 @@ and prompt is enqueued for target shell."
         (should (string-match-p "M file.el" (plist-get res :group-report)))))))
 
 ;;; ─────────────────────────────────────────────────────────────
+;;; Multi-repository workflows
+
+(defmacro asw-test/with-repo-dirs (vars &rest body)
+  "Bind each symbol in VARS to a fresh temporary directory while running BODY."
+  (declare (indent 1))
+  `(let ,(seq-map (lambda (v) `(,v (file-name-as-directory (make-temp-file "asw-repo" t)))) vars)
+     (unwind-protect (progn ,@body)
+       ,@(seq-map (lambda (v) `(delete-directory ,v t)) vars))))
+
+(defun asw-test/record-pre-op (seen)
+  "Return a pre-op that pushes (CONTEXT-DIR REPOS DEFAULT-DIRECTORY) onto SEEN."
+  (lambda (ctx)
+    (push (list (plist-get ctx :context-dir) (plist-get ctx :repos) default-directory)
+          (symbol-value seen))
+    ctx))
+
+(ert-deftest agent-shell-workflow/render-repos-one-per-line ()
+  "A list of strings renders one element per line in templates."
+  (should (equal "a\nb"
+                 (agent-shell-workflow-render "{{repos}}" '(:repos ("a" "b")))))
+  (should (equal "" (agent-shell-workflow-render "{{repos}}" nil))))
+
+(ert-deftest agent-shell-workflow/dispatch-repos-reach-pre-op ()
+  "`:repos' gives the pre-op every directory; the first is the context dir."
+  (asw-test/with-repo-dirs (a b)
+    (asw-test/isolate
+     (defvar asw-test--seen nil)
+     (let ((asw-test--seen nil)
+           (shell-buf (generate-new-buffer "asw-repos-buf")))
+       (unwind-protect
+           (progn
+             (register-agent-shell-workflow test-repos-wf
+               :template "{{repos}}" :target :session-new :new-shell-providers (antigravity)
+               :buffer-display :background :submit t
+               :pre-op (asw-test/record-pre-op 'asw-test--seen))
+             (cl-letf (((symbol-function 'agent-shell--start) (lambda (&rest _) shell-buf))
+                       ((symbol-function 'agent-shell-insert) #'ignore))
+               (agent-shell-workflow-dispatch 'test-repos-wf :repos (list a b)))
+             (pcase-let ((`((,ctx-dir ,repos ,default-dir)) asw-test--seen))
+               (should (equal (file-truename ctx-dir) (file-truename a)))
+               (should (equal (seq-map #'file-truename repos)
+                              (list (file-truename a) (file-truename b))))
+               (should (equal (file-truename default-dir) (file-truename a)))))
+         (kill-buffer shell-buf))))))
+
+(ert-deftest agent-shell-workflow/dispatch-repos-default-to-context-dir ()
+  "Without `:repos', `:repos' is the single context directory."
+  (asw-test/with-repo-dirs (a)
+    (asw-test/isolate
+     (defvar asw-test--seen nil)
+     (let ((asw-test--seen nil)
+           (shell-buf (generate-new-buffer "asw-repos-default-buf")))
+       (unwind-protect
+           (progn
+             (register-agent-shell-workflow test-repos-default-wf
+               :template "x" :target :session-new :new-shell-providers (antigravity)
+               :buffer-display :background :submit t
+               :pre-op (asw-test/record-pre-op 'asw-test--seen))
+             (cl-letf (((symbol-function 'agent-shell--start) (lambda (&rest _) shell-buf))
+                       ((symbol-function 'agent-shell-insert) #'ignore))
+               (agent-shell-workflow-dispatch 'test-repos-default-wf :context-dir a))
+             (should (equal (seq-map #'file-truename (nth 1 (car asw-test--seen)))
+                            (list (file-truename a)))))
+         (kill-buffer shell-buf))))))
+
+(ert-deftest agent-shell-workflow/debounce-key-includes-repo-set ()
+  "Debounce is per primary directory and repo set: repeats drop, other sets do not."
+  (asw-test/with-repo-dirs (a b c)
+    (asw-test/isolate
+     (let ((agent-shell-workflow-debounce-interval 60)
+           (shell-buf (generate-new-buffer "asw-debounce-repos-buf"))
+           (count 0))
+       (unwind-protect
+           (progn
+             (register-agent-shell-workflow test-debounce-repos
+               :template "x" :target :session-new :new-shell-providers (antigravity)
+               :buffer-display :background :submit t
+               :pre-op (lambda (ctx) (setq count (1+ count)) ctx))
+             (cl-letf (((symbol-function 'agent-shell--start) (lambda (&rest _) shell-buf))
+                       ((symbol-function 'agent-shell-insert) #'ignore))
+               (agent-shell-workflow-dispatch 'test-debounce-repos :repos (list a b))
+               (agent-shell-workflow-dispatch 'test-debounce-repos :repos (list a b))
+               (should (= count 1))
+               (agent-shell-workflow-dispatch 'test-debounce-repos :repos (list a c))
+               (should (= count 2))
+               ;; Same set, different primary directory: a separate shell.
+               (agent-shell-workflow-dispatch 'test-debounce-repos :repos (list b a))
+               (should (= count 3))))
+         (kill-buffer shell-buf))))))
+
+(ert-deftest agent-shell-workflow/dispatch-group-together-is-one-dispatch ()
+  "`:together' makes one dispatch carrying every repository."
+  (asw-test/isolate
+   (let (calls)
+     (cl-letf (((symbol-function 'agent-shell-workflow-dispatch)
+                (lambda (_id &rest keys) (push keys calls) 'done)))
+       (let ((res (agent-shell-workflow-dispatch-group
+                   'x '("/tmp/a" "/tmp/b" "/tmp/c") :together t :display :foreground)))
+         (should (= 1 (length calls)))
+         (should (equal (plist-get (car calls) :repos) '("/tmp/a" "/tmp/b" "/tmp/c")))
+         (should-not (plist-member (car calls) :together))
+         (should (eq (plist-get (car calls) :display) :foreground))
+         (should (equal res '(("/tmp/a" . done)))))))))
+
+(ert-deftest agent-shell-workflow/dispatch-group-each-is-n-dispatches ()
+  "Without `:together' each repository gets its own dispatch and context dir."
+  (asw-test/isolate
+   (let (calls)
+     (cl-letf (((symbol-function 'agent-shell-workflow-dispatch)
+                (lambda (_id &rest keys) (push keys calls) t)))
+       (agent-shell-workflow-dispatch-group 'x '("/tmp/a" "/tmp/b" "/tmp/c"))
+       (should (= 3 (length calls)))
+       (should (equal (seq-map (lambda (k) (plist-get k :context-dir)) (reverse calls))
+                      '("/tmp/a" "/tmp/b" "/tmp/c")))
+       (should-not (seq-some (lambda (k) (plist-get k :repos)) calls))))))
+
+(ert-deftest agent-shell-workflow/group-exec-all-template-lists-all-repos ()
+  "The group-exec-all library workflow renders every repository."
+  (let* ((spec (agent-shell-workflow-get 'group-exec-all))
+         (text (agent-shell-workflow-render
+                (agent-shell-workflow-spec-template spec)
+                '(:repos ("/r/one" "/r/two") :args (:instruction "bump go")))))
+    (should (string-match-p "/r/one\n/r/two" text))
+    (should (string-match-p "bump go" text))))
+
+(ert-deftest agent-shell-workflow/group-status-pre-op-uses-ctx-repos ()
+  "Without a group arg the git-status pre-op reads the dispatched `:repos'."
+  (cl-letf (((symbol-function 'agent-shell-workflow-library--git-output)
+             (lambda (&rest args) (if (member "status" args) " M f.el" "main"))))
+    (let ((res (agent-shell-workflow-library--group-status-pre-op
+                '(:repos ("/tmp/solo") :args nil))))
+      (should (string-match-p "solo" (plist-get res :group-report)))
+      (should-not (string-match-p "other" (plist-get res :group-report))))))
+
+;;; ─────────────────────────────────────────────────────────────
 ;;; Display configuration
 
 (ert-deftest agent-shell-workflow/normalize-display-aliases ()

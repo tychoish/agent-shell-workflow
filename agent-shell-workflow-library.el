@@ -167,11 +167,15 @@ Uses Magit to gather state."
 ;; Multi-repository group workflows
 
 (defun agent-shell-workflow-library--group-status-pre-op (ctx &optional callback)
-  "Gather git status and branch for all repositories in the group from CTX args."
-  (let* ((args (plist-get ctx :args))
-         (group (plist-get args :group))
-         (group-sym (if (stringp group) (intern group) group))
-         (repos (agent-shell-workflow-resolve-repo-group group-sym))
+  "Gather git status and branch for the repositories of CTX.
+The repositories come from the `group' arg when given, otherwise from the
+`:repos' in CTX, which is a single repository when dispatched once per
+repository and the whole group when dispatched together."
+  (let* ((group (plist-get (plist-get ctx :args) :group))
+         (repos (if group
+                    (agent-shell-workflow-resolve-repo-group
+                     (if (stringp group) (intern group) group))
+                  (plist-get ctx :repos)))
          (reports nil))
     (dolist (dir repos)
       (let* ((dname (file-name-nondirectory (directory-file-name dir)))
@@ -195,11 +199,11 @@ Uses Magit to gather state."
         (plist-put (copy-sequence ctx) :group-report report)))))
 
 (register-agent-shell-workflow group-git-status
-  :doc "Summarize Git working tree status across a group of repositories"
+  :doc "Summarize Git working tree status across repositories"
   :category "Repository Group"
-  :args ((group :prompt "Repository group: " :type symbol))
+  :args ((group :prompt "Repository group: " :type symbol :optional t))
   :pre-op #'agent-shell-workflow-library--group-status-pre-op
-  :template "Review Git working tree status across repository group '{{args.group}}':
+  :template "Review Git working tree status:
 
 {{group-report}}
 
@@ -208,16 +212,32 @@ Identify repositories with uncommitted changes, untracked files, or detached HEA
   :target :session-reuse)
 
 (register-agent-shell-workflow group-exec
-  :doc "Execute a coordinated instruction across a group of repositories"
+  :doc "Run an instruction once per repository in a group (iterate mode)"
   :category "Repository Group"
-  :args ((group :prompt "Repository group: " :type symbol)
-         (instruction :prompt "Instruction: "))
-  :template "Coordinated task across repository group '{{args.group}}':
+  :args ((instruction :prompt "Instruction: "))
+  :template "Coordinated task, applied separately to each repository in a group.
+This session is for the repository at {{context-dir}}.
 
 Instruction:
 {{args.instruction}}
 
-Review the current workspace and apply necessary changes for this repository."
+Review the current workspace and apply necessary changes for this repository only."
+  :submit t
+  :target :session-reuse)
+
+(register-agent-shell-workflow group-exec-all
+  :doc "Run one instruction across all repositories of a group in a single session"
+  :category "Repository Group"
+  :args ((instruction :prompt "Instruction: "))
+  :template "Coordinated task across these repositories:
+
+{{repos}}
+
+Instruction:
+{{args.instruction}}
+
+The working directory is the first repository; read and change the others by
+path as the task requires, and keep the changes consistent across them."
   :submit t
   :target :session-reuse)
 
