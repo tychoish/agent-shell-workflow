@@ -99,6 +99,13 @@ When set to 0 or nil, debouncing is disabled."
                  (number :tag "Seconds"))
   :group 'agent-shell-workflow)
 
+(defcustom agent-shell-workflow-repo-groups nil
+  "Alist mapping repository group names (symbols) to lists of directory paths.
+Each entry is of the form (GROUP-NAME . (DIR1 DIR2 ...)).
+Directories are expanded to absolute paths upon registration and resolution."
+  :type '(alist :key-type symbol :value-type (repeat directory))
+  :group 'agent-shell-workflow)
+
 (defvar agent-shell-workflow--in-flight-dispatches (make-hash-table :test 'equal)
   "Hash table tracking active or recently dispatched workflows.
 Keys are composite identifiers `(id dir)', values are dispatch timestamps.")
@@ -1532,6 +1539,49 @@ or `:display'."
                    ;; 5. Insert rendered prompt & submit
                    (agent-shell-workflow--dispatch-rendered spec ctx-with-rendered resolved-target effective-submit effective-dir)))))))))))
 
+;; ─────────────────────────────────────────────────────────────────────────────
+;; Repository groups
+
+(defun agent-shell-workflow-register-repo-group (name repos)
+  "Register a repository group named NAME with REPOS directory paths.
+NAME is a symbol (or string converted to a symbol).
+REPOS is a list of directory path strings.
+Existing group with NAME is replaced.  Returns NAME."
+  (unless (symbolp name)
+    (setq name (intern (format "%s" name))))
+  (unless (and (listp repos) (seq-every-p #'stringp repos))
+    (user-error "REPOS must be a list of directory path strings"))
+  (let ((expanded (seq-map #'expand-file-name repos)))
+    (setf (map-elt agent-shell-workflow-repo-groups name) expanded)
+    name))
+
+(defun agent-shell-workflow-resolve-repo-group (group)
+  "Return list of directory paths for GROUP.
+GROUP can be a symbol registered in `agent-shell-workflow-repo-groups',
+or a list of directory path strings.
+Signals `user-error' if GROUP cannot be resolved."
+  (cond
+   ((and (symbolp group) (map-elt agent-shell-workflow-repo-groups group))
+    (map-elt agent-shell-workflow-repo-groups group))
+   ((and (listp group) (seq-every-p #'stringp group))
+    (seq-map #'expand-file-name group))
+   (t
+    (user-error "Unknown or invalid repository group: %S" group))))
+
+(cl-defun agent-shell-workflow-dispatch-group (id group &rest keys)
+  "Dispatch workflow ID across all repositories in GROUP.
+GROUP is a symbol in `agent-shell-workflow-repo-groups' or a list of repository directories.
+KEYS are passed to `agent-shell-workflow-dispatch' for each repository, overriding
+`:dir' with each repository directory.
+Returns an alist mapping each repository directory to its dispatch result."
+  (let* ((repos (agent-shell-workflow-resolve-repo-group group))
+         results)
+    (dolist (dir repos (nreverse results))
+      (let* ((dir-keys (copy-sequence keys))
+             (effective-keys (plist-put dir-keys :dir dir))
+             (res (apply #'agent-shell-workflow-dispatch id effective-keys)))
+        (push (cons dir res) results)))))
+
 ;; Integration with agent-shell-queue
 
 (defun agent-shell-workflow--dispatch-queue-item (item target-buffer)
@@ -1589,6 +1639,7 @@ or `:display'."
 (agent-shell-workflow--setup-queue-integration)
 
 (autoload 'agent-shell-workflow-select "agent-shell-workflow-menu" nil t)
+(autoload 'agent-shell-workflow-select-group "agent-shell-workflow-menu" nil t)
 
 (provide 'agent-shell-workflow)
 

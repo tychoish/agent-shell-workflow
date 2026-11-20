@@ -37,6 +37,8 @@
 (require 'agent-shell-workflow)
 (eval-when-compile (require 'agent-shell-workflow))
 
+(declare-function agent-shell-workflow-dispatch-group "agent-shell-workflow")
+
 (defun agent-shell-workflow--candidates (&optional category)
   "Return registered workflow specs, filtered to CATEGORY when non-nil."
   (let ((specs (agent-shell-workflow-list)))
@@ -71,6 +73,60 @@ via ACR (choosing any open shell, a new shell in repo, or the queue)."
     (if arg
         (agent-shell-workflow-dispatch (agent-shell-workflow-spec-id selected) :target :ask)
       (agent-shell-workflow-dispatch (agent-shell-workflow-spec-id selected)))))
+
+;;;###autoload
+(defun agent-shell-workflow-select-group (&optional group category)
+  "Select a repository GROUP and a workflow, then dispatch across all repositories in GROUP.
+When GROUP is nil, prompt the user via `annotated-completing-read' to select a
+group from `agent-shell-workflow-repo-groups'.
+Then prompt for a workflow via `annotated-completing-read' (optionally filtered by CATEGORY).
+Dispatches the selected workflow to each repository in the group."
+  (interactive)
+  (unless agent-shell-workflow-repo-groups
+    (user-error "No repository groups configured in `agent-shell-workflow-repo-groups'"))
+  (let* ((chosen-group
+          (or group
+              (let* ((table (seq-map
+                             (lambda (entry)
+                               (let* ((grp-name (car entry))
+                                      (grp-repos (cdr entry))
+                                      (count (length grp-repos)))
+                                 (cons (symbol-name grp-name)
+                                       (cons (format "[%d %s: %s]"
+                                                     count
+                                                     (if (= count 1) "repo" "repos")
+                                                     (string-join
+                                                      (seq-map #'file-name-nondirectory
+                                                               (seq-take grp-repos 3))
+                                                      ", "))
+                                             grp-name))))
+                             agent-shell-workflow-repo-groups)))
+                (annotated-completing-read
+                 table
+                 :prompt "Select repository group: "
+                 :category 'agent-shell-repo-group
+                 :require-match t
+                 :history 'agent-shell-workflow-repo-group-history))))
+         (group-sym (if (stringp chosen-group) (intern chosen-group) chosen-group))
+         (specs (or (agent-shell-workflow--candidates category)
+                    (user-error "No workflows registered")))
+         (spec-table (seq-map
+                      (lambda (spec)
+                        (cons (symbol-name (agent-shell-workflow-spec-id spec))
+                              (cons (format "[%s] %s"
+                                            (agent-shell-workflow-spec-category spec)
+                                            (or (agent-shell-workflow-spec-doc spec) ""))
+                                    spec)))
+                      specs))
+         (selected-workflow (annotated-completing-read
+                             spec-table
+                             :prompt (format "Select workflow for group `%s': " group-sym)
+                             :category 'agent-shell-workflow
+                             :require-match t
+                             :history 'agent-shell-workflow-select)))
+    (agent-shell-workflow-dispatch-group
+     (agent-shell-workflow-spec-id selected-workflow)
+     group-sym)))
 
 (provide 'agent-shell-workflow-menu)
 

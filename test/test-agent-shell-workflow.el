@@ -3092,6 +3092,78 @@ and prompt is enqueued for target shell."
        (agent-shell-workflow-select nil '(4))
        (should (eq dispatched-target :ask))))))
 
+(ert-deftest agent-shell-workflow/repo-groups-register-and-resolve ()
+  "Repository groups can be registered and resolved by symbol or string list."
+  (let ((agent-shell-workflow-repo-groups nil))
+    (agent-shell-workflow-register-repo-group 'my-group '("/tmp/repo1" "/tmp/repo2"))
+    (should (equal (agent-shell-workflow-resolve-repo-group 'my-group)
+                   (list (expand-file-name "/tmp/repo1") (expand-file-name "/tmp/repo2"))))
+    ;; Resolve raw list of strings
+    (should (equal (agent-shell-workflow-resolve-repo-group '("/tmp/a" "/tmp/b"))
+                   (list (expand-file-name "/tmp/a") (expand-file-name "/tmp/b"))))
+    ;; Unknown group errors
+    (should-error (agent-shell-workflow-resolve-repo-group 'unknown-group)
+                  :type 'user-error)))
+
+(ert-deftest agent-shell-workflow/dispatch-group-dispatches-across-repos ()
+  "agent-shell-workflow-dispatch-group dispatches workflow in each repository."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-group-wf
+     :template "Run in {{dir}}"
+     :target :session-reuse)
+   (let ((agent-shell-workflow-repo-groups nil)
+         (dispatched-dirs nil))
+     (agent-shell-workflow-register-repo-group 'group-a '("/tmp/repo-a" "/tmp/repo-b"))
+     (cl-letf (((symbol-function 'agent-shell-workflow-dispatch)
+                (lambda (_id &rest keys)
+                  (let ((dir (plist-get keys :dir)))
+                    (push dir dispatched-dirs)
+                    (format "result-for-%s" (file-name-nondirectory dir))))))
+       (let ((results (agent-shell-workflow-dispatch-group 'test-group-wf 'group-a)))
+         (should (= (length results) 2))
+         (should (member (expand-file-name "/tmp/repo-a") dispatched-dirs))
+         (should (member (expand-file-name "/tmp/repo-b") dispatched-dirs))
+         (should (equal (cdr (assoc (expand-file-name "/tmp/repo-a") results)) "result-for-repo-a"))
+         (should (equal (cdr (assoc (expand-file-name "/tmp/repo-b") results)) "result-for-repo-b")))))))
+
+(ert-deftest agent-shell-workflow/select-group-prompts-and-dispatches ()
+  "agent-shell-workflow-select-group prompts for group and workflow, then dispatches."
+  (asw-test/isolate
+   (register-agent-shell-workflow test-grp-sel
+     :template "Work"
+     :target :session-reuse)
+   (let ((agent-shell-workflow-repo-groups '((core . ("/tmp/r1" "/tmp/r2"))))
+         (spec (agent-shell-workflow-get 'test-grp-sel))
+         dispatched-group
+         dispatched-id)
+     (cl-letf (((symbol-function 'annotated-completing-read)
+                (lambda (_table &key prompt &rest _)
+                  (if (string-match-p "repository group" (downcase prompt))
+                      'core
+                    spec)))
+               ((symbol-function 'agent-shell-workflow-dispatch-group)
+                (lambda (id group)
+                  (setq dispatched-id id
+                        dispatched-group group))))
+       (agent-shell-workflow-select-group)
+       (should (eq dispatched-id 'test-grp-sel))
+       (should (eq dispatched-group 'core))))))
+
+(ert-deftest agent-shell-workflow/group-status-pre-op-reports-each-repo ()
+  "Library group-git-status pre-op reports status across all repositories in the group."
+  (let ((agent-shell-workflow-repo-groups '((tools . ("/tmp/tool1" "/tmp/tool2")))))
+    (cl-letf (((symbol-function 'agent-shell-workflow-library--git-output)
+               (lambda (&rest args)
+                 (if (member "status" args)
+                     " M file.el"
+                   "main"))))
+      (let* ((ctx (list :args '(:group tools)))
+             (res (agent-shell-workflow-library--group-status-pre-op ctx)))
+        (should (plist-get res :group-report))
+        (should (string-match-p "tool1" (plist-get res :group-report)))
+        (should (string-match-p "tool2" (plist-get res :group-report)))
+        (should (string-match-p "M file.el" (plist-get res :group-report)))))))
+
 (provide 'test-agent-shell-workflow)
 
 ;;; test-agent-shell-workflow.el ends here

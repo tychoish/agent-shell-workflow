@@ -36,6 +36,8 @@
 (eval-when-compile
   (require 'agent-shell-workflow))
 
+(declare-function agent-shell-workflow-resolve-repo-group "agent-shell-workflow")
+
 ;; Domain workflow modules
 (require 'agent-shell-workflow-github)
 (require 'agent-shell-workflow-pipeline)
@@ -161,6 +163,63 @@ Uses Magit to gather state."
               :template-replace
               (("Create one git commit containing all uncommitted changes:"
                 . "Create a logical series of commits (or a single commit if changes are cohesive; inspect the changes and decide if a series or single commit is appropriate) containing all uncommitted changes:")))))
+
+;; Multi-repository group workflows
+
+(defun agent-shell-workflow-library--group-status-pre-op (ctx &optional callback)
+  "Gather git status and branch for all repositories in the group from CTX args."
+  (let* ((args (plist-get ctx :args))
+         (group (plist-get args :group))
+         (group-sym (if (stringp group) (intern group) group))
+         (repos (agent-shell-workflow-resolve-repo-group group-sym))
+         (reports nil))
+    (dolist (dir repos)
+      (let* ((dname (file-name-nondirectory (directory-file-name dir)))
+             (status (let ((default-directory dir))
+                       (condition-case nil
+                           (agent-shell-workflow-library--git-output "status" "--short")
+                         (error "(error reading git status)"))))
+             (branch (let ((default-directory dir))
+                       (condition-case nil
+                           (agent-shell-workflow-library--git-output "rev-parse" "--abbrev-ref" "HEAD")
+                         (error "unknown"))))
+             (clean (or (string-empty-p (string-trim status))
+                        (equal (string-trim status) "(clean)"))))
+        (push (format "### Repository: %s (%s) [%s]\n%s"
+                      dname dir (string-trim branch)
+                      (if clean "  (clean working tree)" status))
+              reports)))
+    (let ((report (string-join (nreverse reports) "\n\n")))
+      (if callback
+          (funcall callback (plist-put (copy-sequence ctx) :group-report report))
+        (plist-put (copy-sequence ctx) :group-report report)))))
+
+(register-agent-shell-workflow group-git-status
+  :doc "Summarize Git working tree status across a group of repositories"
+  :category "Repository Group"
+  :args ((group :prompt "Repository group: " :type symbol))
+  :pre-op #'agent-shell-workflow-library--group-status-pre-op
+  :template "Review Git working tree status across repository group '{{args.group}}':
+
+{{group-report}}
+
+Identify repositories with uncommitted changes, untracked files, or detached HEAD states."
+  :submit t
+  :target :session-reuse)
+
+(register-agent-shell-workflow group-exec
+  :doc "Execute a coordinated instruction across a group of repositories"
+  :category "Repository Group"
+  :args ((group :prompt "Repository group: " :type symbol)
+         (instruction :prompt "Instruction: "))
+  :template "Coordinated task across repository group '{{args.group}}':
+
+Instruction:
+{{args.instruction}}
+
+Review the current workspace and apply necessary changes for this repository."
+  :submit t
+  :target :session-reuse)
 
 (provide 'agent-shell-workflow-library)
 ;;; agent-shell-workflow-library.el ends here
