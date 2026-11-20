@@ -3071,6 +3071,29 @@ and prompt is enqueued for target shell."
            (should (eq delivered-buf other-buf)))
        (kill-buffer other-buf)))))
 
+(ert-deftest agent-shell-workflow/read-returns-spec-and-uses-prompt ()
+  "agent-shell-workflow-read returns the chosen spec and honors CATEGORY and PROMPT."
+  (asw-test/isolate
+   (register-agent-shell-workflow read-a :template "a" :category "Alpha")
+   (register-agent-shell-workflow read-b :template "b" :category "Beta")
+   (let (seen-table seen-prompt)
+     (cl-letf (((symbol-function 'annotated-completing-read)
+                (lambda (table &rest keys)
+                  (setq seen-table table)
+                  (setq seen-prompt (plist-get keys :prompt))
+                  (cddr (car table)))))
+       (should (eq 'read-a (agent-shell-workflow-spec-id
+                            (agent-shell-workflow-read "Alpha" "Pick: "))))
+       (should (equal "Pick: " seen-prompt))
+       (should (equal '("read-a") (seq-map #'car seen-table)))
+       (agent-shell-workflow-read)
+       (should (equal "Select workflow: " seen-prompt))))))
+
+(ert-deftest agent-shell-workflow/read-without-workflows-signals ()
+  "agent-shell-workflow-read signals `user-error' when nothing matches."
+  (asw-test/isolate
+   (should-error (agent-shell-workflow-read "No-Such-Category") :type 'user-error)))
+
 (ert-deftest agent-shell-workflow/select-menu-prefix-forces-ask ()
   "agent-shell-workflow-select with prefix argument forces :target :ask."
   (asw-test/isolate

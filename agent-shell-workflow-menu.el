@@ -47,13 +47,12 @@
       specs)))
 
 ;;;###autoload
-(defun agent-shell-workflow-select (&optional category arg)
-  "Pick a registered workflow via `annotated-completing-read' and dispatch it.
+(defun agent-shell-workflow-read (&optional category prompt)
+  "Read a registered workflow via `annotated-completing-read'; return its spec.
 Candidates are annotated with their category and one-line doc.  With
-CATEGORY non-nil, only workflows in that category are offered.
-When ARG is non-nil (or invoked with `C-u'), prompt for dispatch target
-via ACR (choosing any open shell, a new shell in repo, or the queue)."
-  (interactive (list nil current-prefix-arg))
+CATEGORY non-nil, only workflows in that category are offered.  PROMPT
+defaults to \"Select workflow: \".  Signal `user-error' when no workflow
+is registered."
   (let* ((specs (or (agent-shell-workflow--candidates category)
                     (user-error "No workflows registered")))
          (table (seq-map
@@ -63,16 +62,25 @@ via ACR (choosing any open shell, a new shell in repo, or the queue)."
                                        (agent-shell-workflow-spec-category spec)
                                        (or (agent-shell-workflow-spec-doc spec) ""))
                                spec)))
-                 specs))
-         (selected (annotated-completing-read
-                    table
-                    :prompt "Select workflow: "
-                    :category 'agent-shell-workflow
-                    :require-match t
-                    :history 'agent-shell-workflow-select)))
+                 specs)))
+    (annotated-completing-read
+     table
+     :prompt (or prompt "Select workflow: ")
+     :category 'agent-shell-workflow
+     :require-match t
+     :history 'agent-shell-workflow-select)))
+
+;;;###autoload
+(defun agent-shell-workflow-select (&optional category arg)
+  "Pick a registered workflow via `agent-shell-workflow-read' and dispatch it.
+With CATEGORY non-nil, only workflows in that category are offered.
+When ARG is non-nil (or invoked with `C-u'), prompt for dispatch target
+via ACR (choosing any open shell, a new shell in repo, or the queue)."
+  (interactive (list nil current-prefix-arg))
+  (let ((id (agent-shell-workflow-spec-id (agent-shell-workflow-read category))))
     (if arg
-        (agent-shell-workflow-dispatch (agent-shell-workflow-spec-id selected) :target :ask)
-      (agent-shell-workflow-dispatch (agent-shell-workflow-spec-id selected)))))
+        (agent-shell-workflow-dispatch id :target :ask)
+      (agent-shell-workflow-dispatch id))))
 
 ;;;###autoload
 (defun agent-shell-workflow-select-group (&optional group category)
@@ -109,22 +117,9 @@ Dispatches the selected workflow to each repository in the group."
                  :require-match t
                  :history 'agent-shell-workflow-repo-group-history))))
          (group-sym (if (stringp chosen-group) (intern chosen-group) chosen-group))
-         (specs (or (agent-shell-workflow--candidates category)
-                    (user-error "No workflows registered")))
-         (spec-table (seq-map
-                      (lambda (spec)
-                        (cons (symbol-name (agent-shell-workflow-spec-id spec))
-                              (cons (format "[%s] %s"
-                                            (agent-shell-workflow-spec-category spec)
-                                            (or (agent-shell-workflow-spec-doc spec) ""))
-                                    spec)))
-                      specs))
-         (selected-workflow (annotated-completing-read
-                             spec-table
-                             :prompt (format "Select workflow for group `%s': " group-sym)
-                             :category 'agent-shell-workflow
-                             :require-match t
-                             :history 'agent-shell-workflow-select)))
+         (selected-workflow
+          (agent-shell-workflow-read
+           category (format "Select workflow for group `%s': " group-sym))))
     (agent-shell-workflow-dispatch-group
      (agent-shell-workflow-spec-id selected-workflow)
      group-sym)))
