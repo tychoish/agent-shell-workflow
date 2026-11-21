@@ -3499,6 +3499,64 @@ and prompt is enqueued for target shell."
                (agent-shell-workflow-get 'fix-ci))
               :background)))
 
+(ert-deftest agent-shell-workflow/diff-review-remediate-and-draft-pass ()
+  "diff-review-remediate and review-draft-pass register and extract artifacts cleanly."
+  (require 'agent-shell-workflow-github)
+  (should (agent-shell-workflow-get 'diff-review-remediate))
+  (should (agent-shell-workflow-get 'review-draft-pass))
+  (let ((dir (make-temp-file "asw-diff-review-test-" t)))
+    (unwind-protect
+        (let* ((review-file (expand-file-name "review/pr-42.json" dir))
+               (c1 (make-hash-table :test #'equal))
+               (c-done (make-hash-table :test #'equal))
+               (data (make-hash-table :test #'equal)))
+          (make-directory (file-name-directory review-file) t)
+          (setf (map-elt c1 "id") "th-1")
+          (setf (map-elt c1 "path") "lisp/foo.el")
+          (setf (map-elt c1 "lines") [15 20])
+          (setf (map-elt c1 "author") "reviewer")
+          (setf (map-elt c1 "body") "Handle nil return")
+          (setf (map-elt c1 "resolved") :false)
+          (setf (map-elt c1 "replies") [])
+
+          (setf (map-elt c-done "id") "th-2")
+          (setf (map-elt c-done "path") "lisp/foo.el")
+          (setf (map-elt c-done "lines") [1 1])
+          (setf (map-elt c-done "author") "reviewer")
+          (setf (map-elt c-done "body") "Already resolved")
+          (setf (map-elt c-done "resolved") t)
+          (setf (map-elt c-done "replies") [])
+
+          (setf (map-elt data "format") "diff-review/1")
+          (setf (map-elt data "root") dir)
+          (setf (map-elt data "base") "main")
+          (setf (map-elt data "head") "feat")
+          (setf (map-elt data "viewed") (make-hash-table :test #'equal))
+          (setf (map-elt data "comments") (vector c1 c-done))
+          (with-temp-file review-file
+            (insert (json-serialize data :null-object nil :false-object :false)))
+
+          ;; Test diff-review-remediate pre-op
+          (let* ((ctx (list :args (list :review-file review-file :root dir)))
+                 (out (agent-shell-workflow-library--diff-review-remediate-pre-op ctx))
+                 (findings-path (expand-file-name (plist-get out :findings-file) dir)))
+            (should (= (plist-get out :findings-count) 1))
+            (should (equal (plist-get out :review-json-file) review-file))
+            (should (file-exists-p findings-path))
+            (with-temp-buffer
+              (insert-file-contents findings-path)
+              (should (string-match-p "lisp/foo.el:15-20" (buffer-string)))
+              (should (string-match-p "Handle nil return" (buffer-string)))
+              (should-not (string-match-p "Already resolved" (buffer-string)))))
+
+          ;; Test review-draft-pass pre-op
+          (let* ((ctx2 (list :args (list :review-file review-file :root dir :focus "concurrency")))
+                 (out2 (agent-shell-workflow-library--review-draft-pass-pre-op ctx2))
+                 (diff-path (expand-file-name (plist-get out2 :diff-file) dir)))
+            (should (equal (plist-get out2 :focus) "concurrency"))
+            (should (file-exists-p diff-path))))
+      (delete-directory dir t))))
+
 
 (provide 'test-agent-shell-workflow)
 

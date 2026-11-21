@@ -688,6 +688,275 @@ Do NOT read all raw comment data into context at once. Review comments in `{{pr-
   :submit t
   :target :session-reuse)
 
+;; Diff-review remediation and autonomous draft critique workflows
+
+(declare-function magit-dash-review-extract-findings "magit-dash-review" (review-file &optional unresolved-only))
+(declare-function magit-dash-review--current-review-file "magit-dash-review" ())
+(declare-function diff-review-refresh "diff-review" ())
+
+(defun agent-shell-workflow-library--resolve-review-file (&optional review-file root)
+  "Resolve REVIEW-FILE path from explicit arg, current diff-review buffer, or ROOT."
+  (cond
+   ((and (stringp review-file) (not (string-empty-p review-file)))
+    (expand-file-name review-file))
+   ((and (fboundp 'magit-dash-review--current-review-file)
+         (magit-dash-review--current-review-file))
+    (expand-file-name (magit-dash-review--current-review-file)))
+   ((and (derived-mode-p 'diff-review-mode) buffer-file-name)
+    (expand-file-name buffer-file-name))
+   (t
+    (let* ((dir (or root (agent-shell-workflow-library--project-root) default-directory))
+           (git-common (string-trim
+                        (with-output-to-string
+                          (with-current-buffer standard-output
+                            (call-process "git" nil t nil "-C" dir "rev-parse" "--git-common-dir")))))
+           (review-dir (expand-file-name "review" (expand-file-name git-common dir)))
+           (files (and (file-directory-p review-dir)
+                       (directory-files review-dir t "\\.json\\'"))))
+      (cond
+       ((null files)
+        (user-error "No diff-review JSON files found in %s" review-dir))
+       ((= (length files) 1)
+        (car files))
+       (t
+        (let* ((names (mapcar (lambda (f) (cons (file-name-nondirectory f) f)) files))
+               (choice (completing-read "Select review file: " (mapcar #'car names) nil t)))
+          (cdr (assoc choice names)))))))))
+
+(defun agent-shell-workflow-library--extract-diff-review-findings (review-file)
+  "Extract unresolved non-draft findings from REVIEW-FILE as a list of plists."
+  (if (fboundp 'magit-dash-review-extract-findings)
+      (magit-dash-review-extract-findings review-file t)
+    (with-temp-buffer
+      (insert-file-contents review-file)
+      (let* ((data (json-parse-string (buffer-string)
+                                      :object-type 'hash-table
+                                      :array-type 'array
+                                      :null-object nil
+                                      :false-object :false))
+             (root (map-elt data "root"))
+             (base (map-elt data "base"))
+             (head (map-elt data "head"))
+             (md (map-elt data "magit_dash"))
+             (worktree (or (and (hash-table-p md) (map-elt md "worktree")) root))
+             (comments (append (or (map-elt data "comments") []) nil))
+             (unresolved (seq-filter
+                          (lambda (c)
+                            (and (not (eq (map-elt c "resolved") t))
+                                 (not (equal (map-elt c "status") "draft"))))
+                          comments)))
+        (mapcar
+         (lambda (c)
+           (let* ((lines (map-elt c "lines"))
+                  (line (and (vectorp lines) (>= (length lines) 1) (aref lines 0)))
+                  (end-line (and (vectorp lines) (>= (length lines) 2) (aref lines 1)))
+                  (path (map-elt c "path"))
+                  (hunk (if (and worktree (file-directory-p worktree) path)
+                            (let ((default-directory worktree))
+                              (string-trim
+                               (with-output-to-string
+                                 (with-current-buffer standard-output
+                                   (if (and base head (not (string-empty-p head)))
+                                       (call-process "git" nil t nil "diff" "-U5"
+                                                     (format "%s...%s" base head) "--" path)
+                                     (call-process "git" nil t nil "diff" "-U5"
+                                                   (or base "HEAD") "--" path))))))
+                          "")))
+             (list :id (map-elt c "id")
+                   :path path
+                   :lines lines
+                   :line line
+                   :end-line end-line
+                   :author (map-elt c "author")
+                   :body (map-elt c "body")
+                   :hunk hunk
+                   :worktree (or worktree root)
+                   :root root
+                   :base base
+                   :head head
+                   :review-file (expand-file-name review-file))))
+         unresolved)))))
+
+(defun agent-shell-workflow-library--format-diff-review-findings-md (review-file findings)
+  "Render FINDINGS from REVIEW-FILE into a structured Markdown document."
+  (let* ((first-f (car findings))
+         (worktree (or (plist-get first-f :worktree) default-directory))
+         (base (or (plist-get first-f :base) "HEAD"))
+         (head (or (plist-get first-f :head) "(working tree)"))
+         (idx 0))
+    (concat
+     (format "# Diff Review Findings\n\n- **Review File**: `%s`\n- **Worktree**: `%s`\n- **Range**: `%s` -> `%s`\n- **Unresolved Findings**: %d\n\n"
+             review-file worktree base head (length findings))
+     (mapconcat
+      (lambda (f)
+        (setq idx (1+ idx))
+        (let* ((id (or (plist-get f :id) "unknown"))
+               (path (or (plist-get f :path) "(review-wide)"))
+               (line (plist-get f :line))
+               (end-line (plist-get f :end-line))
+               (loc (cond
+                     ((and line end-line (/= line end-line))
+                      (format "%s:%d-%d" path line end-line))
+                     (line (format "%s:%d" path line))
+                     (t path)))
+               (author (or (plist-get f :author) "reviewer"))
+               (body (or (plist-get f :body) ""))
+               (hunk (or (plist-get f :hunk) "")))
+          (concat
+           (format "## %d. `%s` (id: `%s`, by @%s)\n\n%s\n"
+                   idx loc id author body)
+           (if (not (string-empty-p hunk))
+               (format "\n### Diff Context\n\n```diff\n%s\n```\n" hunk)
+             ""))))
+      findings
+      "\n"))))
+
+(defun agent-shell-workflow-library--diff-review-remediate-pre-op (ctx &optional callback)
+  "Extract unresolved diff-review findings and write Markdown artifact for CTX."
+  (let* ((args (plist-get ctx :args))
+         (review-file (agent-shell-workflow-library--resolve-review-file
+                       (plist-get args :review-file)
+                       (plist-get args :root)))
+         (findings (or (plist-get args :findings)
+                       (agent-shell-workflow-library--extract-diff-review-findings review-file))))
+    (unless findings
+      (user-error "No unresolved review comments to send"))
+    (let* ((first-f (car findings))
+           (worktree (file-name-as-directory
+                      (expand-file-name
+                       (or (plist-get first-f :worktree)
+                           (plist-get first-f :root)
+                           (agent-shell-workflow-library--project-root)
+                           default-directory))))
+           (target-slug (agent-shell-workflow-library--sanitize-name
+                         (file-name-sans-extension (file-name-nondirectory review-file))))
+           (artifact-dir (expand-file-name
+                          (format ".agent/diff-review/%s"
+                                  (if (string-empty-p target-slug) "review" target-slug))
+                          worktree))
+           (findings-file (expand-file-name "findings.md" artifact-dir))
+           (rel-findings-file (file-relative-name findings-file worktree))
+           (md-content (agent-shell-workflow-library--format-diff-review-findings-md
+                        review-file findings))
+           (updated-args (plist-put (copy-sequence args) :review-file review-file))
+           (updated-ctx (plist-put (copy-sequence ctx) :args updated-args)))
+      (agent-shell-workflow-library--write-file findings-file md-content)
+      (setq updated-ctx (plist-put updated-ctx :review-json-file review-file))
+      (setq updated-ctx (plist-put updated-ctx :findings-file rel-findings-file))
+      (setq updated-ctx (plist-put updated-ctx :findings-count (length findings)))
+      (setq updated-ctx (plist-put updated-ctx :worktree worktree))
+      (setq updated-ctx (plist-put updated-ctx :base (or (plist-get first-f :base) "HEAD")))
+      (setq updated-ctx (plist-put updated-ctx :head (or (plist-get first-f :head) "WORKTREE")))
+      (if callback
+          (funcall callback updated-ctx)
+        updated-ctx))))
+
+(defun agent-shell-workflow-library--diff-review-remediate-post-op (ctx)
+  "Refresh any open diff-review buffer visiting `:review-json-file' in CTX."
+  (when-let* ((rf (plist-get ctx :review-json-file))
+              (buf (find-buffer-visiting rf)))
+    (with-current-buffer buf
+      (if (fboundp 'diff-review-refresh)
+          (diff-review-refresh)
+        (revert-buffer t t t))))
+  ctx)
+
+(register-agent-shell-workflow diff-review-remediate
+  :doc "Send unresolved diff-review findings and hunks to agent-shell for remediation"
+  :category "Code Review"
+  :args ((review-file :prompt "Review JSON file: " :optional t))
+  :pre-op #'agent-shell-workflow-library--diff-review-remediate-pre-op
+  :post-op #'agent-shell-workflow-library--diff-review-remediate-post-op
+  :template "Remediate the {{findings-count}} unresolved code review finding(s) in `{{worktree}}`.
+
+## Review Artifacts:
+- Findings & diff hunks: `{{findings-file}}`
+- Live review JSON store: `{{review-json-file}}`
+
+## Instructions:
+1. Read `{{findings-file}}` and inspect each unresolved finding and its diff context.
+2. Apply the necessary code fixes and/or regression tests directly in `{{worktree}}`.
+3. Run the relevant unit tests to verify every fix passes cleanly.
+4. For each addressed finding (`<comment-id>`), append a concise reply to `{{review-json-file}}` via:
+   `emacsclient --eval '(magit-dash-review-append-reply \"{{review-json-file}}\" \"<comment-id>\" \"agent-shell\" \"<summary of fix>\")'`"
+  :submit t
+  :target :session-reuse)
+
+(defun agent-shell-workflow-library--review-draft-pass-pre-op (ctx &optional callback)
+  "Prepare diff patch artifact for autonomous `review-draft-pass' in CTX."
+  (let* ((args (plist-get ctx :args))
+         (review-file (agent-shell-workflow-library--resolve-review-file
+                       (plist-get args :review-file)
+                       (plist-get args :root)))
+         (data (with-temp-buffer
+                 (insert-file-contents review-file)
+                 (json-parse-string (buffer-string)
+                                    :object-type 'hash-table
+                                    :array-type 'array
+                                    :null-object nil
+                                    :false-object :false)))
+         (root (map-elt data "root"))
+         (base (or (map-elt data "base") "HEAD"))
+         (head (map-elt data "head"))
+         (md (map-elt data "magit_dash"))
+         (worktree (file-name-as-directory
+                    (expand-file-name
+                     (or (and (hash-table-p md) (map-elt md "worktree"))
+                         root
+                         (agent-shell-workflow-library--project-root)
+                         default-directory))))
+         (target-slug (agent-shell-workflow-library--sanitize-name
+                       (file-name-sans-extension (file-name-nondirectory review-file))))
+         (artifact-dir (expand-file-name
+                        (format ".agent/diff-review/%s"
+                                (if (string-empty-p target-slug) "review" target-slug))
+                        worktree))
+         (diff-file (expand-file-name "review-diff.patch" artifact-dir))
+         (rel-diff-file (file-relative-name diff-file worktree))
+         (diff-text (if (file-directory-p worktree)
+                        (let ((default-directory worktree))
+                          (with-output-to-string
+                            (with-current-buffer standard-output
+                              (if (and head (not (string-empty-p head)))
+                                  (call-process "git" nil t nil "diff" "-U5"
+                                                (format "%s...%s" base head))
+                                (call-process "git" nil t nil "diff" "-U5" base)))))
+                      ""))
+         (focus (or (plist-get args :focus) "correctness, edge cases, and test coverage"))
+         (updated-args (plist-put (copy-sequence args) :review-file review-file))
+         (updated-ctx (plist-put (copy-sequence ctx) :args updated-args)))
+    (agent-shell-workflow-library--write-file diff-file diff-text)
+    (setq updated-ctx (plist-put updated-ctx :review-json-file review-file))
+    (setq updated-ctx (plist-put updated-ctx :diff-file rel-diff-file))
+    (setq updated-ctx (plist-put updated-ctx :worktree worktree))
+    (setq updated-ctx (plist-put updated-ctx :base base))
+    (setq updated-ctx (plist-put updated-ctx :head (or head "WORKTREE")))
+    (setq updated-ctx (plist-put updated-ctx :focus focus))
+    (if callback
+        (funcall callback updated-ctx)
+      updated-ctx)))
+
+(register-agent-shell-workflow review-draft-pass
+  :doc "Run an autonomous agent code critique pass and stage draft findings"
+  :category "Code Review"
+  :args ((review-file :prompt "Review JSON file: " :optional t)
+         (focus :prompt "Review focus: " :optional t))
+  :pre-op #'agent-shell-workflow-library--review-draft-pass-pre-op
+  :post-op #'agent-shell-workflow-library--diff-review-remediate-post-op
+  :template "Perform an adversarial code review pass on `{{worktree}}` ({{base}} -> {{head}}).
+
+## Review Context:
+- Unified diff artifact: `{{diff-file}}`
+- Target review JSON store: `{{review-json-file}}`
+- Focus areas: {{focus}}
+
+## Instructions:
+1. Inspect the changes in `{{diff-file}}` and read surrounding source files in `{{worktree}}`.
+2. Identify high-signal defects, concurrency/state hazards, API contract violations, or missing test coverage.
+3. Stage your findings into a `code-review` `hitl-plan` (with operation `draft-finding` or `record-finding` targeting `:review-file \"{{review-json-file}}\"`) so the human reviewer can triage them in `hitl-plan-ui` and `diff-review`."
+  :submit t
+  :target :session-reuse)
+
 (provide 'agent-shell-workflow-github)
 
 ;;; agent-shell-workflow-github.el ends here
