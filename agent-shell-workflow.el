@@ -586,7 +586,7 @@ Re-registering an existing ID replaces the entry."
                                 effective-display))))))
     spec))
 
-(defmacro register-agent-shell-workflow (id &rest keys)
+(defmacro agent-shell-workflow-define (id &rest keys)
   "Define and register a prompt workflow named ID.
 KEYS is a plist accepting the same keys as `agent-shell-workflow-register'
 \(:doc :category :args :pre-op :template :submit :target :post-op
@@ -622,6 +622,8 @@ automatically."
     (when (plist-member keys :providers)
       (setq keys (plist-put keys :providers (list 'quote (plist-get keys :providers)))))
     `(agent-shell-workflow-register :id ',id ,@keys)))
+
+(define-obsolete-function-alias 'register-agent-shell-workflow #'agent-shell-workflow-define "0.2.0")
 
 ;; Argument collection
 
