@@ -491,7 +491,7 @@ asynchronously."
           (funcall callback updated-ctx)
         updated-ctx))))
 
-(register-agent-shell-workflow fix-ci
+(agent-shell-workflow-define fix-ci
   :doc "Download CI artifacts to local filesystem and prompt agent to fix build failure"
   :category "CI/CD"
   :args ((repo :prompt "Repository: " :optional t)
@@ -663,7 +663,7 @@ When CALLBACK is given, executes asynchronously."
                      repo-args)))
         (funcall finish view-json-raw api-json-raw raw-comments)))))
 
-(register-agent-shell-workflow pr-review-patch
+(agent-shell-workflow-define pr-review-patch
   :doc "Fetch PR review comments to local filesystem and draft remediation patch"
   :category "Code Review"
   :args ((pr-number :prompt "PR number: " :type integer :optional t)
@@ -861,7 +861,7 @@ Do NOT read all raw comment data into context at once. Review comments in `{{pr-
         (revert-buffer t t t))))
   ctx)
 
-(register-agent-shell-workflow diff-review-remediate
+(agent-shell-workflow-define diff-review-remediate
   :doc "Send unresolved diff-review findings and hunks to agent-shell for remediation"
   :category "Code Review"
   :args ((review-file :prompt "Review JSON file: " :optional t))
@@ -936,7 +936,7 @@ Do NOT read all raw comment data into context at once. Review comments in `{{pr-
         (funcall callback updated-ctx)
       updated-ctx)))
 
-(register-agent-shell-workflow review-draft-pass
+(agent-shell-workflow-define review-draft-pass
   :doc "Run an autonomous agent code critique pass and stage draft findings"
   :category "Code Review"
   :args ((review-file :prompt "Review JSON file: " :optional t)

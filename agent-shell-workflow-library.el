@@ -59,7 +59,7 @@
       (let ((diff (agent-shell-workflow-library--diff-summary (list "HEAD" "--" file) 5)))
         (plist-put (copy-sequence ctx) :file-diff diff)))))
 
-(register-agent-shell-workflow expand-coverage
+(agent-shell-workflow-define expand-coverage
   :doc "Analyze uncovered lines and author missing unit tests"
   :category "Testing"
   :args ((file :prompt "File: "))
@@ -86,7 +86,7 @@ Diff:
       (let ((log (agent-shell-workflow-library--git-output "log" "--oneline" "-n" "5" "--" file)))
         (plist-put (copy-sequence ctx) :recent-history (if (string-empty-p log) "(no history)" log))))))
 
-(register-agent-shell-workflow refactor-module
+(agent-shell-workflow-define refactor-module
   :doc "Clean up dead code and migrate legacy macro forms"
   :category "Refactoring"
   :args ((file :prompt "File: "))
@@ -129,7 +129,7 @@ Uses Magit to gather state."
             (log (agent-shell-workflow-library--git-output "log" "--oneline" "-n" "5")))
         (funcall finish status diff log)))))
 
-(register-agent-shell-workflow create-commit
+(agent-shell-workflow-define create-commit
   :doc "Commit all uncommitted changes in a single conventional commit"
   :category "Git"
   :args ((instructions :prompt "Additional instructions (optional): " :optional t))
@@ -198,7 +198,7 @@ repository and the whole group when dispatched together."
           (funcall callback (plist-put (copy-sequence ctx) :group-report report))
         (plist-put (copy-sequence ctx) :group-report report)))))
 
-(register-agent-shell-workflow group-git-status
+(agent-shell-workflow-define group-git-status
   :doc "Summarize Git working tree status across repositories"
   :category "Repository Group"
   :args ((group :prompt "Repository group: " :type symbol :optional t))
@@ -211,7 +211,7 @@ Identify repositories with uncommitted changes, untracked files, or detached HEA
   :submit t
   :target :session-reuse)
 
-(register-agent-shell-workflow group-exec
+(agent-shell-workflow-define group-exec
   :doc "Run an instruction once per repository in a group (iterate mode)"
   :category "Repository Group"
   :args ((instruction :prompt "Instruction: "))
@@ -225,7 +225,7 @@ Review the current workspace and apply necessary changes for this repository onl
   :submit t
   :target :session-reuse)
 
-(register-agent-shell-workflow group-exec-all
+(agent-shell-workflow-define group-exec-all
   :doc "Run one instruction across all repositories of a group in a single session"
   :category "Repository Group"
   :args ((instruction :prompt "Instruction: "))

@@ -37,7 +37,7 @@ interactive selection menus.
 * Display behavior
 
 Each workflow controls how its shell buffer is presented, via =:display= (or
-=:buffer-display=) in =register-agent-shell-workflow= or as a keyword to
+=:buffer-display=) in =agent-shell-workflow-define= or as a keyword to
 =agent-shell-workflow-dispatch= (the dispatch argument wins; =:buffer-display= wins over =:display= when
 both are given).  An unrecognized value is ignored.  When neither is given, ~agent-shell-workflow-default-display~ applies.
 
@@ -50,7 +50,7 @@ both are given).  An unrecognized value is ignored.  When neither is given, ~age
 | function                      |          | called with the shell buffer                  |
 
 A =Workflow `ID' dispatched to DIR= message is shown in the echo area
-when the prompt is delivered to a shell.  In the =register-agent-shell-workflow=
+when the prompt is delivered to a shell.  In the =agent-shell-workflow-define=
 macro, quote an action alist (=:display '((display-buffer-pop-up-window))=).  Set ~agent-shell-workflow-notify~ to also send an =alert=
 notification (skipped, with a message, when =alert= is unavailable).
 

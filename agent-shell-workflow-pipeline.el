@@ -226,7 +226,7 @@ Select action:"
         (message "Verifier flagged op `%s`: %s (hitl not available)" op-id summary))
       :done)))
 
-(register-agent-shell-workflow executor-pipeline-run
+(agent-shell-workflow-define executor-pipeline-run
   :doc "Execute an atomic edit operation in an isolated sprite-mcp git worktree"
   :category "Pipeline"
   :args ((file :prompt "Target file: ")
@@ -243,7 +243,7 @@ Perform all edits in this isolated worktree. Ensure all tests and syntax checks 
   :buffer-display :background
   :post-op #'agent-shell-workflow-library--pipeline-run-post-op)
 
-(register-agent-shell-workflow executor-pipeline-verify
+(agent-shell-workflow-define executor-pipeline-verify
   :doc "Verify a worktree diff against the instruction using gptel with HITL escalation"
   :category "Pipeline"
   :args ((op-id :prompt "Op ID: ")

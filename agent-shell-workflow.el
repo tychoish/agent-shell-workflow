@@ -32,7 +32,7 @@
 ;;
 ;; Workflows dispatch either directly to a live or new `agent-shell'
 ;; session, or as a queued item in `agent-shell-queue'.  See
-;; `register-agent-shell-workflow' to register a workflow and
+;; `agent-shell-workflow-define' to register a workflow and
 ;; `agent-shell-workflow-dispatch' to run one.
 
 ;;; Code:
@@ -420,7 +420,7 @@ Requires a clear operation defined for the target shell type/agent.")
 
 (defvar agent-shell-workflow-registry (make-hash-table :test #'eq)
   "Hash table of symbol id to `agent-shell-workflow-spec'.
-Populate via `register-agent-shell-workflow'.")
+Populate via `agent-shell-workflow-define'.")
 
 (defun agent-shell-workflow-get (id)
   "Return the `agent-shell-workflow-spec' registered under ID, or nil."

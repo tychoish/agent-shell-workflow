@@ -41,9 +41,9 @@
 ;;; Registry
 
 (ert-deftest agent-shell-workflow/def-registers-spec ()
-  "register-agent-shell-workflow registers a retrievable spec."
+  "agent-shell-workflow-define registers a retrievable spec."
   (asw-test/isolate
-   (register-agent-shell-workflow sample
+   (agent-shell-workflow-define sample
      :doc "A sample prompt"
      :category "Testing"
      :args ((thing :prompt "Thing: "))
@@ -58,7 +58,7 @@
 (ert-deftest agent-shell-workflow/def-defaults-category-and-target ()
   "Category defaults to General and target defaults to :ask when omitted."
   (asw-test/isolate
-   (register-agent-shell-workflow bare :template "hi")
+   (agent-shell-workflow-define bare :template "hi")
    (let ((spec (agent-shell-workflow-get 'bare)))
      (should (equal (agent-shell-workflow-spec-category spec) "General"))
      (should (eq (agent-shell-workflow-spec-target spec) :ask)))))
@@ -71,16 +71,16 @@
 (ert-deftest agent-shell-workflow/redefine-replaces-entry ()
   "Re-registering an existing id replaces rather than duplicates it."
   (asw-test/isolate
-   (register-agent-shell-workflow dup :template "one")
-   (register-agent-shell-workflow dup :template "two")
+   (agent-shell-workflow-define dup :template "one")
+   (agent-shell-workflow-define dup :template "two")
    (should (= 1 (hash-table-count agent-shell-workflow-registry)))
    (should (equal (agent-shell-workflow-spec-template (agent-shell-workflow-get 'dup)) "two"))))
 
 (ert-deftest agent-shell-workflow/list-returns-all-specs ()
   "agent-shell-workflow-list returns every registered spec."
   (asw-test/isolate
-   (register-agent-shell-workflow a :template "a")
-   (register-agent-shell-workflow b :template "b")
+   (agent-shell-workflow-define a :template "a")
+   (agent-shell-workflow-define b :template "b")
    (should (= 2 (length (agent-shell-workflow-list))))))
 
 ;;; ─────────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/collect-args-skips-provided ()
   "Arguments already present in the provided plist are not re-read."
   (asw-test/isolate
-   (register-agent-shell-workflow needs-arg
+   (agent-shell-workflow-define needs-arg
      :args ((thing :prompt "Thing: "))
      :template "{{args.thing}}")
    (cl-letf (((symbol-function 'read-string) (lambda (&rest _) (error "should not prompt"))))
@@ -131,7 +131,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/collect-args-reads-missing ()
   "A missing argument is read interactively via its declared prompt."
   (asw-test/isolate
-   (register-agent-shell-workflow needs-arg
+   (agent-shell-workflow-define needs-arg
      :args ((thing :prompt "Thing: "))
      :template "{{args.thing}}")
    (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "typed")))
@@ -170,7 +170,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/exec-pre-noop-without-pre-op ()
   "With no pre-op, exec-pre calls back with ctx unchanged."
   (asw-test/isolate
-   (register-agent-shell-workflow no-pre :template "x")
+   (agent-shell-workflow-define no-pre :template "x")
    (let (result)
      (agent-shell-workflow-exec-pre (agent-shell-workflow-get 'no-pre) '(:a 1)
                                   (lambda (ctx) (setq result ctx)))
@@ -179,7 +179,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/exec-pre-synchronous ()
   "A one-argument pre-op runs synchronously and its return value is passed on."
   (asw-test/isolate
-   (register-agent-shell-workflow sync-pre
+   (agent-shell-workflow-define sync-pre
      :pre-op (lambda (ctx) (plist-put ctx :extra "added"))
      :template "x")
    (let (result)
@@ -190,7 +190,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/exec-pre-asynchronous ()
   "A two-argument pre-op is treated as async and must invoke its own callback."
   (asw-test/isolate
-   (register-agent-shell-workflow async-pre
+   (agent-shell-workflow-define async-pre
      :pre-op (lambda (ctx callback) (funcall callback (plist-put ctx :extra "async")))
      :template "x")
    (let (result)
@@ -201,7 +201,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/exec-post-defaults-to-done ()
   "With no post-op, exec-post returns :done."
   (asw-test/isolate
-   (register-agent-shell-workflow no-post :template "x")
+   (agent-shell-workflow-define no-post :template "x")
    (should (eq (agent-shell-workflow-exec-post (agent-shell-workflow-get 'no-post) nil nil "resp")
               :done))))
 
@@ -209,7 +209,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
   "The post-op is called with shell-buffer, ctx, and response text."
   (asw-test/isolate
    (let (seen)
-     (register-agent-shell-workflow with-post
+     (agent-shell-workflow-define with-post
        :post-op (lambda (buf ctx resp) (setq seen (list buf ctx resp)) :close)
        :template "x")
      (should (eq (agent-shell-workflow-exec-post (agent-shell-workflow-get 'with-post) 'buf '(:a 1) "resp")
@@ -273,7 +273,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/dispatch-queue-target-enqueues ()
   "A :queue target enqueues a prompt-library item instead of inserting."
   (asw-test/isolate
-   (register-agent-shell-workflow queued
+   (agent-shell-workflow-define queued
      :args ((thing :prompt "Thing: "))
      :template "do {{args.thing}}"
      :target :queue)
@@ -288,7 +288,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/dispatch-session-inserts-rendered-text ()
   "A session target renders the template and inserts it via agent-shell-insert."
   (asw-test/isolate
-   (register-agent-shell-workflow direct
+   (agent-shell-workflow-define direct
      :args ((thing :prompt "Thing: "))
      :template "do {{args.thing}}"
      :target :session-new
@@ -305,7 +305,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/dispatch-session-reuse-prefers-existing-buffer ()
   ":session-reuse picks an existing directory-scoped buffer over creating one."
   (asw-test/isolate
-   (register-agent-shell-workflow reuse-target :template "hi" :target :session-reuse :submit t)
+   (agent-shell-workflow-define reuse-target :template "hi" :target :session-reuse :submit t)
    (let* ((buf (generate-new-buffer "asw-test-reuse"))
           new-shell-called)
      (unwind-protect
@@ -321,7 +321,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
   "When a spec has a post-op, dispatch subscribes to turn-complete with a
 :response-start position taken from agent-shell-insert's return value."
   (asw-test/isolate
-   (register-agent-shell-workflow with-post
+   (agent-shell-workflow-define with-post
      :template "hi"
      :target :session-new
      :post-op (lambda (_buf _ctx _resp) :done))
@@ -337,7 +337,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/dispatch-without-post-op-does-not-subscribe ()
   "When a spec has no post-op, dispatch never calls agent-shell-subscribe-to."
   (asw-test/isolate
-   (register-agent-shell-workflow no-post-dispatch :template "hi" :target :session-new)
+   (agent-shell-workflow-define no-post-dispatch :template "hi" :target :session-new)
    (let (subscribe-called)
      (cl-letf (((symbol-function 'agent-shell-new-shell) (lambda (&rest _) 'new-buf))
                ((symbol-function 'agent-shell-insert) (lambda (&rest _) (list (cons :end 1))))
@@ -796,7 +796,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/select-dispatches-chosen-prompt ()
   "agent-shell-workflow-select dispatches whichever spec the picker returns."
   (asw-test/isolate
-   (register-agent-shell-workflow choosable :template "hi")
+   (agent-shell-workflow-define choosable :template "hi")
    (let (dispatched)
      (cl-letf (((symbol-function 'annotated-completing-read)
                 (lambda (table &rest _) (cddr (assoc "choosable" table))))
@@ -813,8 +813,8 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/select-filters-by-category ()
   "Passing a category to agent-shell-workflow-select narrows the candidates."
   (asw-test/isolate
-   (register-agent-shell-workflow in-cat :category "CI/CD" :template "hi")
-   (register-agent-shell-workflow other-cat :category "Testing" :template "hi")
+   (agent-shell-workflow-define in-cat :category "CI/CD" :template "hi")
+   (agent-shell-workflow-define other-cat :category "Testing" :template "hi")
    (should (= 1 (length (agent-shell-workflow--candidates "CI/CD"))))))
 
 (ert-deftest agent-shell-workflow/select-is-interactive ()
@@ -904,7 +904,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/dispatch-target-functions-hook ()
   "agent-shell-workflow-dispatch-target-functions intercepts custom targets."
   (asw-test/isolate
-   (register-agent-shell-workflow custom-tgt
+   (agent-shell-workflow-define custom-tgt
      :args ((val :prompt "Val: "))
      :template "Custom {{args.val}}"
      :target :custom-worker)
@@ -922,7 +922,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/dispatch-queue-unregistered-fails ()
   "Dispatching to :queue without a registered handler raises a user-error."
   (asw-test/isolate
-   (register-agent-shell-workflow queue-unreg
+   (agent-shell-workflow-define queue-unreg
      :template "Queue this"
      :target :queue)
    (let ((agent-shell-workflow-dispatch-target-functions nil))
@@ -1438,9 +1438,9 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/candidates-filters-by-category ()
   "agent-shell-workflow--candidates filters specs by category or returns all."
   (asw-test/isolate
-   (register-agent-shell-workflow c-cat1 :template "a" :category "Alpha")
-   (register-agent-shell-workflow c-cat2 :template "b" :category "Beta")
-   (register-agent-shell-workflow c-cat3 :template "c" :category "Alpha")
+   (agent-shell-workflow-define c-cat1 :template "a" :category "Alpha")
+   (agent-shell-workflow-define c-cat2 :template "b" :category "Beta")
+   (agent-shell-workflow-define c-cat3 :template "c" :category "Alpha")
    ;; Without filter
    (let ((all (agent-shell-workflow--candidates)))
      (should (seq-find (lambda (s) (eq (agent-shell-workflow-spec-id s) 'c-cat1)) all))
@@ -1677,7 +1677,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
          (test-buf (generate-new-buffer "*asw-order-shell*")))
      (unwind-protect
          (progn
-           (register-agent-shell-workflow eager-order-test
+           (agent-shell-workflow-define eager-order-test
              :template "Order: {{step}}"
              :target :session-reuse
              :pre-op (lambda (ctx callback)
@@ -1986,7 +1986,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
           sub-callback)
      (unwind-protect
          (progn
-           (register-agent-shell-workflow q-post-wf
+           (agent-shell-workflow-define q-post-wf
              :template "queued text"
              :post-op (lambda (_shell-buf _ctx _resp)
                         (setq post-op-called t)
@@ -2051,7 +2051,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
           (async-cb nil))
      (unwind-protect
          (progn
-           (register-agent-shell-workflow async-busy-test
+           (agent-shell-workflow-define async-busy-test
              :template "Test async busy"
              :target :session-reuse
              :submit t
@@ -2123,7 +2123,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
           (inserted-buf nil))
      (unwind-protect
          (progn
-           (register-agent-shell-workflow busy-select-wf
+           (agent-shell-workflow-define busy-select-wf
              :template "Run task"
              :target :session-reuse
              :submit t)
@@ -2155,7 +2155,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/insert-submit-ask-prompts-user ()
   "`agent-shell-workflow--insert' prompts when submit is `:ask'."
   (asw-test/isolate
-   (register-agent-shell-workflow submit-ask-wf
+   (agent-shell-workflow-define submit-ask-wf
      :template "Hello ask")
    (let* ((spec (agent-shell-workflow-get 'submit-ask-wf))
           (asked nil)
@@ -2176,7 +2176,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
   "Flow: No shell open prompts to create, selects agent, gathers clarifications,
 then creates shell, runs pre-op, inserts prompt, and submits with opt-in prompt."
   (asw-test/isolate
-   (register-agent-shell-workflow flow-no-shell
+   (agent-shell-workflow-define flow-no-shell
      :template "Task: {{args.task}}"
      :target :session-reuse
      :submit :ask
@@ -2243,7 +2243,7 @@ then creates shell, runs pre-op, inserts prompt, and submits with opt-in prompt.
   "Flow: Eligible shell open asks reuse, sets conditional busy upfront, gathers clarifications,
 and reuses existing shell without creating a new one."
   (asw-test/isolate
-   (register-agent-shell-workflow flow-reuse-shell
+   (agent-shell-workflow-define flow-reuse-shell
      :template "Task: {{args.task}}"
      :target :session-reuse
      :submit t
@@ -2296,7 +2296,7 @@ and reuses existing shell without creating a new one."
 (ert-deftest agent-shell-workflow/dispatch-flow-multiple-shells-choice ()
   "Flow: Multiple eligible shells prompt completing-read to select target."
   (asw-test/isolate
-   (register-agent-shell-workflow flow-multi-shell
+   (agent-shell-workflow-define flow-multi-shell
      :template "Run task"
      :target :session-reuse
      :submit t)
@@ -2325,7 +2325,7 @@ and reuses existing shell without creating a new one."
   "Flow: Selected shell is busy, user declines queue and selects new shell,
 agent config selected, clarifications asked, then shell created."
   (asw-test/isolate
-   (register-agent-shell-workflow flow-busy-select
+   (agent-shell-workflow-define flow-busy-select
      :template "Task: {{args.task}}"
      :target :session-reuse
      :submit t
@@ -2389,7 +2389,7 @@ agent config selected, clarifications asked, then shell created."
   "Flow: Selected shell is busy, user opts to enqueue, preflight clarifications run,
 and prompt is enqueued for target shell."
   (asw-test/isolate
-   (register-agent-shell-workflow flow-busy-queue
+   (agent-shell-workflow-define flow-busy-queue
      :template "Task: {{args.task}}"
      :target :session-reuse
      :submit t
@@ -2745,7 +2745,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/spec-fields-registered ()
   "Workflow registration records shell-reuse, new-shell-providers, and buffer-display."
   (asw-test/isolate
-   (register-agent-shell-workflow test-defaults-wf
+   (agent-shell-workflow-define test-defaults-wf
      :template "hi"
      :target :session-new
      :shell-reuse always
@@ -2762,7 +2762,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/session-reuse-always-no-prompt ()
   "Target :session-reuse-always reuses existing buffer without y-or-n-p."
   (asw-test/isolate
-   (register-agent-shell-workflow test-always-reuse
+   (agent-shell-workflow-define test-always-reuse
      :template "hi"
      :target :session-reuse-always
      :submit t)
@@ -2790,7 +2790,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/shell-reuse-always-creates-when-none ()
   "When shell-reuse is always and no shells exist, creates one without prompting."
   (asw-test/isolate
-   (register-agent-shell-workflow test-reuse-fallback
+   (agent-shell-workflow-define test-reuse-fallback
      :template "hi"
      :target :session-reuse
      :shell-reuse always
@@ -2817,7 +2817,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/session-new-always-creates-shell ()
   "Target :session-new creates a new shell even when matching buffers exist."
   (asw-test/isolate
-   (register-agent-shell-workflow test-always-new
+   (agent-shell-workflow-define test-always-new
      :template "hi"
      :target :session-new
      :new-shell-providers (antigravity)
@@ -2846,7 +2846,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/single-provider-no-prompt-with-model ()
   "A single new-shell-provider specifies the default model and avoids select-config prompt."
   (asw-test/isolate
-   (register-agent-shell-workflow test-model-wf
+   (agent-shell-workflow-define test-model-wf
      :template "hi"
      :target :session-new
      :new-shell-providers ((antigravity :model "gemini-2.5-pro"))
@@ -2874,7 +2874,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/multiple-providers-prompts-choice ()
   "Multiple new-shell-providers prompts via completing-read and applies chosen model."
   (asw-test/isolate
-   (register-agent-shell-workflow test-multi-prov
+   (agent-shell-workflow-define test-multi-prov
      :template "hi"
      :target :session-new
      :new-shell-providers ((antigravity :model "flash-v1")
@@ -2905,7 +2905,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/buffer-display-foreground ()
   "buffer-display :foreground pops to buffer."
   (asw-test/isolate
-   (register-agent-shell-workflow test-fg-wf
+   (agent-shell-workflow-define test-fg-wf
      :template "hi"
      :target :session-new
      :new-shell-providers (antigravity)
@@ -2929,7 +2929,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/buffer-display-background ()
   "buffer-display :background does not call display-buffer or pop-to-buffer."
   (asw-test/isolate
-   (register-agent-shell-workflow test-bg-wf
+   (agent-shell-workflow-define test-bg-wf
      :template "hi"
      :target :session-new
      :new-shell-providers (antigravity)
@@ -2951,7 +2951,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/variant-inherits-and-overrides-defaults ()
   "Workflow variants inherit or override shell-reuse, providers, and display."
   (asw-test/isolate
-   (register-agent-shell-workflow test-variant-parent
+   (agent-shell-workflow-define test-variant-parent
      :template "hi"
      :target :session-new
      :shell-reuse always
@@ -2978,7 +2978,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/quoted-symbols-accepted ()
   "Arguments to :target, :buffer-display, and :shell-reuse can be quoted symbols."
   (asw-test/isolate
-   (register-agent-shell-workflow test-quoted-flags
+   (agent-shell-workflow-define test-quoted-flags
      :template "hi"
      :target 'session-reuse-always
      :buffer-display 'foreground
@@ -2989,9 +2989,9 @@ and prompt is enqueued for target shell."
      (should (eq (agent-shell-workflow-spec-shell-reuse spec) 'always)))))
 
 (ert-deftest agent-shell-workflow/bare-symbols-in-macro ()
-  "Bare unquoted symbols in register-agent-shell-workflow are quoted and normalized."
+  "Bare unquoted symbols in agent-shell-workflow-define are quoted and normalized."
   (asw-test/isolate
-   (register-agent-shell-workflow test-bare-flags
+   (agent-shell-workflow-define test-bare-flags
      :template "hi"
      :target session-new
      :buffer-display background
@@ -3054,7 +3054,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/dispatch-ask-dispatches-to-selected-other-shell ()
   "Dispatching with target :ask allows dispatching to an open shell from another project."
   (asw-test/isolate
-   (register-agent-shell-workflow test-ask-other
+   (agent-shell-workflow-define test-ask-other
      :template "Hello ask: {{args.task}}"
      :target :ask
      :submit t)
@@ -3074,8 +3074,8 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/read-returns-spec-and-uses-prompt ()
   "agent-shell-workflow-read returns the chosen spec and honors CATEGORY and PROMPT."
   (asw-test/isolate
-   (register-agent-shell-workflow read-a :template "a" :category "Alpha")
-   (register-agent-shell-workflow read-b :template "b" :category "Beta")
+   (agent-shell-workflow-define read-a :template "a" :category "Alpha")
+   (agent-shell-workflow-define read-b :template "b" :category "Beta")
    (let (seen-table seen-prompt)
      (cl-letf (((symbol-function 'annotated-completing-read)
                 (lambda (table &rest keys)
@@ -3097,7 +3097,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/select-menu-prefix-forces-ask ()
   "agent-shell-workflow-select with prefix argument forces :target :ask."
   (asw-test/isolate
-   (register-agent-shell-workflow test-menu-prefix
+   (agent-shell-workflow-define test-menu-prefix
      :template "Menu task"
      :target :session-reuse
      :submit t)
@@ -3131,7 +3131,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/dispatch-group-dispatches-across-repos ()
   "agent-shell-workflow-dispatch-group dispatches workflow in each repository."
   (asw-test/isolate
-   (register-agent-shell-workflow test-group-wf
+   (agent-shell-workflow-define test-group-wf
      :template "Run in {{dir}}"
      :target :session-reuse)
    (let ((agent-shell-workflow-repo-groups nil)
@@ -3158,7 +3158,7 @@ and prompt is enqueued for target shell."
           seen)
      (unwind-protect
          (progn
-           (register-agent-shell-workflow test-group-real
+           (agent-shell-workflow-define test-group-real
              :template "hi" :target :session-new :new-shell-providers (antigravity)
              :buffer-display :background :submit t
              :pre-op (lambda (ctx)
@@ -3178,7 +3178,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/select-group-prompts-and-dispatches ()
   "agent-shell-workflow-select-group prompts for group and workflow, then dispatches."
   (asw-test/isolate
-   (register-agent-shell-workflow test-grp-sel
+   (agent-shell-workflow-define test-grp-sel
      :template "Work"
      :target :session-reuse)
    (let ((agent-shell-workflow-repo-groups '((core . ("/tmp/r1" "/tmp/r2"))))
@@ -3245,7 +3245,7 @@ and prompt is enqueued for target shell."
            (shell-buf (generate-new-buffer "asw-repos-buf")))
        (unwind-protect
            (progn
-             (register-agent-shell-workflow test-repos-wf
+             (agent-shell-workflow-define test-repos-wf
                :template "{{repos}}" :target :session-new :new-shell-providers (antigravity)
                :buffer-display :background :submit t
                :pre-op (asw-test/record-pre-op 'asw-test--seen))
@@ -3268,7 +3268,7 @@ and prompt is enqueued for target shell."
            (shell-buf (generate-new-buffer "asw-repos-default-buf")))
        (unwind-protect
            (progn
-             (register-agent-shell-workflow test-repos-default-wf
+             (agent-shell-workflow-define test-repos-default-wf
                :template "x" :target :session-new :new-shell-providers (antigravity)
                :buffer-display :background :submit t
                :pre-op (asw-test/record-pre-op 'asw-test--seen))
@@ -3288,7 +3288,7 @@ and prompt is enqueued for target shell."
            (count 0))
        (unwind-protect
            (progn
-             (register-agent-shell-workflow test-debounce-repos
+             (agent-shell-workflow-define test-debounce-repos
                :template "x" :target :session-new :new-shell-providers (antigravity)
                :buffer-display :background :submit t
                :pre-op (lambda (ctx) (setq count (1+ count)) ctx))
@@ -3382,7 +3382,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/default-display-applies-when-unspecified ()
   "An unspecified spec display falls back to `agent-shell-workflow-default-display'."
   (asw-test/isolate
-   (register-agent-shell-workflow test-default-wf
+   (agent-shell-workflow-define test-default-wf
      :template "hi" :target :session-new :new-shell-providers (antigravity) :submit t)
    (should (null (agent-shell-workflow-spec-buffer-display
                   (agent-shell-workflow-get 'test-default-wf))))
@@ -3402,7 +3402,7 @@ and prompt is enqueued for target shell."
 (ert-deftest agent-shell-workflow/dispatch-display-overrides-spec ()
   "A :display argument to dispatch beats the spec's display."
   (asw-test/isolate
-   (register-agent-shell-workflow test-override-wf
+   (agent-shell-workflow-define test-override-wf
      :template "hi" :target :session-new :new-shell-providers (antigravity)
      :buffer-display :foreground :submit t)
    (let ((shell-buf (generate-new-buffer "asw-override-buf")))
