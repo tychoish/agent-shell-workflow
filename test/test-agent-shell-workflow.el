@@ -1148,7 +1148,8 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/apply-post-result-drop-context-fallback ()
   "agent-shell-workflow--apply-post-result falls back to agent-shell-clear when queue clear is not fboundp."
   (let (clear-called
-        (buf (generate-new-buffer "asw-clear-test")))
+        (buf (generate-new-buffer "asw-clear-test"))
+        (orig-fboundp (symbol-function 'fboundp)))
     (unwind-protect
         (cl-letf (((symbol-function 'agent-shell-clear)
                    (lambda (b) (setq clear-called b)))
@@ -1156,7 +1157,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
                    (lambda (sym)
                      (if (eq sym 'agent-shell-queue-enqueue-clear)
                          nil
-                       (eq sym 'agent-shell-clear)))))
+                       (funcall orig-fboundp sym)))))
           (agent-shell-workflow--apply-post-result :drop-context buf)
           (should (eq clear-called buf)))
       (kill-buffer buf))))
@@ -1174,9 +1175,10 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/queue-target-handler-errors-when-queue-unavailable ()
   "agent-shell-workflow--queue-target-handler raises user-error when queue is not loaded."
   (asw-test/isolate
-   (let ((spec (agent-shell-workflow-register :id 'q-test :template "hi")))
+   (let ((spec (agent-shell-workflow-register :id 'q-test :template "hi"))
+         (orig-fboundp (symbol-function 'fboundp)))
      (cl-letf (((symbol-function 'fboundp)
-                (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) nil (cl-typep sym 'symbol)))))
+                (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) nil (funcall orig-fboundp sym)))))
        (should-error (agent-shell-workflow--queue-target-handler spec nil :queue nil)
                      :type 'user-error)))))
 
@@ -1446,9 +1448,10 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/library-pipeline-verify-pre-op-gptel-unavailable-fallback ()
   "pipeline-verify-pre-op falls back gracefully when gptel-request is not fboundp."
   (let* ((ctx (list :args (list :file "test.el" :instruction "Fix" :diff "+ fix")))
-         called-ctx)
+         called-ctx
+         (orig-fboundp (symbol-function 'fboundp)))
     (cl-letf (((symbol-function 'fboundp)
-               (lambda (sym) (if (eq sym 'gptel-request) nil (cl-typep sym 'symbol)))))
+               (lambda (sym) (if (eq sym 'gptel-request) nil (funcall orig-fboundp sym)))))
       (agent-shell-workflow-library--pipeline-verify-pre-op
        ctx
        (lambda (updated) (setq called-ctx updated)))
@@ -1882,28 +1885,26 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/resolve-busy-action-queue-available ()
   "agent-shell-workflow--resolve-busy-action returns `queue' when queue is available."
   (let ((agent-shell-workflow-busy-shell-behavior 'queue))
-    (cl-letf (((symbol-function 'fboundp)
-               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) t (cl-typep sym 'symbol)))))
+    (cl-letf (((symbol-function 'agent-shell-queue--enqueue-args) #'ignore))
       (should (eq (agent-shell-workflow--resolve-busy-action "test-buf") 'queue)))))
 
 (ert-deftest agent-shell-workflow/resolve-busy-action-queue-unavailable-falls-back-to-wait ()
   "agent-shell-workflow--resolve-busy-action falls back to `wait' when queue is not loaded."
-  (let ((agent-shell-workflow-busy-shell-behavior 'queue))
+  (let ((agent-shell-workflow-busy-shell-behavior 'queue)
+        (orig-fboundp (symbol-function 'fboundp)))
     (cl-letf (((symbol-function 'fboundp)
-               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) nil (cl-typep sym 'symbol)))))
+               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) nil (funcall orig-fboundp sym)))))
       (should (eq (agent-shell-workflow--resolve-busy-action "test-buf") 'wait)))))
 
 (ert-deftest agent-shell-workflow/resolve-busy-action-ask ()
   "agent-shell-workflow--resolve-busy-action prompts user when set to `ask'."
   (let ((agent-shell-workflow-busy-shell-behavior 'ask))
     ;; User answers 'y' -> returns 'queue
-    (cl-letf (((symbol-function 'fboundp)
-               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) t (cl-typep sym 'symbol))))
+    (cl-letf (((symbol-function 'agent-shell-queue--enqueue-args) #'ignore)
               ((symbol-function 'y-or-n-p) (lambda (&rest _) t)))
       (should (eq (agent-shell-workflow--resolve-busy-action "test-buf") 'queue)))
     ;; User answers 'n' -> returns 'wait
-    (cl-letf (((symbol-function 'fboundp)
-               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) t (cl-typep sym 'symbol))))
+    (cl-letf (((symbol-function 'agent-shell-queue--enqueue-args) #'ignore)
               ((symbol-function 'y-or-n-p) (lambda (&rest _) nil)))
       (should (eq (agent-shell-workflow--resolve-busy-action "test-buf") 'wait)))))
 
@@ -1919,9 +1920,9 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/enqueue-for-buffer-enqueues-args ()
   "agent-shell-workflow--enqueue-for-buffer enqueues item into shell-buffer bucket."
   (let* ((buf (generate-new-buffer "asw-test-buf"))
-         (spec (agent-shell-workflow-spec--make :id 'test-wf :template "hello {{args.target}}"))
-         (ctx (list :args '(:target "world")))
-         enqueued-args)
+          (spec (agent-shell-workflow-spec--make :id 'test-wf :template "hello {{args.target}}"))
+          (ctx (list :args '(:target "world")))
+          enqueued-args)
     (unwind-protect
         (cl-letf (((symbol-function 'agent-shell-queue--enqueue-args)
                    (lambda (&rest args) (setq enqueued-args args))))
@@ -1937,9 +1938,10 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 
 (ert-deftest agent-shell-workflow/enqueue-for-buffer-errors-when-queue-unavailable ()
   "agent-shell-workflow--enqueue-for-buffer signals user-error when queue is not loaded."
-  (let ((spec (agent-shell-workflow-spec--make :id 'test-wf :template "hello")))
+  (let ((spec (agent-shell-workflow-spec--make :id 'test-wf :template "hello"))
+        (orig-fboundp (symbol-function 'fboundp)))
     (cl-letf (((symbol-function 'fboundp)
-               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) nil (cl-typep sym 'symbol)))))
+               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) nil (funcall orig-fboundp sym)))))
       (should-error (agent-shell-workflow--enqueue-for-buffer spec nil "any-buf" t)
                     :type 'user-error))))
 
@@ -2039,16 +2041,14 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 (ert-deftest agent-shell-workflow/resolve-busy-action-upfront-queue-default ()
   "resolve-busy-action-upfront returns `queue' when queue is available and behavior is `queue'."
   (let ((agent-shell-workflow-busy-shell-behavior 'queue))
-    (cl-letf (((symbol-function 'fboundp)
-               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) t (cl-typep sym 'symbol)))))
+    (cl-letf (((symbol-function 'agent-shell-queue--enqueue-args) #'ignore))
       (should (eq (agent-shell-workflow--resolve-busy-action-upfront "test-buf" t) 'queue)))))
 
 (ert-deftest agent-shell-workflow/resolve-busy-action-upfront-ask-when-already-busy ()
   "resolve-busy-action-upfront asks immediate question when buffer is currently busy."
   (let ((agent-shell-workflow-busy-shell-behavior 'ask)
         (prompt-seen nil))
-    (cl-letf (((symbol-function 'fboundp)
-               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) t (cl-typep sym 'symbol))))
+    (cl-letf (((symbol-function 'agent-shell-queue--enqueue-args) #'ignore)
               ((symbol-function 'agent-shell-workflow--buffer-busy-p) (lambda (_) t))
               ((symbol-function 'y-or-n-p)
                (lambda (p) (setq prompt-seen p) t)))
@@ -2059,8 +2059,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
   "resolve-busy-action-upfront asks conditional question when buffer is currently idle."
   (let ((agent-shell-workflow-busy-shell-behavior 'ask)
         (prompt-seen nil))
-    (cl-letf (((symbol-function 'fboundp)
-               (lambda (sym) (if (eq sym 'agent-shell-queue--enqueue-args) t (cl-typep sym 'symbol))))
+    (cl-letf (((symbol-function 'agent-shell-queue--enqueue-args) #'ignore)
               ((symbol-function 'agent-shell-workflow--buffer-busy-p) (lambda (_) nil))
               ((symbol-function 'y-or-n-p)
                (lambda (p) (setq prompt-seen p) t)))
@@ -2115,7 +2114,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
   "When buffer is busy and user declines queuing, prompt to select a different shell."
   (let ((agent-shell-workflow-busy-shell-behavior 'ask)
         (prompts nil))
-    (cl-letf (((symbol-function 'fboundp) (lambda (_) t))
+    (cl-letf (((symbol-function 'agent-shell-queue--enqueue-args) #'ignore)
               ((symbol-function 'agent-shell-workflow--buffer-busy-p) (lambda (_) t))
               ((symbol-function 'y-or-n-p)
                (lambda (p)
@@ -2130,7 +2129,7 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
   "When buffer is busy and user declines both queue and select, fall back to wait."
   (let ((agent-shell-workflow-busy-shell-behavior 'ask)
         (prompts nil))
-    (cl-letf (((symbol-function 'fboundp) (lambda (_) t))
+    (cl-letf (((symbol-function 'agent-shell-queue--enqueue-args) #'ignore)
               ((symbol-function 'agent-shell-workflow--buffer-busy-p) (lambda (_) t))
               ((symbol-function 'y-or-n-p)
                (lambda (p)
@@ -2286,7 +2285,7 @@ and reuses existing shell without creating a new one."
                      (lambda (_dir) (list existing-buf)))
                     ((symbol-function 'agent-shell-workflow--buffer-busy-p)
                      (lambda (_) nil))
-                    ((symbol-function 'fboundp) (lambda (_) t))
+                    ((symbol-function 'agent-shell-queue--enqueue-args) #'ignore)
                     ((symbol-function 'y-or-n-p)
                      (lambda (p)
                        (cond
@@ -2367,7 +2366,7 @@ agent config selected, clarifications asked, then shell created."
                      (lambda (_dir) (list busy-buf)))
                     ((symbol-function 'agent-shell-workflow--buffer-busy-p)
                      (lambda (b) (eq b busy-buf)))
-                    ((symbol-function 'fboundp) (lambda (_) t))
+                    ((symbol-function 'agent-shell-queue--enqueue-args) #'ignore)
                     ((symbol-function 'y-or-n-p)
                      (lambda (p)
                        (cond
@@ -2429,7 +2428,7 @@ and prompt is enqueued for target shell."
                      (lambda (_dir) (list busy-buf)))
                     ((symbol-function 'agent-shell-workflow--buffer-busy-p)
                      (lambda (b) (eq b busy-buf)))
-                    ((symbol-function 'fboundp) (lambda (_) t))
+                    ((symbol-function 'agent-shell-queue--enqueue-args) #'ignore)
                     ((symbol-function 'y-or-n-p)
                      (lambda (p)
                        (cond
