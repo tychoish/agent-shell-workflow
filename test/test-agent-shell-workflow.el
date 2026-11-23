@@ -391,18 +391,26 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
 
 (ert-deftest agent-shell-workflow/built-in-load-order ()
   "Built-in modules load and register workflows from each entry point."
-  (dolist (entry '(agent-shell-workflow agent-shell-workflow-library
-                   agent-shell-workflow-github agent-shell-workflow-pipeline
-                   agent-shell-workflow-menu))
-    (cl-progv '(features)
-        (list (seq-remove
-               (lambda (feature)
-                 (string-prefix-p "agent-shell-workflow" (symbol-name feature)))
-               features))
-      (let ((agent-shell-workflow-registry (make-hash-table :test #'eq)))
-        (require entry)
-        (dolist (id '(create-commit fix-ci executor-pipeline-run))
-          (should (agent-shell-workflow-get id)))))))
+  (let* ((pkg-root (or (bound-and-true-p agent-shell-workflow-test--root)
+                       "/home/tychoish/src/agent-shell-workflow/"))
+         (load-prefer-newer t)
+         (load-path (cons pkg-root
+                          (seq-remove (lambda (dir)
+                                        (and (stringp dir)
+                                             (string-match-p "/elpa/agent-shell-workflow-" dir)))
+                                      load-path))))
+    (dolist (entry '(agent-shell-workflow agent-shell-workflow-library
+                     agent-shell-workflow-github agent-shell-workflow-pipeline
+                     agent-shell-workflow-menu))
+      (cl-progv '(features)
+          (list (seq-remove
+                 (lambda (feature)
+                   (string-prefix-p "agent-shell-workflow" (symbol-name feature)))
+                 features))
+        (let ((agent-shell-workflow-registry (make-hash-table :test #'eq)))
+          (require entry)
+          (dolist (id '(create-commit fix-ci executor-pipeline-run))
+            (should (agent-shell-workflow-get id))))))))
 
 (ert-deftest agent-shell-workflow/library-registers-built-ins ()
   "The example prompt library registers all four built-in workflows."
@@ -3070,6 +3078,58 @@ and prompt is enqueued for target shell."
            (agent-shell-workflow-dispatch 'test-ask-other :args '(:task "check"))
            (should (eq delivered-buf other-buf)))
        (kill-buffer other-buf)))))
+
+(ert-deftest agent-shell-workflow/target-candidates-prioritizes-ready-before-busy-and-configs ()
+  "Target candidates prioritizes current project ready before busy, followed by configs."
+  (asw-test/isolate
+   (let ((proj-ready (generate-new-buffer "*asw-cand-proj-ready*"))
+         (proj-busy (generate-new-buffer "*asw-cand-proj-busy*"))
+         (other-buf (generate-new-buffer "*asw-cand-other*")))
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell-buffers)
+                    (lambda () (list proj-busy other-buf proj-ready)))
+                   ((symbol-function 'agent-shell-workflow--project-buffers)
+                    (lambda (_dir) (list proj-busy proj-ready)))
+                   ((symbol-function 'agent-shell-workflow--buffer-busy-p)
+                    (lambda (b) (eq b proj-busy)))
+                   ((symbol-function 'agent-shell--resolved-agent-configs)
+                    (lambda () (list '((:identifier . mock-claude) (:buffer-name . "claude"))))))
+           (let* ((candidates (agent-shell-workflow--target-candidates "/mock/repo" t))
+                  (targets (mapcar #'cddr candidates)))
+             ;; 1. proj-ready comes first
+             (should (eq (car targets) proj-ready))
+             ;; 2. proj-busy comes second
+             (should (eq (cadr targets) proj-busy))
+             ;; 3. config session-new exists
+             (should (seq-some (lambda (trg) (and (consp trg) (eq (car trg) :session-new))) targets))
+             ;; 4. other-buf exists
+             (should (member other-buf targets))))
+       (when (buffer-live-p proj-ready) (kill-buffer proj-ready))
+       (when (buffer-live-p proj-busy) (kill-buffer proj-busy))
+       (when (buffer-live-p other-buf) (kill-buffer other-buf))))))
+
+(ert-deftest agent-shell-workflow/dispatch-to-busy-buffer-auto-enqueues ()
+  "Dispatching to a busy buffer automatically enqueues without asking."
+  (asw-test/isolate
+   (agent-shell-workflow-define test-busy-auto-enqueue
+     :template "Hello busy: {{args.task}}"
+     :target :ask
+     :submit t)
+   (let ((busy-buf (generate-new-buffer "*agent: busy-buf*"))
+         enqueued-item)
+     (unwind-protect
+         (cl-letf (((symbol-function 'agent-shell-workflow--pick-dispatch-target)
+                    (lambda (&optional _dir _prompt) busy-buf))
+                   ((symbol-function 'agent-shell-workflow--buffer-busy-p)
+                    (lambda (b) (eq b busy-buf)))
+                   ((symbol-function 'agent-shell-queue--enqueue-args)
+                    (lambda (args type buf)
+                      (setq enqueued-item (list :args args :type type :buf buf))
+                      t)))
+           (agent-shell-workflow-dispatch 'test-busy-auto-enqueue :args '(:task "test-enqueue"))
+           (should (equal (plist-get enqueued-item :type) 'workflow))
+           (should (eq (plist-get enqueued-item :buf) busy-buf)))
+       (kill-buffer busy-buf)))))
 
 (ert-deftest agent-shell-workflow/read-returns-spec-and-uses-prompt ()
   "agent-shell-workflow-read returns the chosen spec and honors CATEGORY and PROMPT."

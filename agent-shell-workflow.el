@@ -340,10 +340,10 @@ CALLBACK-OR-DIR and DIR-OR-CALLBACK may be passed in either order:
           (agent-shell-workflow--run-process-async
            program args dir
            (lambda (out)
-             (puthash key out results)
+             (setf (map-elt results key) out)
              (setq remaining (1- remaining))
              (when (zerop remaining)
-               (let ((alist (mapcar (lambda (p) (cons (car p) (gethash (car p) results)))
+               (let ((alist (mapcar (lambda (p) (cons (car p) (map-elt results (car p))))
                                     pairs)))
                  (when callback (funcall callback alist)))))))))))
 
@@ -424,10 +424,10 @@ Populate via `agent-shell-workflow-define'.")
 
 (defun agent-shell-workflow-get (id)
   "Return the `agent-shell-workflow-spec' registered under ID, or nil."
-  (or (gethash id agent-shell-workflow-registry)
+  (or (map-elt agent-shell-workflow-registry id)
       (progn
         (require 'agent-shell-workflow-library nil t)
-        (gethash id agent-shell-workflow-registry))))
+        (map-elt agent-shell-workflow-registry id))))
 
 (defun agent-shell-workflow-list ()
   "Return all registered `agent-shell-workflow-spec' values."
@@ -802,6 +802,24 @@ or where either directory is within the other."
                             (string-prefix-p canon-dir buf-dir))))))
                 (agent-shell-buffers))))
 
+(defun agent-shell-workflow--buffer-annotation (buf)
+  "Return an annotation string for BUF, resembling `agent-shell-switch-buffer`."
+  (or (when (fboundp 'agent-shell-menu--buffer-annotation)
+        (condition-case nil
+            (agent-shell-menu--buffer-annotation buf)
+          (error nil)))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (let* ((status (if (agent-shell-workflow--buffer-busy-p buf) "busy" "ready"))
+                 (title (when (boundp 'agent-shell--state)
+                          (let ((raw (string-trim (car (split-string (or (map-nested-elt agent-shell--state '(:session :title)) "") "\n")))))
+                            (if (> (length raw) 40) (concat (substring raw 0 37) "...") raw))))
+                 (cwd (abbreviate-file-name (or default-directory ""))))
+            (format "[%s] %s%s"
+                    status
+                    (if (and title (not (string-empty-p title))) (concat title " · ") "")
+                    cwd))))))
+
 (cl-defun agent-shell-workflow--target-candidates (&optional dir (include-queue (or (bound-and-true-p agent-shell-workflow-dispatch-target-functions)
                                                                                    (fboundp 'agent-shell-queue-enqueue))
                                                                                include-queue-p))
@@ -810,37 +828,77 @@ DIR is the target directory (defaults to `default-directory').
 When INCLUDE-QUEUE is non-nil (or omitted when queue integration is
 active), an enqueue target option is included.
 
-Each entry is of the form:
-  (CANDIDATE-STRING ANNOTATION . TARGET)
-Where TARGET is `:session-new', a live shell buffer, or `:queue'."
+Prioritizes open sessions for the current project (ready before busy),
+followed by new buffer operations for each available agent shell in DIR,
+then other open agent shells, and the queue option."
   (let* ((effective-dir (agent-shell-workflow--canonicalize-dir (or dir default-directory)))
          (dir-name (file-name-nondirectory (directory-file-name effective-dir)))
-         (project-buffers (agent-shell-workflow--project-buffers effective-dir))
-         (all-buffers (if (fboundp 'agent-shell-buffers) (agent-shell-buffers) nil))
+         (project-buffers (seq-filter #'buffer-live-p
+                                      (agent-shell-workflow--project-buffers effective-dir)))
+         (all-buffers (seq-filter #'buffer-live-p
+                                  (if (fboundp 'agent-shell-buffers)
+                                      (agent-shell-buffers)
+                                    nil)))
          (other-buffers (seq-remove (lambda (b) (memq b project-buffers)) all-buffers))
+         (proj-ready (seq-remove #'agent-shell-workflow--buffer-busy-p project-buffers))
+         (proj-busy (seq-filter #'agent-shell-workflow--buffer-busy-p project-buffers))
+         (other-ready (seq-remove #'agent-shell-workflow--buffer-busy-p other-buffers))
+         (other-busy (seq-filter #'agent-shell-workflow--buffer-busy-p other-buffers))
+         (agent-configs (when (fboundp 'agent-shell--resolved-agent-configs)
+                          (condition-case nil
+                              (agent-shell--resolved-agent-configs)
+                            (error nil))))
          (queue-available (if include-queue-p
                               include-queue
                             (or (bound-and-true-p agent-shell-workflow-dispatch-target-functions)
                                 (fboundp 'agent-shell-queue-enqueue))))
          candidates)
-    ;; 1. New shell in this directory
-    (push (cons (format "New agent-shell in %s" dir-name)
-                (cons "[new shell]" :session-new))
-          candidates)
-    ;; 2. Open shells matching the repository
-    (dolist (buf project-buffers)
-      (when (buffer-live-p buf)
-        (push (cons (buffer-name buf)
-                    (cons (format "[%s (project)]" dir-name) buf))
-              candidates)))
-    ;; 3. Other open agent shells
-    (dolist (buf other-buffers)
-      (when (buffer-live-p buf)
-        (let* ((buf-dir (with-current-buffer buf default-directory))
-               (buf-dir-short (file-name-nondirectory (directory-file-name (expand-file-name buf-dir)))))
-          (push (cons (buffer-name buf)
-                      (cons (format "[open: %s]" buf-dir-short) buf))
-                candidates))))
+    ;; 1. Open sessions for current project: ready before busy
+    (dolist (buf proj-ready)
+      (push (cons (buffer-name buf)
+                  (cons (or (agent-shell-workflow--buffer-annotation buf)
+                            (format "[%s (ready)]" dir-name))
+                        buf))
+            candidates))
+    (dolist (buf proj-busy)
+      (push (cons (buffer-name buf)
+                  (cons (or (agent-shell-workflow--buffer-annotation buf)
+                            (format "[%s (busy)]" dir-name))
+                        buf))
+            candidates))
+    ;; 2. New buffer operation (current project root) for each available agent shell
+    (if agent-configs
+        (progn
+          (dolist (cfg agent-configs)
+            (let* ((bname (or (map-elt cfg :buffer-name)
+                              (symbol-name (map-elt cfg :identifier))))
+                   (label (format "New %s shell in %s" bname dir-name)))
+              (push (cons label
+                          (cons (format "[new: %s]" bname)
+                                (cons :session-new cfg)))
+                    candidates)))
+          ;; Also include generic :session-new
+          (push (cons (format "New agent-shell in %s" dir-name)
+                      (cons "[new shell]" :session-new))
+                candidates))
+      (push (cons (format "New agent-shell in %s" dir-name)
+                  (cons "[new shell]" :session-new))
+            candidates))
+    ;; 3. Other open agent shells: ready before busy
+    (dolist (buf other-ready)
+      (push (cons (buffer-name buf)
+                  (cons (or (agent-shell-workflow--buffer-annotation buf)
+                            (let ((bdir (with-current-buffer buf default-directory)))
+                              (format "[open: %s]" (file-name-nondirectory (directory-file-name (expand-file-name bdir))))))
+                        buf))
+            candidates))
+    (dolist (buf other-busy)
+      (push (cons (buffer-name buf)
+                  (cons (or (agent-shell-workflow--buffer-annotation buf)
+                            (let ((bdir (with-current-buffer buf default-directory)))
+                              (format "[open (busy): %s]" (file-name-nondirectory (directory-file-name (expand-file-name bdir))))))
+                        buf))
+            candidates))
     ;; 4. Queue target (when available)
     (when queue-available
       (push (cons "Enqueue in task queue"
@@ -850,10 +908,11 @@ Where TARGET is `:session-new', a live shell buffer, or `:queue'."
 
 (defun agent-shell-workflow--pick-dispatch-target (&optional dir prompt)
   "Prompt the user to select a dispatch target via `annotated-completing-read'.
-Offers creating a new shell in DIR, any open shell, and task queue
-when available."
+Offers open shells (prioritizing current project ready before busy),
+new shells in DIR for each available agent shell, and task queue."
   (let* ((effective-dir (agent-shell-workflow--canonicalize-dir (or dir default-directory)))
          (candidates (agent-shell-workflow--target-candidates effective-dir))
+         (default-cand (caar candidates))
          (prompt-str (or prompt
                          (format "Dispatch workflow to [%s]: "
                                  (file-name-nondirectory (directory-file-name effective-dir)))))
@@ -861,18 +920,23 @@ when available."
                   candidates
                   :prompt prompt-str
                   :category 'agent-shell-target
+                  :default default-cand
                   :require-match t
                   :history 'agent-shell-workflow-target-history)))
     (cond
      ((bufferp choice) choice)
      ((memq choice '(:session-new :queue :session-reuse)) choice)
+     ((and (consp choice) (eq (car choice) :session-new)) choice)
      ((stringp choice)
-      (cond
-       ((get-buffer choice) (get-buffer choice))
-       ((string-prefix-p ":" choice) (intern choice))
-       ((string-match-p "\\`\\[?new" (downcase choice)) :session-new)
-       ((string-match-p "queue" (downcase choice)) :queue)
-       (t choice)))
+      (let ((match (assoc choice candidates)))
+        (if match
+            (cddr match)
+          (cond
+           ((get-buffer choice) (get-buffer choice))
+           ((string-prefix-p ":" choice) (intern choice))
+           ((string-match-p "\\`\\[?new" (downcase choice)) :session-new)
+           ((string-match-p "queue" (downcase choice)) :queue)
+           (t choice)))))
      (t choice))))
 
 (defun agent-shell-workflow--resolve-target (target &optional dir)
@@ -1444,7 +1508,7 @@ a `display-buffer' action alist, or a function."
          (canon-repos (seq-map #'agent-shell-workflow--canonicalize-dir (or repos (list dir))))
          (debounce-key (list id canon-dir (sort (copy-sequence canon-repos) #'string<)))
          (now (float-time))
-         (last-time (gethash debounce-key agent-shell-workflow--in-flight-dispatches)))
+         (last-time (map-elt agent-shell-workflow--in-flight-dispatches debounce-key)))
     (if (and agent-shell-workflow-debounce-interval
              last-time
              (< (- now last-time) agent-shell-workflow-debounce-interval))
@@ -1453,7 +1517,7 @@ a `display-buffer' action alist, or a function."
                    id (file-name-nondirectory (directory-file-name canon-dir)))
           nil)
       (when agent-shell-workflow-debounce-interval
-        (puthash debounce-key now agent-shell-workflow--in-flight-dispatches))
+        (setf (map-elt agent-shell-workflow--in-flight-dispatches debounce-key) now))
       (let* ((raw-target (agent-shell-workflow--normalize-target
                           (or target (agent-shell-workflow-spec-target spec))))
              (effective-display
@@ -1467,7 +1531,7 @@ a `display-buffer' action alist, or a function."
              (effective-providers
               (or new-shell-providers providers
                   (and spec (agent-shell-workflow-spec-new-shell-providers spec))))
-             (initial-target (agent-shell-workflow--resolve-target raw-target))
+             (initial-target (agent-shell-workflow--resolve-target raw-target dir))
              (effective-submit (if (null submit)
                                    (agent-shell-workflow-spec-submit spec)
                                  submit))
@@ -1489,8 +1553,10 @@ a `display-buffer' action alist, or a function."
                                          (car buffers)))
                   (setq cur-target :session-new))))
              ((memq cur-target '(:session-reuse :reuse))
-              (if (memq effective-shell-reuse '(new :new))
-                  (setq cur-target :session-new)
+              (cond
+               ((memq effective-shell-reuse '(new :new))
+                (setq cur-target :session-new))
+               ((and noninteractive (not (bound-and-true-p agent-shell-workflow-test-acr)))
                 (let* ((buffers (agent-shell-workflow--project-buffers dir))
                        (dir-name (file-name-nondirectory (directory-file-name dir))))
                   (cond
@@ -1534,7 +1600,13 @@ a `display-buffer' action alist, or a function."
                                       (agent-shell-workflow--resolve-provider-config effective-providers)
                                     (when (fboundp 'agent-shell-select-config)
                                       (agent-shell-select-config :prompt "Start agent for workflow: ")))))
-                        (setq cur-target (get-buffer choice)))))))))
+                        (setq cur-target (get-buffer choice))))))))
+               (t
+                (setq cur-target (agent-shell-workflow--pick-dispatch-target dir)))))
+             ((and (consp cur-target) (eq (car cur-target) :session-new))
+              (setq chosen-config (or (cdr cur-target) chosen-config)
+                    cur-target :session-new
+                    done t))
              ((memq cur-target '(:session-new :new))
               (when (null chosen-config)
                 (setq chosen-config
@@ -1549,7 +1621,8 @@ a `display-buffer' action alist, or a function."
                 (if (and effective-submit (bufferp b) (buffer-live-p b))
                     (let ((b-action (agent-shell-workflow--resolve-busy-action-upfront b effective-submit)))
                       (if (eq b-action 'select)
-                          (progn
+                          (if (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-acr))
+                              (setq cur-target (agent-shell-workflow--pick-dispatch-target dir))
                             (setq cur-target :session-new)
                             (when (null chosen-config)
                               (setq chosen-config
@@ -1742,8 +1815,10 @@ repository in `:together' mode."
      :dispatch-fn #'agent-shell-workflow--dispatch-queue-item
      :input-spec '(:kind capture))))
 
-(require 'agent-shell-queue nil t)
-(agent-shell-workflow--setup-queue-integration)
+(with-eval-after-load 'agent-shell-queue
+  (agent-shell-workflow--setup-queue-integration))
+(when (featurep 'agent-shell-queue)
+  (agent-shell-workflow--setup-queue-integration))
 
 (autoload 'agent-shell-workflow-select "agent-shell-workflow-menu" nil t)
 (autoload 'agent-shell-workflow-select-group "agent-shell-workflow-menu" nil t)

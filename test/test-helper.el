@@ -6,10 +6,19 @@
 
 ;;; Code:
 
-(let* ((test-file (or load-file-name buffer-file-name))
-       (test-dir (file-name-directory test-file))
-       (root (file-name-directory (directory-file-name test-dir))))
-  (add-to-list 'load-path root))
+(defvar agent-shell-workflow-test--root
+  (let* ((test-file (or load-file-name buffer-file-name))
+         (test-dir (and test-file (file-name-directory test-file))))
+    (if test-dir
+        (file-name-directory (directory-file-name test-dir))
+      "/home/tychoish/src/agent-shell-workflow/")))
+
+(setq load-prefer-newer t)
+(setq load-path (cons agent-shell-workflow-test--root
+                      (seq-remove (lambda (dir)
+                                    (and (stringp dir)
+                                         (string-match-p "/elpa/agent-shell-workflow-" dir)))
+                                  load-path)))
 ;; Suppress system desktop notifications during test execution
 (require 'alert nil t)
 (when (boundp 'alert-default-style)
