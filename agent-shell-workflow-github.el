@@ -812,7 +812,8 @@ Do NOT read all raw comment data into context at once. Review comments in `{{pr-
       "\n"))))
 
 (defun agent-shell-workflow-library--diff-review-remediate-pre-op (ctx &optional callback)
-  "Extract unresolved diff-review findings and write Markdown artifact for CTX."
+  "Extract unresolved diff-review findings and write Markdown artifact for CTX.
+CALLBACK, when non-nil, receives the updated context instead of returning it."
   (let* ((args (plist-get ctx :args))
          (review-file (agent-shell-workflow-library--resolve-review-file
                        (plist-get args :review-file)
@@ -883,7 +884,8 @@ Do NOT read all raw comment data into context at once. Review comments in `{{pr-
   :target :session-reuse)
 
 (defun agent-shell-workflow-library--review-draft-pass-pre-op (ctx &optional callback)
-  "Prepare diff patch artifact for autonomous `review-draft-pass' in CTX."
+  "Prepare diff patch artifact for autonomous `review-draft-pass' in CTX.
+CALLBACK, when non-nil, receives the updated context instead of returning it."
   (let* ((args (plist-get ctx :args))
          (review-file (agent-shell-workflow-library--resolve-review-file
                        (plist-get args :review-file)

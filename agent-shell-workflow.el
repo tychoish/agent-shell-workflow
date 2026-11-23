@@ -67,7 +67,7 @@
   '((omp . "/shake")
     (t . "/clear"))
   "Alist mapping agent identifiers to context-clearing slash commands.
-The key `t' provides the fallback command."
+The key t provides the fallback command."
   :type '(alist :key-type symbol :value-type string)
   :group 'agent-shell-workflow)
 
@@ -235,7 +235,7 @@ Returns nil if no clear operation is defined for that shell type/agent."
   "Call or prompt context-clearing command in reused BUFFER according to SPEC.
 When BUFFER is a new or fresh shell buffer, does nothing.
 When SPEC is provided and its clear option is nil, does nothing.
-When SPEC has a non-nil clear option (such as `t') and BUFFER has a clear
+When SPEC has a non-nil clear option (such as t) and BUFFER has a clear
 command defined, executes it immediately.
 When SPEC clear option is `ask' or SPEC is omitted, prompts the user.
 Returns non-nil if a clear command was executed, nil otherwise."
@@ -325,7 +325,7 @@ CALLBACK receives a descriptive error string."
 PAIRS is a list of (KEY PROGRAM ARG...).
 Calls CALLBACK with an alist of (KEY . OUTPUT) when all commands complete.
 CALLBACK-OR-DIR and DIR-OR-CALLBACK may be passed in either order:
-(PAIRS CALLBACK &optional DIR) or (PAIRS DIR CALLBACK)."
+\(PAIRS CALLBACK &optional DIR) or (PAIRS DIR CALLBACK)."
   (let* ((callback (if (functionp callback-or-dir) callback-or-dir dir-or-callback))
          (dir (if (functionp callback-or-dir) dir-or-callback callback-or-dir))
          (total (length pairs))
@@ -455,7 +455,7 @@ Populate via `agent-shell-workflow-define'.")
 (defun agent-shell-workflow--normalize-display (display)
   "Normalize DISPLAY to a canonical display value, or nil when unspecified.
 Keywords, symbols and strings map to `:foreground' (focus), `:display'
-(show) or `:background' (bury, background).  A function or a
+\(show) or `:background' (bury, background).  A function or a
 `display-buffer' action alist (a cons) passes through.  Unknown names
 yield nil so the next candidate or the default applies."
   (cond
@@ -520,7 +520,8 @@ POLICY can be a keyword or symbol."
        (t (intern name))))))
 
 (cl-defun agent-shell-workflow-register (&key id doc category args pre-op template submit target post-op clear clear-before variants shell-reuse new-shell-providers providers buffer-display display)
-  "Register a workflow spec built from ID, DOC, CATEGORY, ARGS, PRE-OP,
+  "Register a workflow spec.
+The spec is built from ID, DOC, CATEGORY, ARGS, PRE-OP,
 TEMPLATE, SUBMIT, TARGET, POST-OP, CLEAR (or CLEAR-BEFORE), and VARIANTS.
 SHELL-REUSE specifies reuse behavior (\\='always, \\='prompt, \\='new).
 NEW-SHELL-PROVIDERS (or PROVIDERS) specifies preferred/allowed shell providers.
@@ -909,7 +910,8 @@ then other open agent shells, and the queue option."
 (defun agent-shell-workflow--pick-dispatch-target (&optional dir prompt)
   "Prompt the user to select a dispatch target via `annotated-completing-read'.
 Offers open shells (prioritizing current project ready before busy),
-new shells in DIR for each available agent shell, and task queue."
+new shells in DIR for each available agent shell, and task queue.
+PROMPT, when non-nil, overrides the default completion prompt."
   (let* ((effective-dir (agent-shell-workflow--canonicalize-dir (or dir default-directory)))
          (candidates (agent-shell-workflow--target-candidates effective-dir))
          (default-cand (caar candidates))
@@ -943,7 +945,7 @@ new shells in DIR for each available agent shell, and task queue."
   "Resolve TARGET into a concrete target.
 When TARGET is `:ask', prompt the user via
 `agent-shell-workflow--pick-dispatch-target'.
-Otherwise return TARGET normalized."
+Otherwise return TARGET normalized.  DIR is passed to the picker."
   (let ((norm (agent-shell-workflow--normalize-target target)))
     (if (eq norm :ask)
         (agent-shell-workflow--pick-dispatch-target dir)
@@ -1114,7 +1116,8 @@ DISPLAY controls buffer display; see `agent-shell-workflow--show-buffer'."
           buf)))))
 
 (defun agent-shell-workflow--call-create-shell (dir &optional config display)
-  "Invoke `agent-shell-workflow--create-shell' respecting mocked arities."
+  "Invoke `agent-shell-workflow--create-shell' respecting mocked arities.
+DIR, CONFIG and DISPLAY are passed through when non-nil."
   (cond
    ((or config display)
     (condition-case nil
@@ -1247,6 +1250,7 @@ prompts the user synchronously before preflight starts.
 If SHELL-BUFFER is already busy, asks if prompt should be queued or if a
 different shell should be selected.  If SHELL-BUFFER is not currently busy,
 asks conditionally if prompt should be queued if the shell becomes busy.
+WILL-SUBMIT is non-nil when the prompt will be submitted.
 Returns one of `queue', `wait', `select', `insert', or `error'."
   (when (and will-submit shell-buffer)
     (let* ((buf (cond
@@ -1262,7 +1266,7 @@ Returns one of `queue', `wait', `select', `insert', or `error'."
         ('ask
          (let ((busy-now (agent-shell-workflow--buffer-busy-p shell-buffer)))
            (if busy-now
-               (if (y-or-n-p (format "Agent shell `%s' is currently busy. Add prompt to queue when preflight completes? "
+               (if (y-or-n-p (format "Agent shell `%s' is currently busy.  Add prompt to queue when preflight completes? "
                                      buf-name))
                    'queue
                  (if (y-or-n-p "Select or create a different agent shell? ")
@@ -1298,7 +1302,7 @@ prompts the user with `y-or-n-p'.  Returns one of `queue', `wait',
     (pcase agent-shell-workflow-busy-shell-behavior
       ('ask
        (if (and queue-avail
-                (y-or-n-p (format "Agent shell `%s' is currently busy. Add prompt to queue? "
+                (y-or-n-p (format "Agent shell `%s' is currently busy.  Add prompt to queue? "
                                   buf-name)))
            'queue
          'wait))
@@ -1385,7 +1389,8 @@ Clears `agent-shell-workflow--pending-clear' if set."
     (funcall callback)))
 
 (defun agent-shell-workflow--insert-and-post (spec ctx shell-buffer submit)
-  "Insert rendered SPEC into SHELL-BUFFER and subscribe to post-op if present."
+  "Insert rendered SPEC into SHELL-BUFFER and subscribe to post-op if present.
+CTX is the workflow context; SUBMIT is non-nil to submit the prompt."
   (let* ((insertion (agent-shell-workflow--insert spec ctx shell-buffer submit))
          (resp-start (alist-get :end insertion)))
     (when (agent-shell-workflow-spec-post-op spec)
@@ -1798,7 +1803,8 @@ repository in `:together' mode."
                           :submit submit))))
 
 (defun agent-shell-workflow--queue-target-handler (spec ctx target submit)
-  "Target handler for `:queue' target when `agent-shell-queue' is loaded."
+  "Target handler for `:queue' target when `agent-shell-queue' is loaded.
+SPEC, CTX, TARGET and SUBMIT are as for dispatch target functions."
   (when (eq target :queue)
     (let ((shell-buf (plist-get ctx :shell-buffer)))
       (agent-shell-workflow--enqueue-for-buffer spec ctx shell-buf submit))))

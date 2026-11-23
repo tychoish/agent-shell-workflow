@@ -44,7 +44,8 @@
 ;; Test coverage expansion
 
 (defun agent-shell-workflow-library--coverage-pre-op (ctx &optional callback)
-  "Diff :file in CTX against HEAD to scope untested edits."
+  "Diff :file in CTX against HEAD to scope untested edits.
+CALLBACK, when non-nil, receives the updated context instead of returning it."
   (let* ((args (plist-get ctx :args))
          (file (plist-get args :file)))
     (if callback
@@ -73,7 +74,8 @@ Diff:
 ;; Refactor / dead-code cleanup
 
 (defun agent-shell-workflow-library--refactor-pre-op (ctx &optional callback)
-  "Gather git log summary for :file in CTX to scope stale/legacy code."
+  "Gather git log summary for :file in CTX to scope stale/legacy code.
+CALLBACK, when non-nil, receives the updated context instead of returning it."
   (let* ((args (plist-get ctx :args))
          (file (plist-get args :file)))
     (if callback
@@ -102,7 +104,8 @@ Recent history:
 (defun agent-shell-workflow-library--create-commit-pre-op (ctx &optional callback)
   "Gather git status, diff against HEAD, and recent log history for CTX.
 Signals a `user-error' if there are no changes to commit.
-Uses Magit to gather state."
+Uses Magit to gather state.
+CALLBACK, when non-nil, receives the updated context instead of returning it."
   (let* ((finish
           (lambda (status diff log)
             (when (and (or (null status) (string-empty-p (string-trim status)) (equal status "(clean)"))
@@ -169,7 +172,8 @@ Uses Magit to gather state."
   "Gather git status and branch for the repositories of CTX.
 The repositories come from the `group' arg when given, otherwise from the
 `:repos' in CTX, which is a single repository when dispatched once per
-repository and the whole group when dispatched together."
+repository and the whole group when dispatched together.
+CALLBACK, when non-nil, receives the updated context instead of returning it."
   (let* ((group (plist-get (plist-get ctx :args) :group))
          (repos (if group
                     (agent-shell-workflow-resolve-repo-group
@@ -179,13 +183,13 @@ repository and the whole group when dispatched together."
     (dolist (dir repos)
       (let* ((dname (file-name-nondirectory (directory-file-name dir)))
              (status (let ((default-directory dir))
-                       (condition-case nil
-                           (agent-shell-workflow-library--git-output "status" "--short")
-                         (error "(error reading git status)"))))
+                       (or (ignore-errors
+                             (agent-shell-workflow-library--git-output "status" "--short"))
+                           "(error reading git status)")))
              (branch (let ((default-directory dir))
-                       (condition-case nil
-                           (agent-shell-workflow-library--git-output "rev-parse" "--abbrev-ref" "HEAD")
-                         (error "unknown"))))
+                       (or (ignore-errors
+                             (agent-shell-workflow-library--git-output "rev-parse" "--abbrev-ref" "HEAD"))
+                           "unknown")))
              (clean (or (string-empty-p (string-trim status))
                         (equal (string-trim status) "(clean)"))))
         (push (format "### Repository: %s (%s) [%s]\n%s"
