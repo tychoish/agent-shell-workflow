@@ -1815,10 +1815,16 @@ repository in `:together' mode."
      :dispatch-fn #'agent-shell-workflow--dispatch-queue-item
      :input-spec '(:kind capture))))
 
-(with-eval-after-load 'agent-shell-queue
-  (agent-shell-workflow--setup-queue-integration))
-(when (featurep 'agent-shell-queue)
-  (agent-shell-workflow--setup-queue-integration))
+(defun agent-shell-workflow--on-queue-loaded (file)
+  "Register queue integration when `agent-shell-queue' is loaded from FILE."
+  (when (string-match-p "agent-shell-queue" file)
+    (agent-shell-workflow--setup-queue-integration)
+    (when (fboundp 'agent-shell-queue-register-item-type)
+      (remove-hook 'after-load-functions #'agent-shell-workflow--on-queue-loaded))))
+
+(agent-shell-workflow--setup-queue-integration)
+(unless (fboundp 'agent-shell-queue-register-item-type)
+  (add-hook 'after-load-functions #'agent-shell-workflow--on-queue-loaded))
 
 (autoload 'agent-shell-workflow-select "agent-shell-workflow-menu" nil t)
 (autoload 'agent-shell-workflow-select-group "agent-shell-workflow-menu" nil t)

@@ -1192,6 +1192,24 @@ match-data `replace-regexp-in-string' relies on for subsequent matches."
       (should type-registered-args)
       (should (eq (plist-get type-registered-args :kind) 'workflow)))))
 
+(ert-deftest agent-shell-workflow/on-queue-loaded-registers-and-unhooks ()
+  "agent-shell-workflow--on-queue-loaded runs setup and unhooks after-load-functions."
+  (let (setup-called)
+    (cl-letf (((symbol-function 'agent-shell-workflow--setup-queue-integration)
+               (lambda () (setq setup-called t)))
+              ((symbol-function 'agent-shell-queue-register-item-type)
+               #'ignore))
+      (add-hook 'after-load-functions #'agent-shell-workflow--on-queue-loaded)
+      (unwind-protect
+          (progn
+            (agent-shell-workflow--on-queue-loaded "/path/to/other.el")
+            (should-not setup-called)
+            (should (memq #'agent-shell-workflow--on-queue-loaded after-load-functions))
+            (agent-shell-workflow--on-queue-loaded "/path/to/agent-shell-queue.el")
+            (should setup-called)
+            (should-not (memq #'agent-shell-workflow--on-queue-loaded after-load-functions)))
+        (remove-hook 'after-load-functions #'agent-shell-workflow--on-queue-loaded)))))
+
 ;;; ─────────────────────────────────────────────────────────────
 ;;; Additional Coverage: Library ISO Timestamps and Formatting
 
