@@ -3761,6 +3761,38 @@ and prompt is enqueued for target shell."
             (should (file-exists-p diff-path))))
       (delete-directory dir t))))
 
+(ert-deftest agent-shell-workflow/implement-org-task-spec-registered ()
+  "Test that implement-org-task is registered with appropriate metadata."
+  (require 'agent-shell-workflow-library)
+  (let ((spec (agent-shell-workflow-get 'implement-org-task)))
+    (should spec)
+    (should (equal (agent-shell-workflow-spec-category spec) "Org"))
+    (should (eq (agent-shell-workflow-spec-target spec) :ask))
+    (should (agent-shell-workflow-spec-submit spec))))
+
+(ert-deftest agent-shell-workflow/implement-org-task-extraction-and-render ()
+  "Test extracting Org task metadata and rendering the implement-org-task template."
+  (require 'agent-shell-workflow-library)
+  (with-temp-buffer
+    (org-mode)
+    (insert "* TODO Refactor authentication middleware :auth:security:\nDetailed instructions for middleware refactor.\n")
+    (goto-char (point-min))
+    (let* ((spec (agent-shell-workflow-get 'implement-org-task))
+           (ctx (agent-shell-workflow-library--org-task-pre-op nil))
+           (rendered (agent-shell-workflow-render (agent-shell-workflow-spec-template spec) ctx)))
+      (should (equal (plist-get ctx :task-title) "Refactor authentication middleware"))
+      (should (string-match-p "Detailed instructions for middleware refactor" (plist-get ctx :task-body)))
+      (should (string-match-p "Refactor authentication middleware" rendered))
+      (should (string-match-p "Detailed instructions" rendered))
+      (should (string-match-p "Provide progress updates" rendered)))))
+
+(ert-deftest agent-shell-workflow/implement-org-task-non-org-error ()
+  "Test that extracting task outside org buffers raises an error."
+  (require 'agent-shell-workflow-library)
+  (with-temp-buffer
+    (fundamental-mode)
+    (insert "not an org file")
+    (should-error (agent-shell-workflow-library--extract-org-task) :type 'user-error)))
 
 (provide 'test-agent-shell-workflow)
 

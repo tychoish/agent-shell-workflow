@@ -32,10 +32,19 @@
 
 (require 'agent-shell-workflow-utils)
 (require 'agent-shell-workflow)
+(require 'org)
 (eval-when-compile
   (require 'agent-shell-workflow))
 
 (declare-function agent-shell-workflow-resolve-repo-group "agent-shell-workflow")
+(declare-function org-back-to-heading "org")
+(declare-function org-get-heading "org")
+(declare-function org-get-todo-state "org")
+(declare-function org-get-tags "org")
+(declare-function org-end-of-subtree "org")
+(declare-function org-todo "org")
+(declare-function org-get-at-bol "org-macs")
+(defvar org-todo-keywords-1)
 
 ;; Domain workflow modules
 (require 'agent-shell-workflow-github)
@@ -165,6 +174,100 @@ CALLBACK, when non-nil, receives the updated context instead of returning it."
               :template-replace
               (("Create one git commit containing all uncommitted changes:"
                 . "Create a logical series of commits (or a single commit if changes are cohesive; inspect the changes and decide if a series or single commit is appropriate) containing all uncommitted changes:")))))
+
+;; Org task implementation
+
+(defun agent-shell-workflow-library--extract-org-task ()
+  "Extract task metadata from current Org or Org-agenda buffer.
+Returns a plist `(:title ... :heading ... :file ... :todo ... :tags ... :body ...)'.
+When in a TODO state, transitions to INPROGRESS if defined in `org-todo-keywords-1'."
+  (let ((marker nil)
+        (buf (current-buffer)))
+    (cond
+     ((derived-mode-p 'org-agenda-mode)
+      (setq marker (or (org-get-at-bol 'org-marker)
+                       (org-get-at-bol 'org-hd-marker)))
+      (unless (and marker (markerp marker) (marker-buffer marker))
+        (user-error "No Org task found at point in agenda")))
+     ((derived-mode-p 'org-mode)
+      nil)
+     (t
+      (user-error "Current buffer is not an Org or Org-agenda buffer")))
+    (let ((target-buf (if marker (marker-buffer marker) buf))
+          (target-pos (if marker (marker-position marker) (point))))
+      (with-current-buffer target-buf
+        (save-excursion
+          (goto-char target-pos)
+          (org-back-to-heading t)
+          (let* ((heading-text (org-get-heading t t t t))
+                 (todo-state (org-get-todo-state))
+                 (tags (org-get-tags))
+                 (file-name (or (buffer-file-name) (buffer-name)))
+                 (full-heading (string-trim (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
+                 (heading-end (save-excursion (end-of-line) (point)))
+                 (subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+                 (raw-body (if (< heading-end subtree-end)
+                               (buffer-substring-no-properties (min (1+ heading-end) subtree-end) subtree-end)
+                             ""))
+                 (body (string-trim raw-body)))
+            (when (and todo-state (boundp 'org-todo-keywords-1) (member "INPROGRESS" org-todo-keywords-1))
+              (ignore-errors (org-todo "INPROGRESS")))
+            (list :title (or heading-text "(untitled task)")
+                  :heading full-heading
+                  :file file-name
+                  :todo (or todo-state "")
+                  :tags (if tags (string-join tags " :") "")
+                  :body (if (string-empty-p body) "(no body content)" body))))))))
+
+(defun agent-shell-workflow-library--org-task-pre-op (ctx &optional callback)
+  "Pre-op to extract current Org task metadata for `implement-org-task'.
+CALLBACK, when non-nil, receives the updated context instead of returning it."
+  (let* ((task (agent-shell-workflow-library--extract-org-task))
+         (updated (copy-sequence ctx)))
+    (setq updated (plist-put updated :task-title (plist-get task :title)))
+    (setq updated (plist-put updated :task-heading (plist-get task :heading)))
+    (setq updated (plist-put updated :task-file (plist-get task :file)))
+    (setq updated (plist-put updated :task-todo (plist-get task :todo)))
+    (setq updated (plist-put updated :task-tags (plist-get task :tags)))
+    (setq updated (plist-put updated :task-body (plist-get task :body)))
+    (if callback
+        (funcall callback updated)
+      updated)))
+
+(agent-shell-workflow-define implement-org-task
+  :doc "Implement the Org-mode task at point, reporting progress and results"
+  :category "Org"
+  :args ((instructions :prompt "Additional instructions (optional): " :optional t))
+  :pre-op #'agent-shell-workflow-library--org-task-pre-op
+  :template "Implement the following task from {{task-file}}:
+
+{{task-heading}}
+
+{{task-body}}
+
+{{args.instructions}}
+
+Instructions:
+1. Implement the requested changes and address all requirements outlined in this task.
+2. Provide progress updates as you proceed with each step.
+3. Upon completion, give a clear summary of the changes made, files modified, and verification results."
+  :submit t
+  :target :ask)
+
+;;;###autoload
+(defun agent-shell-workflow-dispatch-org-task (&optional target instructions)
+  "Dispatch the current Org task at point using `implement-org-task'.
+When TARGET is nil, prompts for dispatch target via ACR.
+With prefix arg, prompt for additional INSTRUCTIONS."
+  (interactive
+   (list nil (when current-prefix-arg
+               (read-string "Additional instructions (optional): "))))
+  (let ((args (when (and instructions (not (string-empty-p instructions)))
+                (list :instructions instructions))))
+    (agent-shell-workflow-dispatch
+     'implement-org-task
+     :target (or target :ask)
+     :args args)))
 
 ;; Multi-repository group workflows
 
