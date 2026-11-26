@@ -111,10 +111,10 @@ Recent history:
 ;; Git commit authoring
 
 (defun agent-shell-workflow-library--create-commit-pre-op (ctx &optional callback)
-  "Gather git status, diff against HEAD, and recent log history for CTX.
-Signals a `user-error' if there are no changes to commit.
-Uses Magit to gather state.
-CALLBACK, when non-nil, receives the updated context instead of returning it."
+  "Add Git status, diff against HEAD, and recent commits to a copy of CTX.
+Signal `user-error' when there are no changes to commit.
+With CALLBACK, gather asynchronously and pass it the updated context.
+Otherwise, return the updated context."
   (let* ((finish
           (lambda (status diff log)
             (when (and (or (null status) (string-empty-p (string-trim status)) (equal status "(clean)"))
@@ -178,9 +178,13 @@ CALLBACK, when non-nil, receives the updated context instead of returning it."
 ;; Org task implementation
 
 (defun agent-shell-workflow-library--extract-org-task ()
-  "Extract task metadata from current Org or Org-agenda buffer.
-Returns a plist `(:title ... :heading ... :file ... :todo ... :tags ... :body ...)'.
-When in a TODO state, transitions to INPROGRESS if defined in `org-todo-keywords-1'."
+  "Return metadata for the Org heading at point or its agenda entry.
+The plist contains :title, :heading, :file, :todo, :tags, and :body strings.
+Use the buffer name when no file is visited and placeholder text for an
+empty body.  The body includes child headings.
+When the heading has a TODO keyword, try to set it to INPROGRESS if that
+state is defined in `org-todo-keywords-1'.  Return the original metadata.
+Signal `user-error' outside Org or when an agenda entry has no live marker."
   (let ((marker nil)
         (buf (current-buffer)))
     (cond
@@ -220,8 +224,10 @@ When in a TODO state, transitions to INPROGRESS if defined in `org-todo-keywords
                   :body (if (string-empty-p body) "(no body content)" body))))))))
 
 (defun agent-shell-workflow-library--org-task-pre-op (ctx &optional callback)
-  "Pre-op to extract current Org task metadata for `implement-org-task'.
-CALLBACK, when non-nil, receives the updated context instead of returning it."
+  "Add the current Org task's template values to a copy of CTX.
+Populate :task-title, :task-heading, :task-file, :task-todo, :task-tags,
+and :task-body using `agent-shell-workflow-library--extract-org-task'.
+Pass the updated context to CALLBACK when non-nil; otherwise return it."
   (let* ((task (agent-shell-workflow-library--extract-org-task))
          (updated (copy-sequence ctx)))
     (setq updated (plist-put updated :task-title (plist-get task :title)))
@@ -256,9 +262,11 @@ Instructions:
 
 ;;;###autoload
 (defun agent-shell-workflow-dispatch-org-task (&optional target instructions)
-  "Dispatch the current Org task at point using `implement-org-task'.
-When TARGET is nil, prompts for dispatch target via ACR.
-With prefix arg, prompt for additional INSTRUCTIONS."
+  "Dispatch the Org heading at point or its agenda entry for implementation.
+TARGET selects the destination; nil or :ask prompts for one.  See
+`agent-shell-workflow-dispatch' for supported targets.
+Append nonempty INSTRUCTIONS to the task prompt.  Interactively, use a
+prefix argument to enter additional instructions."
   (interactive
    (list nil (when current-prefix-arg
                (read-string "Additional instructions (optional): "))))
@@ -272,11 +280,10 @@ With prefix arg, prompt for additional INSTRUCTIONS."
 ;; Multi-repository group workflows
 
 (defun agent-shell-workflow-library--group-status-pre-op (ctx &optional callback)
-  "Gather git status and branch for the repositories of CTX.
-The repositories come from the `group' arg when given, otherwise from the
-`:repos' in CTX, which is a single repository when dispatched once per
-repository and the whole group when dispatched together.
-CALLBACK, when non-nil, receives the updated context instead of returning it."
+  "Add a Git status and branch report to a copy of CTX as :group-report.
+Use the :group argument in CTX's :args when provided; otherwise use :repos
+from CTX.  In per-repository dispatch, :repos contains only that repository.
+Pass the updated context to CALLBACK when non-nil; otherwise return it."
   (let* ((group (plist-get (plist-get ctx :args) :group))
          (repos (if group
                     (agent-shell-workflow-resolve-repo-group
