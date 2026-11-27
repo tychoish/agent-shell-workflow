@@ -34,6 +34,23 @@ interactive selection menus.
 (agent-shell-workflow-select)
 #+END_SRC
 
+* Org task dispatch
+
+Run ~agent-shell-workflow-dispatch-org-task~ at an Org heading or its
+agenda entry, or select the ~implement-org-task~ workflow. The prompt
+includes the source file, absolute subtree line range, and stable Org ID.
+Preflight creates a missing ID and saves changed file-backed tasks before
+dispatch. Read-only headings need an existing ID. Unsaved buffers keep
+their IDs in memory until saved.
+
+Instructions ask agents to record progress and verification under the
+original heading, resolve its ID when lines move, and delegate independent
+work to sub-agents where useful. Source locations survive narrowing and
+foreground shell selection.
+
+For editable raw subtree capture without implementation instructions, use
+~agent-shell-queue-org-capture-from-heading~ instead.
+
 * Display behavior
 
 Each workflow controls how its shell buffer is presented, via =:display= (or

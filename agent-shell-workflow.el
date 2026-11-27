@@ -1506,7 +1506,8 @@ BUFFER-DISPLAY (or DISPLAY; BUFFER-DISPLAY wins) overrides the spec's
 display.  See `agent-shell-workflow--normalize-display' for the accepted
 values: `:foreground'/`focus', `:display'/`show', `:background'/`bury',
 a `display-buffer' action alist, or a function."
-  (let* ((spec (or (agent-shell-workflow-get id)
+  (let* ((source-marker (point-marker))
+         (spec (or (agent-shell-workflow-get id)
                    (error "Agent-shell-workflow: no workflow registered with id `%s'" id)))
          (dir (or context-dir (car repos) default-directory))
          (canon-dir (agent-shell-workflow--canonicalize-dir dir))
@@ -1666,6 +1667,7 @@ a `display-buffer' action alist, or a function."
           ;; 4. Non-blocking preflight execution
           (message "Running preflight for workflow `%s'..." id)
           (let ((initial-ctx (list :args collected-args
+                                   :source-marker source-marker
                                    :target resolved-target
                                    :shell-buffer shell-buffer
                                    :submit effective-submit

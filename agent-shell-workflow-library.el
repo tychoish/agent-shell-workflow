@@ -33,6 +33,7 @@
 (require 'agent-shell-workflow-utils)
 (require 'agent-shell-workflow)
 (require 'org)
+(require 'org-id)
 (eval-when-compile
   (require 'agent-shell-workflow))
 
@@ -179,11 +180,16 @@ Otherwise, return the updated context."
 
 (defun agent-shell-workflow-library--extract-org-task ()
   "Return metadata for the Org heading at point or its agenda entry.
-The plist contains :title, :heading, :file, :todo, :tags, and :body strings.
+The plist contains :title, :heading, :file, :todo, :tags, and :body strings,
+plus :id and absolute :line and :end-line numbers for the source subtree.
+Create a stable Org ID when writable.  Save changed file-backed tasks so
+agents can resolve the reference from disk; unsaved buffers retain the ID
+in memory.  Read-only headings without IDs signal `user-error'.
 Use the buffer name when no file is visited and placeholder text for an
 empty body.  The body includes child headings.
 When the heading has a TODO keyword, try to set it to INPROGRESS if that
-state is defined in `org-todo-keywords-1'.  Return the original metadata.
+state is defined in `org-todo-keywords-1'.  Preserve the original TODO
+state but extract source locations and body after transition/save hooks.
 Signal `user-error' outside Org or when an agenda entry has no live marker."
   (let ((marker nil)
         (buf (current-buffer)))
@@ -201,38 +207,70 @@ Signal `user-error' outside Org or when an agenda entry has no live marker."
           (target-pos (if marker (marker-position marker) (point))))
       (with-current-buffer target-buf
         (save-excursion
-          (goto-char target-pos)
-          (org-back-to-heading t)
-          (let* ((heading-text (org-get-heading t t t t))
-                 (todo-state (org-get-todo-state))
-                 (tags (org-get-tags))
-                 (file-name (or (buffer-file-name) (buffer-name)))
-                 (full-heading (string-trim (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
-                 (heading-end (save-excursion (end-of-line) (point)))
-                 (subtree-end (save-excursion (org-end-of-subtree t t) (point)))
-                 (raw-body (if (< heading-end subtree-end)
-                               (buffer-substring-no-properties (min (1+ heading-end) subtree-end) subtree-end)
-                             ""))
-                 (body (string-trim raw-body)))
-            (when (and todo-state (boundp 'org-todo-keywords-1) (member "INPROGRESS" org-todo-keywords-1))
-              (ignore-errors (org-todo "INPROGRESS")))
-            (list :title (or heading-text "(untitled task)")
-                  :heading full-heading
-                  :file file-name
-                  :todo (or todo-state "")
-                  :tags (if tags (string-join tags " :") "")
-                  :body (if (string-empty-p body) "(no body content)" body))))))))
+          (save-restriction
+            (widen)
+            (goto-char target-pos)
+            (org-back-to-heading t)
+            (unless (or (org-entry-get nil "ID") (not buffer-read-only))
+              (user-error "Task needs an Org ID; make the source buffer writable"))
+            (let* ((heading-marker (copy-marker (point) t))
+                   (todo-state (org-get-todo-state))
+                   (identifier (or (org-entry-get nil "ID")
+                                   (if buffer-file-name
+                                       (org-id-get-create)
+                                     (org-entry-put nil "ID" (org-id-new))
+                                     (org-entry-get nil "ID")))))
+              (when (and (not buffer-read-only) todo-state
+                         (boundp 'org-todo-keywords-1)
+                         (member "INPROGRESS" org-todo-keywords-1))
+                (ignore-errors (org-todo "INPROGRESS")))
+              (when (and buffer-file-name (buffer-modified-p) (not buffer-read-only))
+                (save-buffer))
+              (goto-char heading-marker)
+              (org-back-to-heading t)
+              (let* ((heading-end (line-end-position))
+                     (subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+                     (body (string-trim
+                            (buffer-substring-no-properties
+                             (min (1+ heading-end) subtree-end) subtree-end))))
+                (list :title (org-get-heading t t t t)
+                      :heading (string-trim
+                                (buffer-substring-no-properties
+                                 (line-beginning-position) heading-end))
+                      :file (or (buffer-file-name) (buffer-name))
+                      :id identifier
+                      :line (line-number-at-pos (point) t)
+                      :end-line (line-number-at-pos
+                                 (max heading-end (1- subtree-end)) t)
+                      :todo (or todo-state "")
+                      :tags (string-join (org-get-tags) " :")
+                      :body (if (string-empty-p body) "(no body content)" body))))))))))
 
 (defun agent-shell-workflow-library--org-task-pre-op (ctx &optional callback)
   "Add the current Org task's template values to a copy of CTX.
 Populate :task-title, :task-heading, :task-file, :task-todo, :task-tags,
-and :task-body using `agent-shell-workflow-library--extract-org-task'.
+:task-id, :task-line, :task-end-line, and :task-body.  When CTX includes
+:source-marker, extract from that location even after shell selection.
 Pass the updated context to CALLBACK when non-nil; otherwise return it."
-  (let* ((task (agent-shell-workflow-library--extract-org-task))
+  (let* ((source (plist-get ctx :source-marker))
+         (task (if source
+                   (progn
+                     (unless (and (markerp source) (marker-buffer source))
+                       (user-error "Org task source buffer is no longer available"))
+                     (with-current-buffer (marker-buffer source)
+                       (save-excursion
+                         (save-restriction
+                           (widen)
+                           (goto-char source)
+                           (agent-shell-workflow-library--extract-org-task)))))
+                 (agent-shell-workflow-library--extract-org-task)))
          (updated (copy-sequence ctx)))
     (setq updated (plist-put updated :task-title (plist-get task :title)))
     (setq updated (plist-put updated :task-heading (plist-get task :heading)))
     (setq updated (plist-put updated :task-file (plist-get task :file)))
+    (setq updated (plist-put updated :task-id (plist-get task :id)))
+    (setq updated (plist-put updated :task-line (plist-get task :line)))
+    (setq updated (plist-put updated :task-end-line (plist-get task :end-line)))
     (setq updated (plist-put updated :task-todo (plist-get task :todo)))
     (setq updated (plist-put updated :task-tags (plist-get task :tags)))
     (setq updated (plist-put updated :task-body (plist-get task :body)))
@@ -245,7 +283,8 @@ Pass the updated context to CALLBACK when non-nil; otherwise return it."
   :category "Org"
   :args ((instructions :prompt "Additional instructions (optional): " :optional t))
   :pre-op #'agent-shell-workflow-library--org-task-pre-op
-  :template "Implement the following task from {{task-file}}:
+  :template "Implement the following task from {{task-file}}:{{task-line}}-{{task-end-line}}.
+Stable Org reference: id:{{task-id}} (resolve this ID if line numbers change).
 
 {{task-heading}}
 
@@ -255,8 +294,14 @@ Pass the updated context to CALLBACK when non-nil; otherwise return it."
 
 Instructions:
 1. Implement the requested changes and address all requirements outlined in this task.
-2. Provide progress updates as you proceed with each step.
-3. Upon completion, give a clear summary of the changes made, files modified, and verification results."
+2. Provide progress updates as you proceed with each step. Record progress,
+   decisions, blockers, and verification under the original heading identified
+   by id:{{task-id}} using native Org tools. Save the source file after updates.
+   If the source is an unsaved buffer, report that limitation explicitly.
+3. Delegate independent work to sub-agents when available and useful; give each
+   a clear scope and integrate and verify their results.
+4. Upon completion, summarize changes and verification results in the original
+   heading and mark it done only after all requirements are met."
   :submit t
   :target :ask)
 
