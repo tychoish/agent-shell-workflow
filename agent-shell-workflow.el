@@ -58,6 +58,11 @@
 (declare-function shell-maker-busy "shell-maker")
 (declare-function agent-shell--active-requests-p "agent-shell")
 
+(autoload 'agent-shell-workflow-resolve-workspace
+  "agent-shell-workflow-workspaces")
+(autoload 'agent-shell-workflow-dispatch-worktrees
+  "agent-shell-workflow-workspaces")
+
 (defgroup agent-shell-workflow nil
   "Reusable prompt and agent workflows for agent-shell."
   :group 'tools
@@ -1130,13 +1135,35 @@ DIR, CONFIG and DISPLAY are passed through when non-nil."
    (t
     (agent-shell-workflow--create-shell dir))))
 
-(defun agent-shell-workflow--session-buffer (target &optional dir spec)
+(defun agent-shell-workflow--shell-buffers (dir exact)
+  "Return shells for DIR, requiring an exact checkout match when EXACT."
+  (if exact
+      (seq-filter
+       (lambda (buffer)
+         (and (buffer-live-p buffer)
+              (with-current-buffer buffer
+                (equal (agent-shell-workflow--canonicalize-dir default-directory)
+                       (agent-shell-workflow--canonicalize-dir dir)))))
+       (agent-shell-buffers))
+    (agent-shell-workflow--project-buffers dir)))
+
+(defun agent-shell-workflow--validate-shell-directory (buffer dir)
+  "Return BUFFER, rejecting a live shell outside the explicit resource DIR."
+  (when (and dir (buffer-live-p buffer))
+    (unless (with-current-buffer buffer
+              (equal (agent-shell-workflow--canonicalize-dir default-directory)
+                     (agent-shell-workflow--canonicalize-dir dir)))
+      (user-error "Shell %s is outside resource %s; select a shell there or use :session-new"
+                  (buffer-name buffer) dir)))
+  buffer)
+
+(defun agent-shell-workflow--session-buffer (target &optional dir spec exact)
   "Return a live `agent-shell' buffer for TARGET in DIR, creating or prompting.
 When TARGET is `:session-new' or `:new', always create a new shell buffer.
 When TARGET is `:session-reuse-always' (or SPEC has shell-reuse set to always),
 reuse an existing project buffer without prompting; if none exist, create one.
 Otherwise, prompt the user whether to reuse an existing buffer or create one.
-If declined, signals `user-error'."
+If declined, signals `user-error'.  EXACT requires shells to match DIR."
   (let* ((effective-dir (or dir default-directory))
          (norm-target (agent-shell-workflow--normalize-target target))
          (reuse-policy (agent-shell-workflow--normalize-shell-reuse
@@ -1149,7 +1176,7 @@ If declined, signals `user-error'."
     (if (eq norm-target :session-new)
         (let ((cfg (and providers (agent-shell-workflow--resolve-provider-config providers))))
           (agent-shell-workflow--call-create-shell effective-dir cfg display))
-      (let* ((buffers (agent-shell-workflow--project-buffers effective-dir))
+      (let* ((buffers (agent-shell-workflow--shell-buffers effective-dir exact))
              (dir-name (file-name-nondirectory (directory-file-name (expand-file-name effective-dir))))
              (reused-buf nil)
              (res-buf nil))
@@ -1197,7 +1224,8 @@ When SUBMIT is non-nil, submit the prompt immediately.
 Once the turn has been handed off without error (inserted, queued or
 deferred), the function named by CTX's `:after-handoff' (a symbol, so
 it survives queue serialization) is called with CTX."
-  (let* ((effective-dir (or dir (plist-get ctx :context-dir) default-directory))
+  (let* ((shell-dir (plist-get ctx :shell-dir))
+         (effective-dir (or shell-dir dir (plist-get ctx :context-dir) default-directory))
          (target (agent-shell-workflow--resolve-target (or target (agent-shell-workflow-spec-target spec)) effective-dir))
          (submit (if (null submit) (agent-shell-workflow-spec-submit spec) submit))
          (result
@@ -1208,8 +1236,14 @@ it survives queue serialization) is called with CTX."
      ((eq target :queue)
       (user-error "Target `:queue' requested but no queue target handler is registered"))
      (t
-      (let* ((shell-buffer (or (plist-get ctx :shell-buffer)
-                               (agent-shell-workflow--session-buffer target effective-dir spec))))
+      (let* ((shell-buffer (agent-shell-workflow--validate-shell-directory
+                           (or (plist-get ctx :shell-buffer)
+                               (if shell-dir
+                                   (agent-shell-workflow--session-buffer
+                                    target effective-dir spec shell-dir)
+                                 (agent-shell-workflow--session-buffer
+                                  target effective-dir spec)))
+                           shell-dir)))
         (agent-shell-workflow--dispatch-to-buffer spec ctx shell-buffer submit))))))
     (when-let* ((after (plist-get ctx :after-handoff))
                 ((functionp after)))
@@ -1484,6 +1518,8 @@ or extracts buffer substring directly."
 
 ;;;###autoload
 (cl-defun agent-shell-workflow-dispatch (id &key args target submit context-dir repos
+                                            shell-dir workspace manifest
+                                            operation-id target-id operation-generation
                                             shell-reuse new-shell-providers providers
                                             buffer-display display &allow-other-keys)
   "Instantiate the workflow ID and dispatch it.
@@ -1492,9 +1528,13 @@ are read interactively.
 TARGET overrides the spec's declared target (`:session-reuse',
 `:session-reuse-always', `:session-new', `:queue', `:ask').
 SUBMIT non-nil forces prompt submission regardless of spec default.
-CONTEXT-DIR sets `default-directory' for pre-op execution and names the
-shell's working directory; it defaults to the first of REPOS, then to
-`default-directory'.
+CONTEXT-DIR sets `default-directory' for pre-op execution; it defaults to
+the first of REPOS, then to `default-directory'.  SHELL-DIR overrides the
+shell startup directory and requires reused shells to match it exactly.
+WORKSPACE resolves an opt-in resource policy for the selected checkouts.
+Without either override, shells retain the CONTEXT-DIR routing behavior.
+MANIFEST, OPERATION-ID, TARGET-ID and OPERATION-GENERATION are frozen
+operation data carried through pre-ops, templates and queued items.
 REPOS is a list of repository directories the workflow works across at
 once.  The canonical list is available to pre-ops and templates as
 `:repos' (`{{repos}}' renders one directory per line); when REPOS is nil it
@@ -1512,9 +1552,30 @@ a `display-buffer' action alist, or a function."
          (dir (or context-dir (car repos) default-directory))
          (canon-dir (agent-shell-workflow--canonicalize-dir dir))
          (canon-repos (seq-map #'agent-shell-workflow--canonicalize-dir (or repos (list dir))))
+         (snapshot (and workspace
+                        (agent-shell-workflow-resolve-workspace workspace canon-repos)))
+         (workspace-target
+          (and snapshot
+               (seq-find (lambda (member)
+                           (equal canon-dir (plist-get member :worktree-dir)))
+                         (plist-get snapshot :targets))))
+         (resource-dir (or shell-dir (plist-get workspace-target :shell-dir)))
+         (shell-directory (or resource-dir dir))
          (debounce-key (list id canon-dir (sort (copy-sequence canon-repos) #'string<)))
          (now (float-time))
          (last-time (map-elt agent-shell-workflow--in-flight-dispatches debounce-key)))
+    (when workspace
+      (unless workspace-target
+        (user-error "Workspace %s does not include checkout %s" workspace canon-dir))
+      (seq-do (lambda (member)
+                (when-let* ((failure (plist-get member :preflight-error)))
+                  (user-error "Workspace preflight failed for %s: %s"
+                              (plist-get member :worktree-dir) failure)))
+              (plist-get snapshot :targets)))
+    (when (and resource-dir
+               (or (file-remote-p resource-dir)
+                   (not (file-directory-p resource-dir))))
+      (user-error "Shell resource must be an available local directory: %s" resource-dir))
     (if (and agent-shell-workflow-debounce-interval
              last-time
              (< (- now last-time) agent-shell-workflow-debounce-interval))
@@ -1537,7 +1598,7 @@ a `display-buffer' action alist, or a function."
              (effective-providers
               (or new-shell-providers providers
                   (and spec (agent-shell-workflow-spec-new-shell-providers spec))))
-             (initial-target (agent-shell-workflow--resolve-target raw-target dir))
+             (initial-target (agent-shell-workflow--resolve-target raw-target shell-directory))
              (effective-submit (if (null submit)
                                    (agent-shell-workflow-spec-submit spec)
                                  submit))
@@ -1553,7 +1614,7 @@ a `display-buffer' action alist, or a function."
              ((or (memq cur-target '(:session-reuse-always :always-reuse :session-reuse-or-new :reuse-always))
                   (and (memq cur-target '(:session-reuse :reuse))
                        (memq effective-shell-reuse '(always :always t))))
-              (let* ((buffers (agent-shell-workflow--project-buffers dir)))
+              (let* ((buffers (agent-shell-workflow--shell-buffers shell-directory resource-dir)))
                 (if buffers
                     (setq cur-target (or (agent-shell-workflow--match-buffer-provider buffers effective-providers)
                                          (car buffers)))
@@ -1563,8 +1624,8 @@ a `display-buffer' action alist, or a function."
                ((memq effective-shell-reuse '(new :new))
                 (setq cur-target :session-new))
                ((and noninteractive (not (bound-and-true-p agent-shell-workflow-test-acr)))
-                (let* ((buffers (agent-shell-workflow--project-buffers dir))
-                       (dir-name (file-name-nondirectory (directory-file-name dir))))
+                (let* ((buffers (agent-shell-workflow--shell-buffers shell-directory resource-dir))
+                       (dir-name (file-name-nondirectory (directory-file-name shell-directory))))
                   (cond
                    ((null buffers)
                     (if (y-or-n-p (format "No agent-shell open for %s. Create one? " dir-name))
@@ -1608,7 +1669,7 @@ a `display-buffer' action alist, or a function."
                                       (agent-shell-select-config :prompt "Start agent for workflow: ")))))
                         (setq cur-target (get-buffer choice))))))))
                (t
-                (setq cur-target (agent-shell-workflow--pick-dispatch-target dir)))))
+                (setq cur-target (agent-shell-workflow--pick-dispatch-target shell-directory)))))
              ((and (consp cur-target) (eq (car cur-target) :session-new))
               (setq chosen-config (or (cdr cur-target) chosen-config)
                     cur-target :session-new
@@ -1624,11 +1685,12 @@ a `display-buffer' action alist, or a function."
               (setq done t))
              ((or (bufferp cur-target) (stringp cur-target))
               (let ((b (if (stringp cur-target) (get-buffer cur-target) cur-target)))
+                (agent-shell-workflow--validate-shell-directory b resource-dir)
                 (if (and effective-submit (bufferp b) (buffer-live-p b))
                     (let ((b-action (agent-shell-workflow--resolve-busy-action-upfront b effective-submit)))
                       (if (eq b-action 'select)
                           (if (or (not noninteractive) (bound-and-true-p agent-shell-workflow-test-acr))
-                              (setq cur-target (agent-shell-workflow--pick-dispatch-target dir))
+                              (setq cur-target (agent-shell-workflow--pick-dispatch-target shell-directory))
                             (setq cur-target :session-new)
                             (when (null chosen-config)
                               (setq chosen-config
@@ -1651,7 +1713,7 @@ a `display-buffer' action alist, or a function."
           ;; 3. Create the shell buffer now if needed
           (if (eq resolved-target :session-new)
               (progn
-                (setq shell-buffer (agent-shell-workflow--call-create-shell dir chosen-config effective-display)
+                (setq shell-buffer (agent-shell-workflow--call-create-shell shell-directory chosen-config effective-display)
                       resolved-target shell-buffer)
                 (when (buffer-live-p shell-buffer)
                   (unless noninteractive
@@ -1665,6 +1727,7 @@ a `display-buffer' action alist, or a function."
               (agent-shell-workflow--maybe-clear-reused-buffer shell-buffer spec)))
 
           ;; 4. Non-blocking preflight execution
+          (agent-shell-workflow--validate-shell-directory shell-buffer resource-dir)
           (message "Running preflight for workflow `%s'..." id)
           (let ((initial-ctx (list :args collected-args
                                    :source-marker source-marker
@@ -1673,6 +1736,12 @@ a `display-buffer' action alist, or a function."
                                    :submit effective-submit
                                    :busy-action busy-action
                                    :context-dir dir
+                                   :shell-dir resource-dir
+                                   :workspace workspace
+                                   :manifest (or manifest snapshot)
+                                   :operation-id operation-id
+                                   :target-id target-id
+                                   :operation-generation operation-generation
                                    :repos canon-repos
                                    :buffer-display effective-display
                                    :shell-reuse effective-shell-reuse
@@ -1737,6 +1806,8 @@ With the key `:together' non-nil, the workflow is dispatched once with
 every repository in `:repos' (the first is the context directory), for
 tasks that must see all repositories at the same time; the display is
 used as given.
+With `:workspace', delegate the resolved checkout selection to
+`agent-shell-workflow-dispatch-worktrees' with the selected resource policy.
 Returns an alist mapping each dispatched directory to its dispatch
 result: one entry per repository, or a single entry for the first
 repository in `:together' mode."
@@ -1751,10 +1822,15 @@ repository in `:together' mode."
            (and spec (agent-shell-workflow-spec-buffer-display spec))))
          (shown nil)
          results)
-    (if together
+    (cond
+     ((plist-get keys :workspace)
+      (apply #'agent-shell-workflow-dispatch-worktrees id repos
+             (plist-put keys :together together)))
+     (together
         (list (cons (car repos)
                     (apply #'agent-shell-workflow-dispatch id
-                           (plist-put (copy-sequence keys) :repos repos))))
+                           (plist-put (copy-sequence keys) :repos repos)))))
+     (t
       (dolist (dir repos (nreverse results))
         (let* ((repo-display (cond
                               ((eq group-display :background) :background)
@@ -1767,7 +1843,7 @@ repository in `:together' mode."
                                  (plist-put :buffer-display repo-display)))
                (res (apply #'agent-shell-workflow-dispatch id effective-keys)))
           (setq shown (or shown (not (eq repo-display :background))))
-          (push (cons dir res) results))))))
+          (push (cons dir res) results)))))))
 
 ;; Integration with agent-shell-queue
 
@@ -1794,6 +1870,7 @@ repository in `:together' mode."
          (workflow-id (and (listp plist) (plist-get plist :workflow-id)))
          (spec (when workflow-id (agent-shell-workflow-get workflow-id)))
          (ctx (and (listp plist) (plist-get plist :ctx))))
+    (agent-shell-workflow--validate-shell-directory buf (plist-get ctx :shell-dir))
     (if spec
         (let ((effective-ctx (if (listp ctx) (copy-sequence ctx) nil)))
           (setq effective-ctx (plist-put effective-ctx :shell-buffer buf))
