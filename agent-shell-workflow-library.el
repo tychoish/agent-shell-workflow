@@ -50,6 +50,49 @@
 ;; Domain workflow modules
 (require 'agent-shell-workflow-github)
 (require 'agent-shell-workflow-pipeline)
+(require 'agent-shell-workflow-workspace-actions)
+
+(agent-shell-workflow-define commit-group
+  :doc "Prepare explicit files for verified workspace commits"
+  :category "Workspace"
+  :pre-op #'agent-shell-workflow--workspace-action-pre
+  :template "Prepare the requested changes in each selected checkout.
+The initial checkout is {{context-dir}}.  Operate only on the selected
+target IDs {{args.workspace-target-ids}} in the frozen manifest.
+Frozen selected checkout manifest:
+{{args.workspace-manifest}}
+Instruction: {{args.instruction}}
+Allowed files: {{args.files}}
+Do not stage, commit, push, rebase, or change branches. A coordinator verifies
+and commits the explicit files after this turn."
+  :post-op #'agent-shell-workflow--workspace-action-post
+  :submit t :target :session-reuse)
+
+(agent-shell-workflow-define repair-conflicts
+  :doc "Repair a requested merge in an exact workspace checkout"
+  :category "Workspace"
+  :pre-op #'agent-shell-workflow--workspace-action-pre
+  :template "Resolve conflicts from the requested merge in selected checkouts.
+The initial checkout is {{context-dir}}.  Operate only on the selected
+target IDs {{args.workspace-target-ids}} in the frozen manifest.
+Frozen selected checkout manifest:
+{{args.workspace-manifest}}
+Merge reference: {{args.merge-ref}}
+Inspect Git state before editing. Resolve and stage merge conflicts only.
+Do not commit, push, rebase, or change branches. The coordinator verifies
+the resolved merge and records its commit after this turn."
+  :post-op #'agent-shell-workflow--workspace-action-post
+  :submit t :target :session-reuse)
+
+(agent-shell-workflow-define workspace-inspect
+  :doc "Inspect a frozen workspace checkout selection"
+  :category "Workspace"
+  :pre-op #'agent-shell-workflow--workspace-action-pre
+  :template "Inspect {{context-dir}} read-only. Do not modify or commit files.
+Frozen selected checkout manifest:
+{{args.workspace-manifest}}"
+  :post-op #'agent-shell-workflow--workspace-action-post
+  :submit t :target :session-reuse)
 
 ;; Test coverage expansion
 

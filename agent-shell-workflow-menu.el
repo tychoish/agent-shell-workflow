@@ -34,9 +34,86 @@
 (require 'cl-lib)
 (require 'annotated-completing-read)
 (require 'agent-shell-workflow)
+(require 'tabulated-list)
 (eval-when-compile (require 'agent-shell-workflow))
 
 (declare-function agent-shell-workflow-dispatch-group "agent-shell-workflow")
+(declare-function agent-shell-workflow-dispatch-worktrees "agent-shell-workflow-workspace-actions")
+(declare-function agent-shell-workflow-workspace-preview "agent-shell-workflow-workspace-actions")
+(declare-function agent-shell-workflow-operation-list "agent-shell-workflow-operations")
+(declare-function agent-shell-workflow-operation-read "agent-shell-workflow-operations")
+
+(defvar-local agent-shell-workflow--workspace-status-id nil
+  "Operation displayed by the current workspace status buffer.")
+
+(defun agent-shell-workflow--workspace-status-refresh ()
+  "Refresh the current workspace operation status table."
+  (let* ((operation (agent-shell-workflow-operation-read
+                     agent-shell-workflow--workspace-status-id))
+         (targets (plist-get operation :targets)))
+    (setq tabulated-list-entries
+          (seq-map
+           (lambda (member)
+             (let* ((target-id (plist-get member :target-id))
+                    (target (seq-find
+                             (lambda (entry) (equal target-id (plist-get entry :id))) targets)))
+               (list target-id
+                     (vector (plist-get target :worktree-dir)
+                             (or (plist-get target :branch) "DETACHED")
+                             (plist-get member :state)
+                             (format "%S" (plist-get member :details))))))
+           (plist-get operation :members)))))
+
+(define-derived-mode agent-shell-workflow-workspace-status-mode
+  tabulated-list-mode "Workspace Status"
+  "Show independently tracked members of a frozen workspace operation."
+  (setq tabulated-list-format
+        [("Checkout" 48 t) ("Branch" 22 t) ("State" 12 t) ("Details" 0 nil)])
+  (add-hook 'tabulated-list-revert-hook
+            #'agent-shell-workflow--workspace-status-refresh nil t)
+  (tabulated-list-init-header))
+
+;;;###autoload
+(defun agent-shell-workflow-workspace-status (&optional operation-id)
+  "Display durable per-member progress for OPERATION-ID."
+  (interactive)
+  (require 'agent-shell-workflow-operations)
+  (let* ((selected (or operation-id
+                       (completing-read
+                        "Operation: "
+                        (seq-map (lambda (operation) (plist-get operation :operation-id))
+                                 (agent-shell-workflow-operation-list)) nil t)))
+         (buffer (get-buffer-create (format "*Workspace %s*" selected))))
+    (with-current-buffer buffer
+      (agent-shell-workflow-workspace-status-mode)
+      (setq agent-shell-workflow--workspace-status-id selected)
+      (agent-shell-workflow--workspace-status-refresh)
+      (tabulated-list-print t))
+    (pop-to-buffer buffer)))
+
+;;;###autoload
+(defun agent-shell-workflow-select-worktrees (&optional directories)
+  "Preview exact DIRECTORIES before choosing a workspace workflow.
+Interactively select one existing checkout directory; callers may supply
+multiple selected worktrees, including two from the same repository."
+  (interactive)
+  (require 'agent-shell-workflow-workspace-actions)
+  (let* ((paths (or directories (list (read-directory-name "Exact checkout: " nil nil t))))
+         (preview (agent-shell-workflow-workspace-preview paths)))
+    (agent-shell-workflow-workspace-status (plist-get preview :operation-id))
+    (when (y-or-n-p "Dispatch a workflow to exactly these checkouts? ")
+      (let ((id (agent-shell-workflow-spec-id (agent-shell-workflow-read))) args)
+        (when (memq id '(commit-group repair-conflicts))
+          (setq args (list :verify-command
+                           (split-string-and-unquote
+                            (read-string "Verification program and arguments: "))
+                           :commit-message (read-string "Commit message: ")))
+          (if (eq id 'commit-group)
+              (setq args (plist-put args :files
+                                    (split-string-and-unquote
+                                     (read-string "Explicit files relative to each checkout: "))))
+            (setq args (plist-put args :merge-ref (read-string "Merge reference: ")))))
+        (agent-shell-workflow-dispatch-worktrees id paths :args args)))))
 
 (defun agent-shell-workflow--candidates (&optional category)
   "Return registered workflow specs, filtered to CATEGORY when non-nil."
