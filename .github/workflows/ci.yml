@@ -27,21 +27,24 @@ jobs:
       - name: Lint Source Code
         uses: tychoish/elisp-ci/lint@main
         with:
+          elpaish: true
           dependencies: "agent-shell transient annotated-completing-read magit"
-          target-files: "agent-shell-workflow.el agent-shell-workflow-menu.el agent-shell-workflow-library.el agent-shell-workflow-utils.el agent-shell-workflow-github.el agent-shell-workflow-pipeline.el"
+          target-files: "agent-shell-workflow.el agent-shell-workflow-menu.el agent-shell-workflow-library.el agent-shell-workflow-utils.el agent-shell-workflow-github.el agent-shell-workflow-pipeline.el agent-shell-workflow-workspaces.el agent-shell-workflow-operations.el agent-shell-workflow-workspace-actions.el"
           linters: "byte-compile checkdoc package-lint"
           required-linters: "byte-compile checkdoc package-lint"
 
       - name: Run ERT Tests
         uses: tychoish/elisp-ci@main
         with:
+          elpaish: true
           dependencies: "agent-shell transient annotated-completing-read magit"
 
       - name: Measure Code Coverage
         uses: tychoish/elisp-ci/coverage@main
         with:
+          elpaish: true
           dependencies: "agent-shell transient annotated-completing-read magit"
-          source-files: "agent-shell-workflow.el agent-shell-workflow-menu.el agent-shell-workflow-library.el agent-shell-workflow-utils.el agent-shell-workflow-github.el agent-shell-workflow-pipeline.el"
+          source-files: "agent-shell-workflow.el agent-shell-workflow-menu.el agent-shell-workflow-library.el agent-shell-workflow-utils.el agent-shell-workflow-github.el agent-shell-workflow-pipeline.el agent-shell-workflow-workspaces.el agent-shell-workflow-operations.el agent-shell-workflow-workspace-actions.el"
           report-format: "lcov"
           output-file: "coverage/lcov.info"
 
