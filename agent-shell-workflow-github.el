@@ -516,6 +516,364 @@ Do NOT read the entire log file into context. Inspect the logs as files using se
   :buffer-display :background
   :clear t)
 
+;; Multi-repository group CI remediation
+
+(defconst agent-shell-workflow-library--failing-conclusions
+  '("failure" "cancelled" "timed_out" "action_required")
+  "GitHub Actions run conclusions treated as failing CI runs.")
+
+(defun agent-shell-workflow-library--find-failing-run (runs branch &optional head-sha)
+  "Return the failing run alist from RUNS for BRANCH or HEAD-SHA, or nil.
+Checks a run matching HEAD-SHA first, then the latest run on BRANCH
+\(falling back to the latest run in RUNS when BRANCH has no runs)."
+  (let* ((sha-run (when (and (stringp head-sha) (not (string-empty-p head-sha)))
+                    (seq-find (lambda (r)
+                                (let ((r-sha (map-elt r 'headSha)))
+                                  (and (stringp r-sha)
+                                       (or (string-prefix-p r-sha head-sha)
+                                           (string-prefix-p head-sha r-sha)))))
+                              runs)))
+         (sha-state (and sha-run (or (map-elt sha-run 'conclusion)
+                                     (map-elt sha-run 'status))))
+         (branch-runs (seq-filter (lambda (r) (equal (map-elt r 'headBranch) branch))
+                                  runs))
+         (latest (car (or branch-runs runs)))
+         (latest-state (and latest (or (map-elt latest 'conclusion)
+                                       (map-elt latest 'status)))))
+    (cond
+     ((and sha-run
+           (member sha-state agent-shell-workflow-library--failing-conclusions))
+      sha-run)
+     ((and latest
+           (member latest-state agent-shell-workflow-library--failing-conclusions))
+      latest)
+     (t nil))))
+
+(defun agent-shell-workflow-library--failing-job-names (ci-jobs-json)
+  "Extract failing job names from CI-JOBS-JSON string as a list of strings."
+  (when-let* (((and (stringp ci-jobs-json) (not (string-empty-p ci-jobs-json))))
+              (parsed (ignore-errors
+                        (json-parse-string ci-jobs-json
+                                           :object-type 'alist
+                                           :array-type 'list)))
+              (jobs (and (listp parsed) (alist-get 'jobs parsed))))
+    (thread-last jobs
+      (seq-filter (lambda (j)
+                    (member (or (alist-get 'conclusion j) (alist-get 'status j))
+                            agent-shell-workflow-library--failing-conclusions)))
+      (seq-map (lambda (j) (alist-get 'name j)))
+      (seq-filter #'stringp))))
+
+(defun agent-shell-workflow-library--write-ci-artifacts
+    (root repo-slug run-id-str run-branch date ci-summary ci-log ci-jobs)
+  "Write CI artifacts under ROOT/.agent/fix-ci/ and return metadata plist.
+REPO-SLUG, RUN-ID-STR, RUN-BRANCH, DATE, CI-SUMMARY, CI-LOG, and CI-JOBS
+populate the run log, jobs JSON, triage index, and plan paths."
+  (let* ((root (file-name-as-directory (expand-file-name root)))
+         (parsed-jobs (ignore-errors
+                        (json-parse-string ci-jobs
+                                           :object-type 'alist
+                                           :array-type 'list)))
+         (effective-branch (or run-branch
+                               (and (listp parsed-jobs)
+                                    (alist-get 'headBranch parsed-jobs))
+                               "main"))
+         (base-ci-dir (expand-file-name ".agent/fix-ci" root))
+         (ci-dir (agent-shell-workflow-library--unique-artifact-dir
+                  base-ci-dir (format "run-%s" run-id-str) effective-branch date))
+         (log-file (expand-file-name (format "run-%s-logs.txt" run-id-str) ci-dir))
+         (jobs-file (expand-file-name (format "run-%s-jobs.json" run-id-str) ci-dir))
+         (index-file (expand-file-name "ci-triage-index.md" ci-dir))
+         (alias-log-file (expand-file-name "ci-logs.txt" ci-dir))
+         (alias-jobs-file (expand-file-name "ci-jobs.json" ci-dir))
+         (plan-file (expand-file-name "fix-plan.md" ci-dir))
+         (log-content (if (and (stringp ci-log) (not (string-empty-p ci-log)))
+                          ci-log
+                        (format "No failed-step logs returned for run #%s.\n\nSummary:\n%s"
+                                run-id-str ci-summary)))
+         (jobs-content (if (and (stringp ci-jobs) (not (string-empty-p ci-jobs)))
+                           ci-jobs
+                         "{}"))
+         (index-content
+          (format "# CI Triage Index\n\n- **Repository**: %s\n- **Run ID**: %s\n- **Branch**: %s\n- **Generated**: %s\n- **Log File**: `%s`\n- **Jobs Metadata**: `%s`\n- **Fix Plan**: `%s`\n\n## Summary\n\n```\n%s\n```\n"
+                  repo-slug run-id-str effective-branch
+                  (format-time-string "%Y-%m-%dT%T%z")
+                  (file-relative-name log-file root)
+                  (file-relative-name jobs-file root)
+                  (file-relative-name plan-file root)
+                  ci-summary)))
+    (agent-shell-workflow-library--write-file log-file log-content)
+    (agent-shell-workflow-library--write-file jobs-file jobs-content)
+    (agent-shell-workflow-library--write-file index-file index-content)
+    (agent-shell-workflow-library--write-file alias-log-file log-content)
+    (agent-shell-workflow-library--write-file alias-jobs-file jobs-content)
+    (list :root root
+          :repo repo-slug
+          :run-id run-id-str
+          :branch effective-branch
+          :ci-dir ci-dir
+          :log-file log-file
+          :jobs-file jobs-file
+          :index-file index-file
+          :plan-file plan-file
+          :failing-jobs (agent-shell-workflow-library--failing-job-names jobs-content))))
+
+(defun agent-shell-workflow-library--group-ci-repo-meta (dir target-branch)
+  "Resolve local repository metadata plist for DIR and optional TARGET-BRANCH."
+  (let* ((root (file-name-as-directory (expand-file-name dir)))
+         (default-directory root)
+         (slug (agent-shell-workflow-library--resolve-repo-slug root))
+         (branch (or target-branch
+                     (ignore-errors
+                       (let ((b (agent-shell-workflow-library--git-output
+                                 "rev-parse" "--abbrev-ref" "HEAD")))
+                         (unless (string-empty-p b) b)))
+                     (agent-shell-workflow-library--current-branch)))
+         (head-sha (ignore-errors
+                     (let ((sha (agent-shell-workflow-library--git-output
+                                 "rev-parse" "HEAD")))
+                       (unless (string-empty-p sha) sha)))))
+    (list :root root :slug slug :branch branch :head-sha head-sha)))
+
+(defun agent-shell-workflow-library--format-group-ci-report (artifacts)
+  "Format downloaded CI ARTIFACTS list into a compact Markdown report."
+  (string-join
+   (seq-map
+    (lambda (art)
+      (let ((jobs (plist-get art :failing-jobs)))
+        (concat
+         (format "### %s (`%s`) — run #%s [%s]\n"
+                 (plist-get art :repo)
+                 (plist-get art :root)
+                 (plist-get art :run-id)
+                 (plist-get art :branch))
+         (when jobs
+           (format "- Failing jobs: %s\n" (string-join jobs ", ")))
+         (format "- Failed step log: `%s`\n" (plist-get art :log-file))
+         (format "- Failing jobs metadata: `%s`\n" (plist-get art :jobs-file))
+         (format "- CI triage index: `%s`" (plist-get art :index-file)))))
+    artifacts)
+   "\n\n"))
+
+(defun agent-shell-workflow-library--group-fix-ci-finalize
+    (ctx metas failing-entries healthy-entries date)
+  "Populate CTX from METAS, FAILING-ENTRIES, HEALTHY-ENTRIES, and DATE.
+Signals `agent-shell-workflow-skip' when no repository has a failing run."
+  (when (null failing-entries)
+    (agent-shell-workflow-skip
+     (format "All %d %s have passing CI"
+             (length healthy-entries)
+             (if (= (length healthy-entries) 1) "repository" "repositories"))))
+  (let* ((primary-root (or (plist-get (car metas) :root)
+                           (plist-get ctx :context-dir)
+                           default-directory))
+         (group-plan-dir (agent-shell-workflow-library--unique-artifact-dir
+                          (expand-file-name ".agent/fix-ci" primary-root)
+                          "group" nil date))
+         (group-plan-file (expand-file-name "fix-plan.md" group-plan-dir))
+         (report (agent-shell-workflow-library--format-group-ci-report failing-entries))
+         (healthy-text
+          (if healthy-entries
+              (string-join
+               (seq-map (lambda (m)
+                          (format "- %s (`%s`)"
+                                  (or (plist-get m :slug) (plist-get m :root))
+                                  (plist-get m :root)))
+                        healthy-entries)
+               "\n")
+            "(none)"))
+         (updated (copy-sequence ctx)))
+    (setq updated (plist-put updated :ci-group-report report))
+    (setq updated (plist-put updated :ci-group-healthy healthy-text))
+    (setq updated (plist-put updated :ci-group-failed-count (length failing-entries)))
+    (setq updated (plist-put updated :ci-group-healthy-count (length healthy-entries)))
+    (setq updated (plist-put updated :ci-group-plan-file group-plan-file))
+    (setq updated (plist-put updated :ci-group-artifacts failing-entries))
+    updated))
+
+(defun agent-shell-workflow-library--group-fix-ci-pre-op (ctx &optional callback)
+  "Download failing CI artifacts across a repository group into CTX.
+Resolves repositories from `:group' in CTX's `:args', else `:repos' in
+CTX, else `:context-dir'.  Healthy repositories are skipped so zero
+turns are spent on them; if all repositories are healthy, skips the
+entire workflow via `agent-shell-workflow-skip'.  When CALLBACK is
+non-nil, fetches all repositories in parallel asynchronously."
+  (let* ((args (plist-get ctx :args))
+         (group (plist-get args :group))
+         (target-branch (let ((b (plist-get args :branch)))
+                          (when (and (stringp b) (not (string-empty-p b))) b)))
+         (date (plist-get args :date))
+         (repos (cond
+                 ((and group (not (equal group "")))
+                  (agent-shell-workflow-resolve-repo-group
+                   (if (stringp group) (intern group) group)))
+                 ((plist-get ctx :repos)
+                  (plist-get ctx :repos))
+                 (t
+                  (list (or (plist-get ctx :context-dir) default-directory)))))
+         (metas (seq-map (lambda (dir)
+                           (agent-shell-workflow-library--group-ci-repo-meta
+                            dir target-branch))
+                         repos))
+         (run-fields "databaseId,displayTitle,status,conclusion,headBranch,headSha,createdAt,updatedAt,startedAt,url"))
+    (if callback
+        ;; Wave 1: query recent runs for every repository in parallel.
+        (let ((list-pairs
+               (seq-map
+                (lambda (m)
+                  (list (plist-get m :root)
+                        "gh" "run" "list"
+                        "--repo" (plist-get m :slug)
+                        "--limit" "20"
+                        "--json" run-fields))
+                metas)))
+          (agent-shell-workflow--gather-async
+           list-pairs
+           (lambda (list-results)
+             (let (failing-metas healthy-metas detail-pairs)
+               (seq-do
+                (lambda (m)
+                  (let* ((root (plist-get m :root))
+                         (raw (or (cdr (assoc root list-results)) ""))
+                         (runs (ignore-errors
+                                 (json-parse-string raw
+                                                    :object-type 'alist
+                                                    :array-type 'list)))
+                         (fail-run (and (listp runs)
+                                        (agent-shell-workflow-library--find-failing-run
+                                         runs (plist-get m :branch) (plist-get m :head-sha)))))
+                    (if fail-run
+                        (let* ((run-id-str (format "%s" (map-elt fail-run 'databaseId)))
+                               (slug (plist-get m :slug))
+                               (entry (plist-put (copy-sequence m) :run-id run-id-str)))
+                          (push entry failing-metas)
+                          (push (list (cons root :summary) "gh" "run" "view" run-id-str "--repo" slug)
+                                detail-pairs)
+                          (push (list (cons root :log) "gh" "run" "view" run-id-str "--repo" slug "--log-failed")
+                                detail-pairs)
+                          (push (list (cons root :jobs) "gh" "run" "view" run-id-str "--repo" slug
+                                      "--json" "jobs,conclusion,workflowName,url,displayTitle,headBranch")
+                                detail-pairs))
+                      (push m healthy-metas))))
+                metas)
+               (setq failing-metas (nreverse failing-metas))
+               (setq healthy-metas (nreverse healthy-metas))
+               (if (null failing-metas)
+                   (condition-case skip
+                       (agent-shell-workflow-library--group-fix-ci-finalize
+                        ctx metas nil healthy-metas date)
+                     (agent-shell-workflow-skip
+                      (message "Workflow skipped: %s" (cadr skip))))
+                 ;; Wave 2: download failed logs and metadata in parallel.
+                 (agent-shell-workflow--gather-async
+                  (nreverse detail-pairs)
+                  (lambda (detail-results)
+                    (let ((artifacts
+                           (seq-map
+                            (lambda (m)
+                              (let* ((root (plist-get m :root))
+                                     (summary (or (cdr (assoc (cons root :summary) detail-results)) ""))
+                                     (log (or (cdr (assoc (cons root :log) detail-results)) ""))
+                                     (jobs (or (cdr (assoc (cons root :jobs) detail-results)) "")))
+                                (agent-shell-workflow-library--write-ci-artifacts
+                                 root (plist-get m :slug) (plist-get m :run-id)
+                                 (plist-get m :branch) date summary log jobs)))
+                            failing-metas)))
+                      (funcall callback
+                               (agent-shell-workflow-library--group-fix-ci-finalize
+                                ctx metas artifacts healthy-metas date))))))))))
+      ;; Synchronous path
+      (let (artifacts healthy-metas)
+        (seq-do
+         (lambda (m)
+           (let* ((slug (plist-get m :slug))
+                  (runs (agent-shell-workflow-library--fetch-runs slug 20))
+                  (fail-run (agent-shell-workflow-library--find-failing-run
+                             runs (plist-get m :branch) (plist-get m :head-sha))))
+             (if fail-run
+                 (let* ((run-id-str (format "%s" (map-elt fail-run 'databaseId)))
+                        (summary (agent-shell-workflow-library--shell
+                                  "gh" "run" "view" run-id-str "--repo" slug))
+                        (log (agent-shell-workflow-library--shell
+                              "gh" "run" "view" run-id-str "--repo" slug "--log-failed"))
+                        (jobs (agent-shell-workflow-library--shell
+                               "gh" "run" "view" run-id-str "--repo" slug
+                               "--json" "jobs,conclusion,workflowName,url,displayTitle,headBranch")))
+                   (push (agent-shell-workflow-library--write-ci-artifacts
+                          (plist-get m :root) slug run-id-str
+                          (plist-get m :branch) date summary log jobs)
+                         artifacts))
+               (push m healthy-metas))))
+         metas)
+        (agent-shell-workflow-library--group-fix-ci-finalize
+         ctx metas (nreverse artifacts) (nreverse healthy-metas) date)))))
+
+(agent-shell-workflow-define group-fix-ci
+  :doc "Download failing CI artifacts across a repository group and fix in one session"
+  :category "CI/CD"
+  :args ((group :prompt "Repository group (optional): " :type symbol :optional t)
+         (branch :prompt "Branch (optional): " :optional t))
+  :pre-op #'agent-shell-workflow-library--group-fix-ci-pre-op
+  :template "Investigate and fix the failing CI runs across this repository group ({{ci-group-failed-count}} failing, {{ci-group-healthy-count}} passing).
+
+## Failing Repositories & Pre-Downloaded Artifacts:
+{{ci-group-report}}
+
+## Passing Repositories (skipped):
+{{ci-group-healthy}}
+
+Do NOT read entire log files into context and do NOT re-run `gh run list` or `gh run view` — artifacts are already downloaded above. Inspect all failing logs in parallel using search or tail inspection (failures typically appear in the last 150-200 lines).
+
+## Instructions:
+1. Inspect all failing logs in parallel (search `Error:`, `FAILED`, `FAIL`, panics, or lint failures) and note any shared root causes across repositories.
+2. Write a unified fix plan to `{{ci-group-plan-file}}` (per-repo root cause, action items, verification).
+3. Present the fix plan to the user and ask confirmation before modifying source files.
+4. Implement targeted fixes across the failing repositories and verify each with narrow tests or `elisp_validate`."
+  :submit t
+  :target :session-reuse
+  :buffer-display :background
+  :clear t)
+
+;;;###autoload
+(defun agent-shell-workflow-fix-ci-group (&optional group branch)
+  "Dispatch `group-fix-ci' across GROUP in a single session.
+When GROUP is nil, prompt from `agent-shell-workflow-repo-groups'.
+Optional BRANCH overrides per-repository branch detection."
+  (interactive)
+  (unless (or group agent-shell-workflow-repo-groups)
+    (user-error "No repository groups configured in `agent-shell-workflow-repo-groups'"))
+  (let* ((chosen-group
+          (or group
+              (let* ((table (seq-map
+                             (lambda (entry)
+                               (let* ((grp-name (car entry))
+                                      (grp-repos (cdr entry))
+                                      (count (length grp-repos)))
+                                 (cons (symbol-name grp-name)
+                                       (cons (format "[%d %s: %s]"
+                                                     count
+                                                     (if (= count 1) "repo" "repos")
+                                                     (string-join
+                                                      (seq-map #'file-name-nondirectory
+                                                               (seq-take grp-repos 3))
+                                                      ", "))
+                                             grp-name))))
+                             agent-shell-workflow-repo-groups)))
+                (if (fboundp 'annotated-completing-read)
+                    (annotated-completing-read
+                     table
+                     :prompt "Select repository group for fix-ci: "
+                     :category 'agent-shell-repo-group
+                     :require-match t
+                     :history 'agent-shell-workflow-repo-group-history)
+                  (intern (completing-read "Select repository group for fix-ci: "
+                                           (mapcar #'car table) nil t))))))
+         (group-sym (if (stringp chosen-group) (intern chosen-group) chosen-group))
+         (args (when (and (stringp branch) (not (string-empty-p branch)))
+                 (list :branch branch))))
+    (agent-shell-workflow-dispatch-group
+     'group-fix-ci group-sym :together t :args args)))
+
 ;; PR review comment remediation
 
 (defun agent-shell-workflow-library--pr-review-pre-op (ctx &optional callback)

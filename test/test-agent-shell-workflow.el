@@ -3794,6 +3794,125 @@ and prompt is enqueued for target shell."
     (insert "not an org file")
     (should-error (agent-shell-workflow-library--extract-org-task) :type 'user-error)))
 
+(ert-deftest agent-shell-workflow/group-fix-ci-downloads-only-failing-repos ()
+  "group-fix-ci downloads artifacts only for failing repos and skips passing ones."
+  (let* ((tmp (make-temp-file "asw-group-fix-ci-" t))
+         (repo-a (file-name-as-directory (expand-file-name "repo-a" tmp)))
+         (repo-b (file-name-as-directory (expand-file-name "repo-b" tmp)))
+         (agent-shell-workflow-repo-groups `((demo . (,repo-a ,repo-b)))))
+    (make-directory repo-a t)
+    (make-directory repo-b t)
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-workflow-library--group-ci-repo-meta)
+                   (lambda (dir _branch)
+                     (let ((name (file-name-nondirectory (directory-file-name dir))))
+                       (list :root (file-name-as-directory (expand-file-name dir))
+                             :slug (concat "tychoish/" name)
+                             :branch "main"
+                             :head-sha "abc1234"))))
+                  ((symbol-function 'agent-shell-workflow-library--fetch-runs)
+                   (lambda (slug &optional _limit)
+                     (if (equal slug "tychoish/repo-a")
+                         '(((databaseId . 101) (headBranch . "main")
+                            (headSha . "abc1234") (conclusion . "failure")))
+                       '(((databaseId . 202) (headBranch . "main")
+                          (headSha . "abc1234") (conclusion . "success"))))))
+                  ((symbol-function 'agent-shell-workflow-library--shell)
+                   (lambda (&rest args)
+                     (cond
+                      ((member "--log-failed" args)
+                       "repo-a.el:10:1: Error: reference to free variable `foo'")
+                      ((member "--json" args)
+                       "{\"headBranch\":\"main\",\"jobs\":[{\"name\":\"test (31.1)\",\"conclusion\":\"failure\"}]}")
+                      (t "Run #101 failed")))))
+          (let* ((spec (agent-shell-workflow-get 'group-fix-ci))
+                 (ctx (agent-shell-workflow-library--group-fix-ci-pre-op
+                       (list :args (list :group 'demo :date "20261128"))))
+                 (rendered (agent-shell-workflow-render
+                            (agent-shell-workflow-spec-template spec) ctx))
+                 (art (car (plist-get ctx :ci-group-artifacts))))
+            (should spec)
+            (should (= (plist-get ctx :ci-group-failed-count) 1))
+            (should (= (plist-get ctx :ci-group-healthy-count) 1))
+            (should (file-exists-p (plist-get art :log-file)))
+            (should (file-exists-p (plist-get art :jobs-file)))
+            (should (file-exists-p (plist-get art :index-file)))
+            (should (string-match-p "tychoish/repo-a" rendered))
+            (should (string-match-p "test (31\\.1)" rendered))
+            (should (string-match-p "run-101-logs\\.txt" rendered))
+            (should (string-match-p "tychoish/repo-b" (plist-get ctx :ci-group-healthy)))
+            ;; Raw log body is not inlined into the prompt.
+            (should-not (string-match-p "reference to free variable" rendered))))
+      (delete-directory tmp t))))
+
+(ert-deftest agent-shell-workflow/group-fix-ci-skips-when-all-passing ()
+  "group-fix-ci signals `agent-shell-workflow-skip' when every repo is green."
+  (let* ((tmp (make-temp-file "asw-group-fix-ci-ok-" t))
+         (repo-a (file-name-as-directory (expand-file-name "repo-a" tmp))))
+    (make-directory repo-a t)
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-workflow-library--group-ci-repo-meta)
+                   (lambda (dir _branch)
+                     (list :root (file-name-as-directory (expand-file-name dir))
+                           :slug "tychoish/repo-a" :branch "main" :head-sha "abc1234")))
+                  ((symbol-function 'agent-shell-workflow-library--fetch-runs)
+                   (lambda (_slug &optional _limit)
+                     '(((databaseId . 202) (headBranch . "main")
+                        (headSha . "abc1234") (conclusion . "success"))))))
+          (should-error
+           (agent-shell-workflow-library--group-fix-ci-pre-op
+            (list :repos (list repo-a)))
+           :type 'agent-shell-workflow-skip))
+      (delete-directory tmp t))))
+
+(ert-deftest agent-shell-workflow/group-fix-ci-async-parallel-gather ()
+  "group-fix-ci async path fetches runs and logs in two parallel waves."
+  (let* ((tmp (make-temp-file "asw-group-fix-ci-async-" t))
+         (repo-a (file-name-as-directory (expand-file-name "repo-a" tmp)))
+         (repo-b (file-name-as-directory (expand-file-name "repo-b" tmp)))
+         (waves 0)
+         (result-ctx nil))
+    (make-directory repo-a t)
+    (make-directory repo-b t)
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-workflow-library--group-ci-repo-meta)
+                   (lambda (dir _branch)
+                     (let ((name (file-name-nondirectory (directory-file-name dir))))
+                       (list :root (file-name-as-directory (expand-file-name dir))
+                             :slug (concat "tychoish/" name)
+                             :branch "main"
+                             :head-sha "def5678"))))
+                  ((symbol-function 'agent-shell-workflow--gather-async)
+                   (lambda (pairs cb &optional _dir)
+                     (setq waves (1+ waves))
+                     (funcall
+                      cb
+                      (seq-map
+                       (lambda (p)
+                         (let ((key (car p))
+                               (cmd-args (cddr p)))
+                           (cons key
+                                 (cond
+                                  ((member "list" cmd-args)
+                                   (if (equal key repo-a)
+                                       "[{\"databaseId\":303,\"headBranch\":\"main\",\"headSha\":\"def5678\",\"conclusion\":\"failure\"}]"
+                                     "[{\"databaseId\":404,\"headBranch\":\"main\",\"headSha\":\"def5678\",\"conclusion\":\"success\"}]"))
+                                  ((member "--log-failed" cmd-args)
+                                   "FAILED test-foo")
+                                  ((member "--json" cmd-args)
+                                   "{\"headBranch\":\"main\",\"jobs\":[{\"name\":\"lint\",\"conclusion\":\"failure\"}]}")
+                                  (t "Run #303 failed")))))
+                       pairs)))))
+          (agent-shell-workflow-library--group-fix-ci-pre-op
+           (list :repos (list repo-a repo-b) :args (list :date "20261128"))
+           (lambda (ctx) (setq result-ctx ctx)))
+          (should (= waves 2))
+          (should result-ctx)
+          (should (= (plist-get result-ctx :ci-group-failed-count) 1))
+          (should (= (plist-get result-ctx :ci-group-healthy-count) 1))
+          (should (file-exists-p (plist-get (car (plist-get result-ctx :ci-group-artifacts)) :log-file))))
+      (delete-directory tmp t))))
+
 (provide 'test-agent-shell-workflow)
 
 ;;; test-agent-shell-workflow.el ends here
