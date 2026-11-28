@@ -6,6 +6,7 @@
 ;;; Code:
 
 (require 'ert)
+(add-to-list 'load-path (file-name-directory (or load-file-name buffer-file-name)))
 (require 'test-helper)
 (require 'agent-shell-workflow-review)
 (require 'agent-shell-workflow-worker)

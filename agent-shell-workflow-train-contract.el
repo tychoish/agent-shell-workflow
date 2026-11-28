@@ -122,8 +122,8 @@ and `:review-batch-window' are validated when supplied."
 
 (defun agent-shell-workflow-train-validate-handoff (checkpoint)
   "Validate immutable worker handoff CHECKPOINT plist.
-Requires `:train-id', `:task-id', `:objective', `:resource', `:expected-revision',
-`:remaining-limits', and `:schema-version'."
+Requires `:train-id', `:task-id', `:objective', `:resource',
+`:expected-revision', `:remaining-limits', and `:schema-version'."
   (let ((errors nil))
     (if (not (and (listp checkpoint) (cl-evenp (length checkpoint))))
         (push "Handoff checkpoint must be a plist" errors)
